@@ -63,67 +63,12 @@ modelvl = OpenAIChatCompletionClient(
     },
 )
 
-model =OpenAILike(
-    id="F:\\try\\qwen\\Qwen2.5-1.5B-Instruct-AWQ",
-    api_key='ss',
-    base_url="http://localhost:23333/v1",
-)
-
-
-model =OpenAILike(
-    id="qwen2.5:32b",
-    api_key='ss',
-    base_url="http://localhost:11434/v1",
-)
-
-import typer
-from typing import Optional
-from rich.prompt import Prompt
-
-from phi.agent import Agent
-from phi.knowledge.pdf import PDFUrlKnowledgeBase
-from phi.vectordb.lancedb import LanceDb
-from phi.vectordb.search import SearchType
-
-# LanceDB Vector DB
-vector_db = LanceDb(
-    table_name="recipes",
-    api_key = 'ss',
-    uri="/tmp/lancedb",
-    search_type=SearchType.keyword,
-)
-
-# Knowledge Base
-knowledge_base = PDFUrlKnowledgeBase(
-    urls=["https://phi-public.s3.amazonaws.com/recipes/ThaiRecipes.pdf"],
-    vector_db=vector_db,
-)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 async def add_two_numbers(a: int,b: int) -> int:
     return a+b
 
 async def multiply_two_numbers(a: int,b: int) -> int:
     return a*b
-
-
 
 
 async def main() -> None:
@@ -142,7 +87,7 @@ async def main() -> None:
     agent_team = RoundRobinGroupChat([weather_agent], termination_condition=termination, max_turns=12)
 
     # Run the team and stream messages to the console
-    stream = agent_team.run_stream(task="What 5x6?")
+    stream = agent_team.run_stream(task="What 5 plus 6?")
     await Console(stream)
 
 asyncio.run(main())
@@ -154,30 +99,25 @@ asyncio.run(main())
 
 
 
-# Define a tool
-async def get_weather(city: str) -> str:
-    return f"The weather in {city} is 73 degrees and Sunny."
-
-
+# todo, speedtest local models
+import time
+tim = time.perf_counter()
 agent = AssistantAgent(
     name="weather_agent",
     model_client=model,
-    tools=[get_weather],
 )
-
+tokens = 0
 async def assistant_run() -> None:
+    global tokens
     response = await agent.on_messages(
-        [TextMessage(content="Find information on AutoGen", source="user")],
+        [TextMessage(content="what the difference and similarities between tiger, lion. provide a 500 word answer", source="user")],
         cancellation_token=CancellationToken(),
     )
-    print(response.inner_messages)
-    print(response.chat_message)
+    # print(response.inner_messages)
+    tokens= response.chat_message.models_usage.completion_tokens
 
-
-# Use asyncio.run(assistant_run()) when running in a script.
 asyncio.run(assistant_run())
-
-
+print(tokens/(time.perf_counter() - tim))
 
 
 
@@ -195,7 +135,6 @@ asyncio.run(assistant_run())
 
 
 import asyncio
-
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.base import TaskResult
 from autogen_agentchat.conditions import ExternalTermination, TextMentionTermination
@@ -204,13 +143,6 @@ from autogen_agentchat.ui import Console
 from autogen_core import CancellationToken
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 
-# Create an OpenAI model client.
-model_client = OpenAIChatCompletionClient(
-    model="gpt-4o-2024-08-06",
-    # api_key="sk-...", # Optional if you have an OPENAI_API_KEY env variable set.
-)
-
-# Create the primary agent.
 primary_agent = AssistantAgent(
     "primary",
     model_client=model,
@@ -233,43 +165,6 @@ team = RoundRobinGroupChat([primary_agent, critic_agent], termination_condition=
 
 result = asyncio.run( team.run(task="Write a short poem about the fall season."))
 print(result)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
-from autogen_agentchat.conditions import TextMentionTermination
-from autogen_agentchat.teams import RoundRobinGroupChat
-from autogen_agentchat.ui import Console
-from autogen_ext.models.openai import OpenAIChatCompletionClient
-
-
-assistant = AssistantAgent("assistant", model_client=model)
-user_proxy = UserProxyAgent("user_proxy", input_func=input)  # Use input() to get user input from console.
-
-# Create the termination condition which will end the conversation when the user says "APPROVE".
-termination = TextMentionTermination("APPROVE")
-
-# Create the team.
-team = RoundRobinGroupChat([assistant, user_proxy], termination_condition=termination)
-
-# Run the conversation and stream to the console.
-stream = team.run_stream(task="Write a 4-line poem about the ocean.")
-# Use asyncio.run(...) when running in a script.
-asyncio.run( Console(stream))
-
 
 
 
@@ -349,6 +244,8 @@ asyncio.run( run_team_stream())
 
 
 
+
+
 working_directory = TemporaryDirectory(dir =r'F:\temp')
 toolkit = FileManagementToolkit(
     root_dir=str(working_directory.name)
@@ -375,52 +272,21 @@ async def main() -> None:
     )
 asyncio.run(main())
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# todo, terminations
-
-
-
-# Create the primary agent.
-primary_agent = AssistantAgent(
-    "primary",
-    model_client=model,
-    system_message="You are a helpful AI assistant.",
-)
-
-# Create the critic agent.
-critic_agent = AssistantAgent(
-    "critic",
-    model_client=model,
-    system_message="Provide constructive feedback for every message. Get at least one improvement. Respond with 'APPROVE' to when your feedbacks are addressed.",
-)
-
-max_msg_termination = MaxMessageTermination(max_messages=10)
-text_termination = TextMentionTermination("APPROVE")
-combined_termination = max_msg_termination | text_termination
-
-round_robin_team = RoundRobinGroupChat([primary_agent, critic_agent], termination_condition=combined_termination)
-
-# Use asyncio.run(...) if you are running this script as a standalone script.
-await Console(round_robin_team.run_stream(task="Write a unique, Haiku about the weather in Paris"))
+async def main() -> None:
+    model_client = model
+    agent = AssistantAgent(
+        "assistant",
+        tools=[tool],
+        model_client=model_client,
+        system_message="You are an AI assistant.",
+    )
+    await Console(
+        agent.on_messages_stream(
+            # [TextMessage(content="1- Search the web for Allama Iqbal.\n2- Create a new file locally with name iqbal.txt.\n3- write the resulting text of search in iqbal.txt", source="user")], CancellationToken()
+            [TextMessage(content=content, source="user")], CancellationToken()
+        )
+    )
+asyncio.run(main())
 
 
 
@@ -449,7 +315,6 @@ def load_video(video_path, bound=None, num_segments=32):
     vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
     max_frame = len(vr) - 1
     fps = float(vr.get_avg_fps())
-    pixel_values_list, num_patches_list = [], []
     frame_indices = get_index(bound, fps, max_frame, first_idx=0, num_segments=num_segments)
     imgs = []
     for frame_index in frame_indices:
@@ -543,8 +408,13 @@ import numpy as np
 from PIL import Image
 import io
 
+
+from openai import OpenAI
+client = OpenAI(api_key='ss', base_url='http://localhost:23334/v1')
+model_name = client.models.list().data[0].id
+
 class RealtimeVideoContext:
-    def __init__(self, video_source, window_size=10, fps=1):
+    def __init__(self, video_source, window_size=10, fps=1.0):
         """
         Args:
             video_source: RTSP URL or video path
@@ -554,7 +424,7 @@ class RealtimeVideoContext:
         self.video_source = video_source
         self.window_size = window_size
         self.fps = fps
-        self.frame_buffer = deque(maxlen=window_size * fps)
+        self.frame_buffer = deque(maxlen=window_size)
         self.lock = Lock()
         self.running = True
 
@@ -579,109 +449,82 @@ class RealtimeVideoContext:
 
                 timestamp = time.time()
                 with self.lock:
-                    self.frame_buffer.append({
-                        'image': pil_image,
-                        'timestamp': timestamp
-                    })
+                    # self.frame_buffer.append({
+                    #     'image': pil_image,
+                    #     'timestamp': timestamp
+                    # })
+                    self.frame_buffer.append(pil_image)
+                time.sleep(0.99)
 
             frame_count += 1
 
         video.release()
 
-    def get_context_for_vlm(self):
-        """
-        Prepares context for VLM with temporal information
-        """
-        with self.lock:
-            frames = list(self.frame_buffer)
-
-        if not frames:
-            return "No visual information available."
-
-        # Create context with temporal information
-        context = "Current visual context (last {} seconds):\n".format(self.window_size)
-
-        # Group frames into meaningful segments
-        segments = self._segment_frames(frames)
-
-        for segment in segments:
-            context += f"- {segment}\n"
-
-        return context
-
-    def _segment_frames(self, frames):
-        """
-        Groups similar frames into meaningful segments
-        Basic implementation - can be enhanced with scene detection
-        """
-        segments = []
-        current_time = time.time()
-
-        # Group frames into recent, medium, and older events
-        recent = [f for f in frames if current_time - f['timestamp'] <= 3]
-        medium = [f for f in frames if 3 < current_time - f['timestamp'] <= 7]
-        older = [f for f in frames if current_time - f['timestamp'] > 7]
-
-        if recent:
-            segments.append("Currently observing: [latest frame]")
-        if medium:
-            segments.append("Recently observed: [3-7 seconds ago]")
-        if older:
-            segments.append("Previously observed: [7+ seconds ago]")
-
-        return segments
-
-    def get_vlm_prompt(self, user_question):
-        """
-        Generates appropriate prompt for VLM based on user question
-        """
-        context = self.get_context_for_vlm()
-
-        system_prompt = f"""You are analyzing a real-time video stream. 
-You have access to the last {self.window_size} seconds of visual information.
-Current timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}
-
-{context}
-
-Please answer the following question based on the current visual context:
-{user_question}
-
-Note: Focus on the most recent and relevant information. If you're uncertain about any details, please indicate that."""
-
-        return system_prompt
-
     def cleanup(self):
         self.running = False
         self.capture_thread.join()
-
+video_context = RealtimeVideoContext(
+    video_source="E:/tour2.mp4",
+    window_size=10,  # Keep last 10 seconds
+    fps=1  # 1 frame per second
+)
 # Example usage:
-def main():
-    # Initialize with RTSP stream
-    video_context = RealtimeVideoContext(
-        video_source="rtsp://your_stream_url",
-        window_size=10,  # Keep last 10 seconds
-        fps=1  # 1 frame per second
-    )
+def live_interaction(user_query):
+    """
+    reads stream from camera and answer user text queries and questions according to current
+    context of video
+    :return: str
+    """
+    imgs = list(video_context.frame_buffer)
+    question = ''
+    for i in range(len(imgs)):
+        question = question + f'Frame{i+1}: {IMAGE_TOKEN}\n'
+    question += 'what am i trying to capture while vlogging?'
 
-    # Example VLM integration (pseudo-code)
-    while True:
-        user_question = "What's happening in the camera right now?"
+    content = [{'type': 'text', 'text': question}]
+    for img in imgs:
+        content.append({'type': 'image_url', 'image_url': {'max_dynamic_patch': 1, 'url': f'data:image/jpeg;base64,{encode_image_base64(img)}'}})
+    messages = [dict(role='user', content=content)]
 
-        # Get prompt for VLM
-        prompt = video_context.get_vlm_prompt(user_question)
-
-        # Send to VLM (implement according to your VLM choice)
-        # response = vlm.generate(prompt)
-        # print(response)
-
-        time.sleep(1)  # Add appropriate delay
+    # out = pipe(messages, gen_config=GenerationConfig(top_k=1))
 
 
 
+response = client.chat.completions.create(
+    model=model_name,
+    messages = messages,
+    temperature=0.8,
+    top_p=0.8)
+print(response)
+
+
+
+persistant one is working 10 sec chunks always
+when persistant is working on current 10 sec frame it is made avaialble of last 5 text context
+when a live 10 sec request comes last 10 sec frames and text history is attached along with global passivecontext
+
+
+1-save useful actions from cam or screen all the time with timestamps (an agent can decide if current event is significant
+or to be skipped based on previous scope too)
+2-need to contain the current scope precisely, if watching, video scope of full video and interactions while watching
+should be availble while it lasts. same for cam events timstamped boundaries
+3-save timestamped summaries with embeddings and also plain video or images or even audio
 
 
 
 
+
+
+
+
+
+# Index summaries by time and keywords for efficient retrieval.
+#     Use a vector database (e.g., Pinecone, Weaviate) for storing embeddings.
+#     Retrieval:
+#
+# When a user asks a new query, retrieve summaries that are:
+# Close in time to the current query.
+# Relevant based on textual or embedding similarity.
 
 
 
@@ -810,3 +653,4 @@ ACTION_TAKEN: [What change was made]
 AFFECTED_LIGHTS: [Which lights were modified]
 STATUS: [Success/Failure]""",
 )
+
