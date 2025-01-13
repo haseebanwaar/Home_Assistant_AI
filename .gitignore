@@ -1,0 +1,40 @@
+# .idea folder
+.idea/
+
+# Python specific ignores
+*.pyc
+__pycache__/
+
+# Node.js specific ignores
+node_modules/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+
+# Compiled files
+*.out
+*.class
+*.o
+
+# Coverage directory used by testing tools
+coverage/
+
+# IDE specific ignores
+.vscode/
+*.swp
+
+# Dependency directories
+target/
+dist/
+build/
