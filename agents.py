@@ -7,7 +7,6 @@ from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_core import CancellationToken
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 import json
-
 import numpy as np
 from lmdeploy import pipeline, GenerationConfig
 from decord import VideoReader, cpu
@@ -37,103 +36,6 @@ from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_agentchat.ui import Console
 from autogen_ext.models.openai import OpenAIChatCompletionClient
-
-
-model = OpenAIChatCompletionClient(
-    # model="F:\\try\\qwen\\Qwen2.5-1.5B-Instruct-AWQ",
-    model="F:\\try\\qwen\\Qwen2.5-7B-Instruct-AWQ",
-    base_url="http://localhost:23333/v1",
-    api_key="placeholder",
-    model_capabilities={
-        "vision": True,
-        "function_calling": True,
-        "json_output": True,
-    },
-)
-# Define a tool
-modelvl = OpenAIChatCompletionClient(
-    # model="F:\\try\\qwen\\Qwen2.5-1.5B-Instruct-AWQ",
-    model="F:\\try\\qwen\\InternVL2_5-8B-AWQ",
-    base_url="http://localhost:23334/v1",
-    api_key="placeholder",
-    model_capabilities={
-        "vision": True,
-        "function_calling": True,
-        "json_output": True,
-    },
-)
-
-
-async def add_two_numbers(a: int,b: int) -> int:
-    return a+b
-
-async def multiply_two_numbers(a: int,b: int) -> int:
-    return a*b
-
-
-async def main() -> None:
-    # Define an agent
-    weather_agent = AssistantAgent(
-        name="weather_agent",
-        model_client=model,
-        tools=[multiply_two_numbers,add_two_numbers],
-    )
-
-    # Define termination condition
-    termination = TextMentionTermination("TERMINATE")
-    # termination = TextMentionTermination("STOP")
-
-    # Define a team
-    agent_team = RoundRobinGroupChat([weather_agent], termination_condition=termination, max_turns=12)
-
-    # Run the team and stream messages to the console
-    stream = agent_team.run_stream(task="What 5 plus 6?")
-    await Console(stream)
-
-asyncio.run(main())
-
-
-
-
-
-
-
-
-# todo, speedtest local models
-import time
-tim = time.perf_counter()
-agent = AssistantAgent(
-    name="weather_agent",
-    model_client=model,
-)
-tokens = 0
-async def assistant_run() -> None:
-    global tokens
-    response = await agent.on_messages(
-        [TextMessage(content="what the difference and similarities between tiger, lion. provide a 500 word answer", source="user")],
-        cancellation_token=CancellationToken(),
-    )
-    # print(response.inner_messages)
-    tokens= response.chat_message.models_usage.completion_tokens
-
-asyncio.run(assistant_run())
-print(tokens/(time.perf_counter() - tim))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import asyncio
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.base import TaskResult
@@ -142,42 +44,7 @@ from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_agentchat.ui import Console
 from autogen_core import CancellationToken
 from autogen_ext.models.openai import OpenAIChatCompletionClient
-
-primary_agent = AssistantAgent(
-    "primary",
-    model_client=model,
-    system_message="You are a helpful AI assistant.",
-)
-
-# Create the critic agent.
-critic_agent = AssistantAgent(
-    "critic",
-    model_client=model,
-    system_message="Provide constructive feedback. Respond with 'APPROVE' to when your feedbacks are addressed.",
-)
-
-# Define a termination condition that stops the task if the critic approves.
-text_termination = TextMentionTermination("APPROVE")
-
-# Create a team with the primary and critic agents.
-team = RoundRobinGroupChat([primary_agent, critic_agent], termination_condition=text_termination)
-
-
-result = asyncio.run( team.run(task="Write a short poem about the fall season."))
-print(result)
-
-
-
-
-
-
-
-
-
-
-
-
-
+from providers.local_openAI import model_llm, model_vlm, model_vlm_local, model_name
 from typing import Any, Dict, List
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.conditions import HandoffTermination, TextMentionTermination
@@ -185,221 +52,10 @@ from autogen_agentchat.messages import HandoffMessage
 from autogen_agentchat.teams import Swarm
 from autogen_agentchat.ui import Console
 from autogen_ext.models.openai import OpenAIChatCompletionClient
-
-
-def refund_flight(flight_id: str) -> str:
-    """Refund a flight"""
-    return f"Flight {flight_id} refunded"
-
-
-travel_agent = AssistantAgent(
-    "travel_agent",
-    model_client=model,
-    handoffs=["flights_refunder", "user"],
-    system_message="""You are a travel agent.
-    The flights_refunder is in charge of refunding flights.
-    If you need information from the user, you must first send your message, then you can handoff to the user.
-    Use TERMINATE when the travel planning is complete.""",
-)
-
-flights_refunder = AssistantAgent(
-    "flights_refunder",
-    model_client=model,
-    handoffs=["travel_agent", "user"],
-    tools=[refund_flight],
-    system_message="""You are an agent specialized in refunding flights.
-    You only need flight reference numbers to refund a flight.
-    You have the ability to refund a flight using the refund_flight tool.
-    If you need information from the user, you must first send your message, then you can handoff to the user.
-    When the transaction is complete, handoff to the travel agent to finalize.""",
-)
-
-
-
-termination = HandoffTermination(target="user") | TextMentionTermination("TERMINATE")
-team = Swarm([travel_agent, flights_refunder], termination_condition=termination)
-
-task = "can you help me refund my flight."
-
-
-async def run_team_stream() -> None:
-    task_result = await Console(team.run_stream(task=task))
-    last_message = task_result.messages[-1]
-
-    while isinstance(last_message, HandoffMessage) and last_message.target == "user":
-        user_message = input("User: ")
-
-        task_result = await Console(
-            team.run_stream(task=HandoffMessage(source="user", target=last_message.source, content=user_message))
-        )
-        last_message = task_result.messages[-1]
-
-
-asyncio.run( run_team_stream())
-
-
-
-
-
-
-
-
-
-
-working_directory = TemporaryDirectory(dir =r'F:\temp')
-toolkit = FileManagementToolkit(
-    root_dir=str(working_directory.name)
-)  # If you don't provide a root_dir, operations will default to the current working directory
-l = toolkit.get_tools()
-
-
-async def main() -> None:
-    tool = [LangChainToolAdapter(i) for i in l]
-    tool = [*tool,LangChainToolAdapter(DuckDuckGoSearchRun())]
-    model_client = model
-    agent = AssistantAgent(
-        "assistant",
-        # tools=[tool],
-        tools=tool,
-        model_client=model_client,
-        system_message="You are an AI assistant with web search and file handling capabilities. Your task is to perform web searches and save results systematically.",
-    )
-    await Console(
-        web_search.on_messages_stream(
-            # [TextMessage(content="1- Search the web for Allama Iqbal.\n2- Create a new file locally with name iqbal.txt.\n3- write the resulting text of search in iqbal.txt", source="user")], CancellationToken()
-            [TextMessage(content="""search the web for elon""", source="user")], CancellationToken()
-        )
-    )
-asyncio.run(main())
-
-async def main() -> None:
-    model_client = model
-    agent = AssistantAgent(
-        "assistant",
-        tools=[tool],
-        model_client=model_client,
-        system_message="You are an AI assistant.",
-    )
-    await Console(
-        agent.on_messages_stream(
-            # [TextMessage(content="1- Search the web for Allama Iqbal.\n2- Create a new file locally with name iqbal.txt.\n3- write the resulting text of search in iqbal.txt", source="user")], CancellationToken()
-            [TextMessage(content=content, source="user")], CancellationToken()
-        )
-    )
-asyncio.run(main())
-
-
-
-
-
-
-
-
-
-def get_index(bound, fps, max_frame, first_idx=0, num_segments=32):
-    if bound:
-        start, end = bound[0], bound[1]
-    else:
-        start, end = -100000, 100000
-    start_idx = max(first_idx, round(start * fps))
-    end_idx = min(round(end * fps), max_frame)
-    seg_size = float(end_idx - start_idx) / num_segments
-    frame_indices = np.array([
-        int(start_idx + (seg_size / 2) + np.round(seg_size * idx))
-        for idx in range(num_segments)
-    ])
-    return frame_indices
-
-
-def load_video(video_path, bound=None, num_segments=32):
-    vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
-    max_frame = len(vr) - 1
-    fps = float(vr.get_avg_fps())
-    frame_indices = get_index(bound, fps, max_frame, first_idx=0, num_segments=num_segments)
-    imgs = []
-    for frame_index in frame_indices:
-        img = Image.fromarray(vr[frame_index].asnumpy()).convert('RGB')
-        imgs.append(img)
-    return imgs
-
-
-
-
-def Live_camera_balcony(max_frames):
-
-    video_path = 'e:/tour2.mp4'
-    imgs = load_video(video_path, num_segments=max_frames)
-
-    question = ''
-    for i in range(len(imgs)):
-        question = question + f'Frame{i+1}: {IMAGE_TOKEN}\n'
-
-    question += 'describe this video in maximum detail. describe each segment and settings?'
-
-    content = [{'type': 'text', 'text': question}]
-    for img in imgs:
-        content.append({'type': 'image_url', 'image_url': {'max_dynamic_patch': 1, 'url': f'data:image/jpeg;base64,{encode_image_base64(img)}'}})
-
-    messages = [dict(role='user', content=content)]
-    out = pipe(messages, gen_config=GenerationConfig(top_k=1))
-    out = pipe(messages, gen_config=gen_config)
-    out.text
-
-
 import cv2
 import math
 import time
 import numpy as np
-
-def extract_frames_per_second(mp4_file_path,sfps):
-    try:
-        cap = cv2.VideoCapture(mp4_file_path)
-
-        if not cap.isOpened():
-            print(f"Error: Could not open video file '{mp4_file_path}'.")
-            return
-
-        fps = cap.get(cv2.CAP_PROP_FPS)  # Get frames per second
-        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)  # Get frames per second
-        w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # Get frames per second
-        h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # Get frames per second
-        duration =math.ceil(total_frames/fps)  # Get frames per second
-
-        frame_count = 0
-        seconds_passed = 0
-
-        while True:
-            ret, frame = cap.read()
-
-            if not ret:  # End of the video
-                break
-
-            frame_count += 1
-
-            # Check if one second has passed
-            if frame_count >= (seconds_passed + 1) * sfps:
-                seconds_passed = seconds_passed+ (sfps/fps)
-                time.sleep(sfps/fps)
-                yield frame
-
-        cap.release()
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        yield None
-
-
-# Example usage:
-for i,frame in enumerate(extract_frames_per_second("e:/tour2.mp4",10)):
-    if frame is not None:
-        print(i)
-        # cv2.imwrite(f"./frames/{i}.jpg", frame)
-
-
-
-
-
-
 from collections import deque
 import cv2
 import time
@@ -409,9 +65,6 @@ from PIL import Image
 import io
 
 
-from openai import OpenAI
-client = OpenAI(api_key='ss', base_url='http://localhost:23334/v1')
-model_name = client.models.list().data[0].id
 
 class RealtimeVideoContext:
     def __init__(self, video_source, window_size=10, fps=1.0):
@@ -464,7 +117,8 @@ class RealtimeVideoContext:
         self.running = False
         self.capture_thread.join()
 video_context = RealtimeVideoContext(
-    video_source="E:/tour2.mp4",
+    video_source="E:/imran2.mp4",
+    # video_source="E:/tour2.mp4",
     window_size=10,  # Keep last 10 seconds
     fps=1  # 1 frame per second
 )
@@ -475,11 +129,12 @@ def live_interaction(user_query):
     context of video
     :return: str
     """
+    # global video_context
     imgs = list(video_context.frame_buffer)
     question = ''
     for i in range(len(imgs)):
         question = question + f'Frame{i+1}: {IMAGE_TOKEN}\n'
-    question += 'what am i trying to capture while vlogging?'
+    question += 'what am i trying to capture while vlogging in this video?'
 
     content = [{'type': 'text', 'text': question}]
     for img in imgs:
@@ -490,13 +145,13 @@ def live_interaction(user_query):
 
 
 
-response = client.chat.completions.create(
-    model=model_name,
-    messages = messages,
-    temperature=0.8,
-    top_p=0.8)
-print(response)
-
+    response = model_vlm_local.chat.completions.create(
+        model=model_name,
+        messages = messages,
+        temperature=0.8,
+        top_p=0.8)
+    print(response)
+live_interaction("user_query")
 
 
 persistant one is working 10 sec chunks always
@@ -554,7 +209,7 @@ Use TERMINATE when research is complete.""",
 
 camera_garage = AssistantAgent(
     "camera_garage",
-    model_client=modelvl,
+    model_client=model_llm,
     handoffs=["planner"],
     tools=[Live_camera_balcony],
     system_message="""

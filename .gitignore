@@ -1,5 +1,6 @@
 # .idea folder
 .idea/
+.garbage/
 
 # Python specific ignores
 *.pyc
@@ -38,3 +39,4 @@ coverage/
 target/
 dist/
 build/
+/garbage/
