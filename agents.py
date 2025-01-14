@@ -95,7 +95,7 @@ class RealtimeVideoContext:
             if not ret:
                 break
 
-            if frame_count % (30 // self.fps) == 0:  # Assuming 30fps video
+            if frame_count % (24 // self.fps) == 0:  # Assuming 30fps video
                 # Convert frame to PIL Image for VLM compatibility
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_image = Image.fromarray(frame_rgb)
@@ -117,11 +117,12 @@ class RealtimeVideoContext:
         self.running = False
         self.capture_thread.join()
 video_context = RealtimeVideoContext(
-    video_source="E:/imran2.mp4",
+    video_source="G:/b.mp4",
     # video_source="E:/tour2.mp4",
     window_size=10,  # Keep last 10 seconds
     fps=1  # 1 frame per second
 )
+
 # Example usage:
 def live_interaction(user_query):
     """
@@ -129,29 +130,26 @@ def live_interaction(user_query):
     context of video
     :return: str
     """
-    # global video_context
     imgs = list(video_context.frame_buffer)
     question = ''
     for i in range(len(imgs)):
         question = question + f'Frame{i+1}: {IMAGE_TOKEN}\n'
-    question += 'what am i trying to capture while vlogging in this video?'
+    question += user_query
 
     content = [{'type': 'text', 'text': question}]
     for img in imgs:
         content.append({'type': 'image_url', 'image_url': {'max_dynamic_patch': 1, 'url': f'data:image/jpeg;base64,{encode_image_base64(img)}'}})
     messages = [dict(role='user', content=content)]
+    # response = model_vlm_local.chat.completions.create(model=model_name,messages = messages,temperature=0.8,top_p=0.8)
+    response = model_vlm_local.chat.completions.create(model=model_name,messages = messages,temperature=1)
+    return response.choices[0].dict()['message']['content']
 
-    # out = pipe(messages, gen_config=GenerationConfig(top_k=1))
+live_interaction('what is happening in this video?')
+live_interaction('do you see cars in video?')
+live_interaction('how many cars?')
+live_interaction('what is happening in this video?')
+live_interaction('what is happening?')
 
-
-
-    response = model_vlm_local.chat.completions.create(
-        model=model_name,
-        messages = messages,
-        temperature=0.8,
-        top_p=0.8)
-    print(response)
-live_interaction("user_query")
 
 
 persistant one is working 10 sec chunks always
