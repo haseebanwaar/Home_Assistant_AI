@@ -8,8 +8,8 @@ model_name = model_vlm_local.models.list().data[0].id
 
 
 model_llm = OpenAIChatCompletionClient(
-    # model="F:\\try\\qwen\\Qwen2.5-1.5B-Instruct-AWQ",
-    model="D:\VLM\qwen\Qwen2.5-7B-Instruct-AWQ",
+    model="F:\\try\\qwen\\Qwen2.5-1.5B-Instruct-AWQ",
+    # model="D:\VLM\qwen\Qwen2.5-7B-Instruct-AWQ",
     base_url="http://localhost:23333/v1",
     api_key="placeholder",
     model_capabilities={
@@ -20,8 +20,8 @@ model_llm = OpenAIChatCompletionClient(
 )
 # Define a tool
 model_vlm = OpenAIChatCompletionClient(
-    # model="F:\\try\\qwen\\Qwen2.5-1.5B-Instruct-AWQ",
-    model="D:\VLM\qwen\InternVL2_5-8B-AWQ",
+    model="F:\\try\\qwen\\InternVL2_5-8B-AWQ",
+    # model="D:\VLM\qwen\InternVL2_5-8B-AWQ",
     base_url="http://localhost:23334/v1",
     api_key="placeholder",
     model_capabilities={

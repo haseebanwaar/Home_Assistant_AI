@@ -64,73 +64,39 @@ import numpy as np
 from PIL import Image
 import io
 
+from sources.file import RealtimeFileContext
+from sources.rtsp import RealtimeCameraStream
+from sources.screen import RealtimeScreenCapture
 
+# video_stream = RealtimeFileContext(
+#     # video_source="G:/b.mp4",
+#     video_source="E:/tour2.mp4",
+#     window_size=10,  # Keep last 10 seconds
+#     fps=1  # 1 frame per second
+# )
+#
+# camera_stream = RealtimeCameraStream(
+#     # video_source="G:/b.mp4",
+#     video_source="E:/tour2.mp4",
+#     window_size=10,  # Keep last 10 seconds
+#     fps=1  # 1 frame per second
+# )
 
-class RealtimeVideoContext:
-    def __init__(self, video_source, window_size=10, fps=1.0):
-        """
-        Args:
-            video_source: RTSP URL or video path
-            window_size: Number of seconds to keep in memory
-            fps: Frames per second to process
-        """
-        self.video_source = video_source
-        self.window_size = window_size
-        self.fps = fps
-        self.frame_buffer = deque(maxlen=window_size)
-        self.lock = Lock()
-        self.running = True
-
-        # Start frame capture thread
-        self.capture_thread = Thread(target=self._capture_frames)
-        self.capture_thread.daemon = True
-        self.capture_thread.start()
-
-    def _capture_frames(self):
-        video = cv2.VideoCapture(self.video_source)
-        frame_count = 0
-
-        while self.running:
-            ret, frame = video.read()
-            if not ret:
-                break
-
-            if frame_count % (24 // self.fps) == 0:  # Assuming 30fps video
-                # Convert frame to PIL Image for VLM compatibility
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_image = Image.fromarray(frame_rgb)
-
-                timestamp = time.time()
-                with self.lock:
-                    # self.frame_buffer.append({
-                    #     'image': pil_image,
-                    #     'timestamp': timestamp
-                    # })
-                    self.frame_buffer.append(pil_image)
-                time.sleep(0.99)
-
-            frame_count += 1
-
-        video.release()
-
-    def cleanup(self):
-        self.running = False
-        self.capture_thread.join()
-video_context = RealtimeVideoContext(
-    video_source="G:/b.mp4",
-    # video_source="E:/tour2.mp4",
+screen_stream = RealtimeScreenCapture(
+    # video_source="G:/b.mp4",
+    video_source="",
     window_size=10,  # Keep last 10 seconds
     fps=1  # 1 frame per second
 )
 
-# Example usage:
-def live_interaction(user_query):
+#todo, use thread for preprocessing
+def live_interaction(video_context, user_query):
     """
     reads stream from camera and answer user text queries and questions according to current
     context of video
     :return: str
     """
-    imgs = list(video_context.frame_buffer)
+    imgs = list(screen_stream.frame_buffer)
     question = ''
     for i in range(len(imgs)):
         question = question + f'Frame{i+1}: {IMAGE_TOKEN}\n'
@@ -144,11 +110,11 @@ def live_interaction(user_query):
     response = model_vlm_local.chat.completions.create(model=model_name,messages = messages,temperature=1)
     return response.choices[0].dict()['message']['content']
 
-live_interaction('what is happening in this video?')
-live_interaction('do you see cars in video?')
-live_interaction('how many cars?')
-live_interaction('what is happening in this video?')
-live_interaction('what is happening?')
+live_interaction(screen_stream,'what is happening in this video?')
+live_interaction(screen_stream,'do you see cars in video?')
+live_interaction(screen_stream,'how many cars?')
+live_interaction(screen_stream,'what is happening in this video?')
+live_interaction(screen_stream,'what is happening?')
 
 
 
