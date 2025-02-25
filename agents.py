@@ -80,7 +80,7 @@ from sources.screen import RealtimeScreenCapture
 #     video_source="E:/tour2.mp4",
 #     window_size=10,  # Keep last 10 seconds
 #     fps=1  # 1 frame per second
-# )
+# ) 3,686,400
 
 screen_stream = RealtimeScreenCapture(
     # video_source="G:/b.mp4",
@@ -104,18 +104,19 @@ def live_interaction(video_context, user_query):
 
     content = [{'type': 'text', 'text': question}]
     for img in imgs:
-        content.append({'type': 'image_url', 'image_url': {'max_dynamic_patch': 1, 'url': f'data:image/jpeg;base64,{encode_image_base64(img)}'}})
+        #todo, what with max_dynamic_patch, its actually image detail
+        content.append({'type': 'image_url', 'image_url': {'max_dynamic_patch': 24, 'url': f'data:image/jpeg;base64,{encode_image_base64(img)}'}})
     messages = [dict(role='user', content=content)]
     # response = model_vlm_local.chat.completions.create(model=model_name,messages = messages,temperature=0.8,top_p=0.8)
     response = model_vlm_local.chat.completions.create(model=model_name,messages = messages,temperature=1)
     return response.choices[0].dict()['message']['content']
 
 live_interaction(screen_stream,'what is happening in this video?')
-live_interaction(screen_stream,'do you see cars in video?')
-live_interaction(screen_stream,'how many cars?')
-live_interaction(screen_stream,'what is happening in this video?')
+live_interaction(screen_stream,'whats happening in code line no 107?')
+live_interaction(screen_stream,'can you tell what i am doing in this video?')
+live_interaction(screen_stream,'can you write the code you see on the screen?')
+live_interaction(screen_stream,'focus on extreme right where you see green graphs. explain each sub graphs?')
 live_interaction(screen_stream,'what is happening?')
-
 
 
 persistant one is working 10 sec chunks always
@@ -272,4 +273,25 @@ ACTION_TAKEN: [What change was made]
 AFFECTED_LIGHTS: [Which lights were modified]
 STATUS: [Success/Failure]""",
 )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

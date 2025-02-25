@@ -213,5 +213,9 @@ messages.append(dict(role='assistant', content=out.text))
 messages.append(dict(role='user', content='what kind of car it is?'))
 out = pipe(messages, gen_config=GenerationConfig(top_k=1))
 
+messages.append(dict(role='assistant', content=out.text))
+messages.append(dict(role='user', content='what kind of car it is?'))
+out = pipe(messages, gen_config=GenerationConfig(top_k=1))
+
 
 
