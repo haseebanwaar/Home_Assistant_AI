@@ -31,20 +31,23 @@ class RealtimeScreenCapture:
     def _capture_frames(self):
         # video = cv2.VideoCapture(self.video_source)
         frame_count = 0
+        with mss() as sct:
+            monitor = sct.monitors[1]  # Primary monitor
 
-        while self.running:
+            while self.running:
             # ret, frame = video.read()
             # if not ret:
             #     break
 
 
             # Initialize mss
-            with mss() as sct:
+
                 # Capture the screen
-                monitor = sct.monitors[1]  # Primary monitor
                 screenshot = sct.grab(monitor)
 
                 # Convert to numpy array if needed
+                # frame = Image.frombytes('RGB', (img.width, img.height), img.rgb)
+
                 img = np.array(screenshot)[:,:,:3]
                 frame_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 pil_image = Image.fromarray(frame_rgb)
