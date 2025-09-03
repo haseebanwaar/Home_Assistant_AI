@@ -1,4 +1,4 @@
-# Home Assistant AI
+<img width="880" height="313" alt="image" src="https://github.com/user-attachments/assets/2cf3e381-df8b-4b93-aa96-7099be0fe9e5" /># Home Assistant AI
 <img width="1024" height="490" alt="image" src="https://github.com/user-attachments/assets/dd2441e4-2e12-40cc-80eb-a4e9d3e181ff" />
 
 **Description:**
@@ -22,5 +22,5 @@ Orpheus 0.1 ft	0.63	2.3	high	Expressive, emotions	-
 (Q2_k gguf)
 Chatterbox	1	5.2	high	Plain	yes
 Kitten TTS	0.44	0.8	low	Noisy, robotic	-
-<img width="880" height="336" alt="image" src="https://github.com/user-attachments/assets/baae974f-3159-49f3-9933-11d2ce6a76c8" />
+<img width="880" height="313" alt="image" src="https://github.com/user-attachments/assets/cf009c66-4113-4bde-b1ad-ef9f26c6d6e4" />
 
