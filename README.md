@@ -15,5 +15,10 @@ Home Assistant AI is an initiative to develop a next-generation, agents-based sy
 
 ## Components
 ### TTS
-<img width="880" height="313" alt="image" src="https://github.com/user-attachments/assets/cf009c66-4113-4bde-b1ad-ef9f26c6d6e4" />
-
+| Model | Realtime Factor | VRAM (GB) | Quality | Extra | Zero-shot Voice Cloning |
+|---|---|---|---|---|---|
+| VibeVoice 1.5B (bfloat16) | 1.65 | 6 | high | Expressive | yes |
+| Kokoro | 0.02 | 2.5 | low | Bit robotic | - |
+| Orpheus 0.1 ft (Q2_k gguf) | 0.63 | 2.3 | high | Expressive, emotions | - |
+| Chatterbox | 1 | 5.2 | high | Plain | yes |
+| Kitten TTS | 0.44 | 0.8 | low | Noisy, robotic | - |
