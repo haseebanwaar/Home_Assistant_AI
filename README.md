@@ -15,8 +15,12 @@ Home Assistant AI is an initiative to develop a next-generation, agents-based sy
 
 ## Components
 ### TTS
-- **Natural Language Understanding**: Powered by state-of-the-art LLMs for human-like text and voice interactions.
-- **Visual Recognition**: Enabled by VLMs for tasks like recognizing objects, faces, and scenes.
-- **Omnidirectional Integration**: Supports IoT devices, calendars, email, and more.
-- **Agent-Based Architecture**: Modular and extensible design for adding new features.
-- **Privacy First**: Ensures user data is handled securely and respects privacy.
+Model	Realtime Factor	VRAM (GB)	Quality	Extra	Zero-shot Voice Cloning
+VibeVoice 1.5B (bfloat16)	1.65	6	high	Expressive	yes
+Kokoro	0.02	2.5	low	Bit robotic	-
+Orpheus 0.1 ft	0.63	2.3	high	Expressive, emotions	-
+(Q2_k gguf)
+Chatterbox	1	5.2	high	Plain	yes
+Kitten TTS	0.44	0.8	low	Noisy, robotic	-
+<img width="880" height="336" alt="image" src="https://github.com/user-attachments/assets/baae974f-3159-49f3-9933-11d2ce6a76c8" />
+
