@@ -1,4 +1,4 @@
-# Home Assistant AI
+<img width="1024" height="490" alt="image" src="https://github.com/user-attachments/assets/dd2441e4-2e12-40cc-80eb-a4e9d3e181ff" /># Home Assistant AI
 
 **Description:**
 Towards Agents-based Home and Personal Assistant AI (LLM, VLM, Omni)
@@ -13,6 +13,7 @@ Home Assistant AI is an initiative to develop a next-generation, agents-based sy
 4. **Seamless Integration**: Work across various platforms and devices.
 
 ## Components
+### TTS
 - **Natural Language Understanding**: Powered by state-of-the-art LLMs for human-like text and voice interactions.
 - **Visual Recognition**: Enabled by VLMs for tasks like recognizing objects, faces, and scenes.
 - **Omnidirectional Integration**: Supports IoT devices, calendars, email, and more.
