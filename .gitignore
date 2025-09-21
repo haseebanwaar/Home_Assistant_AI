@@ -1,9 +1,4 @@
 
-smart_devices/
-utils/
-examples/
-temp_media/
-todo.py
 
 
 
@@ -48,3 +43,7 @@ coverage/
 target/
 dist/
 build/
+/examples/
+/smart_devices/
+/temp_media/
+/utils/
