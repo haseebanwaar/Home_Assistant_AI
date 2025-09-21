@@ -1,4 +1,5 @@
 # Home Assistant AI
+<img width="1024" height="490" alt="image" src="https://github.com/user-attachments/assets/dd2441e4-2e12-40cc-80eb-a4e9d3e181ff" />
 
 **Description:**
 Towards Agents-based Home and Personal Assistant AI (LLM, VLM, Omni)
@@ -12,56 +13,12 @@ Home Assistant AI is an initiative to develop a next-generation, agents-based sy
 3. **Personalization**: Adapt to individual user preferences and habits over time.
 4. **Seamless Integration**: Work across various platforms and devices.
 
-## Key Features
-- **Natural Language Understanding**: Powered by state-of-the-art LLMs for human-like text and voice interactions.
-- **Visual Recognition**: Enabled by VLMs for tasks like recognizing objects, faces, and scenes.
-- **Omnidirectional Integration**: Supports IoT devices, calendars, email, and more.
-- **Agent-Based Architecture**: Modular and extensible design for adding new features.
-- **Privacy First**: Ensures user data is handled securely and respects privacy.
-
-## Use Cases
-- **Smart Home Management**: Control smart devices, monitor home security, and automate routines.
-- **Personal Productivity**: Manage schedules, set reminders, and organize tasks.
-- **Information Retrieval**: Answer questions and provide insights from multiple sources.
-- **Entertainment**: Recommend music, movies, and more based on user preferences.
-
-## Architecture
-The system is composed of the following:
-1. **Core LLM**: The brain of the assistant, handling natural language processing.
-2. **VLM Integration**: Provides vision-based capabilities for multimodal interactions.
-3. **Agents**: Specialized modules that handle specific tasks.
-4. **Omni Connector**: Ensures compatibility with diverse platforms and APIs.
-
-## Getting Started
-### Prerequisites
-- Python 3.8+
-- Required libraries (listed in `requirements.txt`)
-- Compatible IoT devices (optional, for smart home integration)
-
-### Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/your-username/home_assistant_ai.git
-   cd home_assistant_ai
-   ```
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Run the application:
-   ```bash
-   python main.py
-   ```
-
-## Contributing
-Contributions are welcome! Please follow these steps:
-1. Fork the repository.
-2. Create a new branch for your feature or bugfix.
-3. Commit your changes and push them to your fork.
-4. Submit a pull request.
-
-## License
-This project is licensed under the MIT License. See the `LICENSE` file for more details.
-
-## Contact
-For questions, suggestions, or feedback, please contact [your-email@example.com].
+## Components
+### TTS
+| Model | Realtime Factor | VRAM (GB) | Quality | Extra | Zero-shot Voice Cloning |Sample|
+|---|---|---|---|---|---|---|
+| VibeVoice 1.5B (bfloat16) | 1.65 | 6 | high | Expressive | yes |---|
+| Kokoro | 0.02 | 2.5 | low | Bit robotic | - |---|
+| Orpheus 0.1 ft (Q2_k gguf) | 0.63 | 2.3 | high | Expressive, emotions | - |---|
+| Chatterbox | 1 | 5.2 | high | Plain | yes |---|
+| Kitten TTS | 0.44 | 0.8 | low | Noisy, robotic | - |---|
