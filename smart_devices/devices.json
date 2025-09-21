@@ -1,0 +1,849 @@
+[
+    {
+        "name": "LED BULB W509Z2",
+        "id": "bf03f976dbc55901f9nblx",
+        "key": "lwJ<Q3[tL)]XlNt2",
+        "mac": "fc:3c:d7:3f:b9:ee",
+        "uuid": "762ac8562e494cbf",
+        "category": "dj",
+        "product_name": "LED BULB W509Z2",
+        "product_id": "xibcsv6dp3ajzth9",
+        "biz_type": 0,
+        "model": "\u4eae\u725b \u82af\u7247\u4e0a\u677f BP5758 9w\u7403\u6ce1",
+        "sub": false,
+        "icon": "https://images.tuyaeu.com/smart/icon/bay17276620713082cth/0d4d6a7f2390f7874670ea40bc8ce506.png",
+        "mapping": {
+            "20": {
+                "code": "switch_led",
+                "type": "Boolean",
+                "values": {}
+            },
+            "21": {
+                "code": "work_mode",
+                "type": "Enum",
+                "values": {
+                    "range": [
+                        "white",
+                        "colour",
+                        "scene",
+                        "music"
+                    ]
+                }
+            },
+            "22": {
+                "code": "bright_value_v2",
+                "type": "Integer",
+                "values": {
+                    "min": 10,
+                    "max": 1000,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "23": {
+                "code": "temp_value_v2",
+                "type": "Integer",
+                "values": {
+                    "min": 0,
+                    "max": 1000,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "24": {
+                "code": "colour_data_v2",
+                "type": "Json",
+                "raw_values": "{\"h\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":360,\"step\":1},\"s\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1},\"v\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1}}",
+                "values": {
+                    "h": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 360,
+                        "step": 1
+                    },
+                    "s": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 1000,
+                        "step": 1
+                    },
+                    "v": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 1000,
+                        "step": 1
+                    }
+                }
+            },
+            "25": {
+                "code": "scene_data_v2",
+                "type": "Json",
+                "raw_values": "{\"scene_num\":{\"min\":1,\"scale\":0,\"max\":8,\"step\":1},\"scene_units\": {\"unit_change_mode\":{\"range\":[\"static\",\"jump\",\"gradient\"]},\"unit_switch_duration\":{\"min\":0,\"scale\":0,\"max\":100,\"step\":1},\"unit_gradient_duration\":{\"min\":0,\"scale\":0,\"max\":100,\"step\":1},\"bright\":{\"min\":0,\"scale\":0,\"max\":1000,\"step\":1},\"temperature\":{\"min\":0,\"scale\":0,\"max\":1000,\"step\":1},\"h\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":360,\"step\":1},\"s\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1},\"v\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1}}}",
+                "values": {
+                    "scene_num": {
+                        "min": 1,
+                        "scale": 0,
+                        "max": 8,
+                        "step": 1
+                    },
+                    "scene_units": {
+                        "unit_change_mode": {
+                            "range": [
+                                "static",
+                                "jump",
+                                "gradient"
+                            ]
+                        },
+                        "unit_switch_duration": {
+                            "min": 0,
+                            "scale": 0,
+                            "max": 100,
+                            "step": 1
+                        },
+                        "unit_gradient_duration": {
+                            "min": 0,
+                            "scale": 0,
+                            "max": 100,
+                            "step": 1
+                        },
+                        "bright": {
+                            "min": 0,
+                            "scale": 0,
+                            "max": 1000,
+                            "step": 1
+                        },
+                        "temperature": {
+                            "min": 0,
+                            "scale": 0,
+                            "max": 1000,
+                            "step": 1
+                        },
+                        "h": {
+                            "min": 0,
+                            "scale": 0,
+                            "unit": "",
+                            "max": 360,
+                            "step": 1
+                        },
+                        "s": {
+                            "min": 0,
+                            "scale": 0,
+                            "unit": "",
+                            "max": 1000,
+                            "step": 1
+                        },
+                        "v": {
+                            "min": 0,
+                            "scale": 0,
+                            "unit": "",
+                            "max": 1000,
+                            "step": 1
+                        }
+                    }
+                }
+            },
+            "26": {
+                "code": "countdown_1",
+                "type": "Integer",
+                "values": {
+                    "unit": "s",
+                    "min": 0,
+                    "max": 86400,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "27": {
+                "code": "music_data",
+                "type": "Json",
+                "raw_values": "{\"change_mode\":{\"range\":[\"direct\",\"gradient\"]}, \"bright\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1}, \"temperature\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1}, \"h\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":360,\"step\":1},\"s\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":255,\"step\":1},\"v\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":255,\"step\":1}}",
+                "values": {
+                    "change_mode": {
+                        "range": [
+                            "direct",
+                            "gradient"
+                        ]
+                    },
+                    "bright": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 1000,
+                        "step": 1
+                    },
+                    "temperature": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 1000,
+                        "step": 1
+                    },
+                    "h": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 360,
+                        "step": 1
+                    },
+                    "s": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 255,
+                        "step": 1
+                    },
+                    "v": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 255,
+                        "step": 1
+                    }
+                }
+            },
+            "28": {
+                "code": "control_data",
+                "type": "Json",
+                "raw_values": "{\"change_mode\":{\"range\":[\"direct\",\"gradient\"]}, \"bright\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1}, \"temperature\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1}, \"h\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":360,\"step\":1},\"s\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":255,\"step\":1},\"v\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":255,\"step\":1}}",
+                "values": {
+                    "change_mode": {
+                        "range": [
+                            "direct",
+                            "gradient"
+                        ]
+                    },
+                    "bright": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 1000,
+                        "step": 1
+                    },
+                    "temperature": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 1000,
+                        "step": 1
+                    },
+                    "h": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 360,
+                        "step": 1
+                    },
+                    "s": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 255,
+                        "step": 1
+                    },
+                    "v": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 255,
+                        "step": 1
+                    }
+                }
+            },
+            "30": {
+                "code": "rhythm_mode",
+                "type": "Raw",
+                "values": {
+                    "maxlen": "255"
+                }
+            },
+            "31": {
+                "code": "sleep_mode",
+                "type": "Raw",
+                "values": {
+                    "maxlen": "255"
+                }
+            },
+            "32": {
+                "code": "wakeup_mode",
+                "type": "Raw",
+                "values": {
+                    "maxlen": "255"
+                }
+            },
+            "33": {
+                "code": "power_memory",
+                "type": "Raw",
+                "values": {}
+            },
+            "34": {
+                "code": "do_not_disturb",
+                "type": "Boolean",
+                "values": {}
+            },
+            "209": {
+                "code": "cycle_timing",
+                "type": "Raw",
+                "values": {}
+            },
+            "210": {
+                "code": "random_timing",
+                "type": "Raw",
+                "values": {}
+            }
+        }
+    },
+    {
+        "name": "Wii-Fi Temperature & Humidity Sensor 2",
+        "id": "bf489dd05c973d89cbwpur",
+        "key": "&S:^JG6IKfz7&;)O",
+        "mac": "b8:06:0d:3b:ba:73",
+        "uuid": "8cda1abf8d32e719",
+        "sn": "10013922604DE5",
+        "category": "wsdcg",
+        "product_name": "Wii-Fi Temperature & Humidity Sensor",
+        "product_id": "xflodz7oja0pndk3",
+        "biz_type": 0,
+        "model": "TH08",
+        "sub": false,
+        "icon": "https://images.tuyaeu.com/smart/icon/ay15427647462366edzT/53c1c0d70d455d17ad15971996b442c6.png",
+        "mapping": {
+            "1": {
+                "code": "va_temperature",
+                "type": "Integer",
+                "values": {
+                    "unit": "\u00b0C",
+                    "min": -200,
+                    "max": 600,
+                    "scale": 1,
+                    "step": 1
+                }
+            },
+            "2": {
+                "code": "va_humidity",
+                "type": "Integer",
+                "values": {
+                    "unit": "%",
+                    "min": 0,
+                    "max": 100,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "4": {
+                "code": "battery_percentage",
+                "type": "Integer",
+                "values": {
+                    "unit": "%",
+                    "min": 0,
+                    "max": 100,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "9": {
+                "code": "temp_unit_convert",
+                "type": "Enum",
+                "values": {
+                    "range": [
+                        "c",
+                        "f"
+                    ]
+                }
+            },
+            "10": {
+                "code": "maxtemp_set",
+                "type": "Integer",
+                "values": {
+                    "unit": "\u00b0C",
+                    "min": -200,
+                    "max": 600,
+                    "scale": 1,
+                    "step": 1
+                }
+            },
+            "11": {
+                "code": "minitemp_set",
+                "type": "Integer",
+                "values": {
+                    "unit": "\u00b0C",
+                    "min": -200,
+                    "max": 600,
+                    "scale": 1,
+                    "step": 1
+                }
+            },
+            "12": {
+                "code": "maxhum_set",
+                "type": "Integer",
+                "values": {
+                    "unit": "%",
+                    "min": 0,
+                    "max": 100,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "13": {
+                "code": "minihum_set",
+                "type": "Integer",
+                "values": {
+                    "unit": "%",
+                    "min": 0,
+                    "max": 100,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "14": {
+                "code": "temp_alarm",
+                "type": "Enum",
+                "values": {
+                    "range": [
+                        "loweralarm",
+                        "upperalarm",
+                        "cancel"
+                    ]
+                }
+            },
+            "15": {
+                "code": "hum_alarm",
+                "type": "Enum",
+                "values": {
+                    "range": [
+                        "loweralarm",
+                        "upperalarm",
+                        "cancel"
+                    ]
+                }
+            },
+            "19": {
+                "code": "temp_sensitivity",
+                "type": "Integer",
+                "values": {
+                    "unit": "\u00b0C",
+                    "min": 3,
+                    "max": 20,
+                    "scale": 1,
+                    "step": 1
+                }
+            },
+            "20": {
+                "code": "hum_sensitivity",
+                "type": "Integer",
+                "values": {
+                    "unit": "%",
+                    "min": 3,
+                    "max": 20,
+                    "scale": 0,
+                    "step": 1
+                }
+            }
+        },
+        "ip": "",
+        "version": ""
+    },
+    {
+        "name": "Wii-Fi Temperature & Humidity Sensor",
+        "id": "bf6d70020405c647b4zsih",
+        "key": "T.f[{51NL4C`g=os",
+        "mac": "b8:06:0d:3b:c4:6e",
+        "uuid": "b0ebb4d44fb33340",
+        "sn": "10013922604E99",
+        "category": "wsdcg",
+        "product_name": "Wii-Fi Temperature & Humidity Sensor",
+        "product_id": "xflodz7oja0pndk3",
+        "biz_type": 0,
+        "model": "TH08",
+        "sub": false,
+        "icon": "https://images.tuyaeu.com/smart/icon/ay15427647462366edzT/53c1c0d70d455d17ad15971996b442c6.png",
+        "mapping": {
+            "1": {
+                "code": "va_temperature",
+                "type": "Integer",
+                "values": {
+                    "unit": "\u00b0C",
+                    "min": -200,
+                    "max": 600,
+                    "scale": 1,
+                    "step": 1
+                }
+            },
+            "2": {
+                "code": "va_humidity",
+                "type": "Integer",
+                "values": {
+                    "unit": "%",
+                    "min": 0,
+                    "max": 100,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "4": {
+                "code": "battery_percentage",
+                "type": "Integer",
+                "values": {
+                    "unit": "%",
+                    "min": 0,
+                    "max": 100,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "9": {
+                "code": "temp_unit_convert",
+                "type": "Enum",
+                "values": {
+                    "range": [
+                        "c",
+                        "f"
+                    ]
+                }
+            },
+            "10": {
+                "code": "maxtemp_set",
+                "type": "Integer",
+                "values": {
+                    "unit": "\u00b0C",
+                    "min": -200,
+                    "max": 600,
+                    "scale": 1,
+                    "step": 1
+                }
+            },
+            "11": {
+                "code": "minitemp_set",
+                "type": "Integer",
+                "values": {
+                    "unit": "\u00b0C",
+                    "min": -200,
+                    "max": 600,
+                    "scale": 1,
+                    "step": 1
+                }
+            },
+            "12": {
+                "code": "maxhum_set",
+                "type": "Integer",
+                "values": {
+                    "unit": "%",
+                    "min": 0,
+                    "max": 100,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "13": {
+                "code": "minihum_set",
+                "type": "Integer",
+                "values": {
+                    "unit": "%",
+                    "min": 0,
+                    "max": 100,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "14": {
+                "code": "temp_alarm",
+                "type": "Enum",
+                "values": {
+                    "range": [
+                        "loweralarm",
+                        "upperalarm",
+                        "cancel"
+                    ]
+                }
+            },
+            "15": {
+                "code": "hum_alarm",
+                "type": "Enum",
+                "values": {
+                    "range": [
+                        "loweralarm",
+                        "upperalarm",
+                        "cancel"
+                    ]
+                }
+            },
+            "19": {
+                "code": "temp_sensitivity",
+                "type": "Integer",
+                "values": {
+                    "unit": "\u00b0C",
+                    "min": 3,
+                    "max": 20,
+                    "scale": 1,
+                    "step": 1
+                }
+            },
+            "20": {
+                "code": "hum_sensitivity",
+                "type": "Integer",
+                "values": {
+                    "unit": "%",
+                    "min": 3,
+                    "max": 20,
+                    "scale": 0,
+                    "step": 1
+                }
+            }
+        },
+        "ip": "",
+        "version": ""
+    },
+    {
+        "name": "SCW-BL_CBHC3",
+        "id": "bfd9d492e56e71e905ebih",
+        "key": "g=y8~V:7x0zq1q!m",
+        "mac": "a8:80:55:97:c7:4a",
+        "uuid": "dcfa48bc0f18f70c",
+        "category": "dd",
+        "product_name": "SCW-BL_CBHC3",
+        "product_id": "hiwb6wsmk6liswsq",
+        "biz_type": 0,
+        "model": "",
+        "sub": false,
+        "icon": "https://images.tuyaeu.com/smart/icon/ay15373622314086wreM/7bab146d0018e93bfc1eb65808767a7d.png",
+        "mapping": {
+            "20": {
+                "code": "switch_led",
+                "type": "Boolean",
+                "values": {}
+            },
+            "21": {
+                "code": "work_mode",
+                "type": "Enum",
+                "values": {
+                    "range": [
+                        "white",
+                        "colour",
+                        "scene",
+                        "music"
+                    ]
+                }
+            },
+            "22": {
+                "code": "bright_value",
+                "type": "Integer",
+                "values": {
+                    "min": 10,
+                    "max": 1000,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "23": {
+                "code": "temp_value",
+                "type": "Integer",
+                "values": {
+                    "min": 0,
+                    "max": 1000,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "24": {
+                "code": "colour_data",
+                "type": "Json",
+                "raw_values": "{\"h\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":360,\"step\":1},\"s\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1},\"v\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1}}",
+                "values": {
+                    "h": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 360,
+                        "step": 1
+                    },
+                    "s": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 1000,
+                        "step": 1
+                    },
+                    "v": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 1000,
+                        "step": 1
+                    }
+                }
+            },
+            "26": {
+                "code": "countdown",
+                "type": "Integer",
+                "values": {
+                    "unit": "s",
+                    "min": 0,
+                    "max": 86400,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "27": {
+                "code": "music_data",
+                "type": "Json",
+                "raw_values": "{\"change_mode\":{\"range\":[\"direct\",\"gradient\"]}, \"bright\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1}, \"temperature\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":1000,\"step\":1}, \"h\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":360,\"step\":1},\"s\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":255,\"step\":1},\"v\":{\"min\":0,\"scale\":0,\"unit\":\"\",\"max\":255,\"step\":1}}",
+                "values": {
+                    "change_mode": {
+                        "range": [
+                            "direct",
+                            "gradient"
+                        ]
+                    },
+                    "bright": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 1000,
+                        "step": 1
+                    },
+                    "temperature": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 1000,
+                        "step": 1
+                    },
+                    "h": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 360,
+                        "step": 1
+                    },
+                    "s": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 255,
+                        "step": 1
+                    },
+                    "v": {
+                        "min": 0,
+                        "scale": 0,
+                        "unit": "",
+                        "max": 255,
+                        "step": 1
+                    }
+                }
+            }
+        },
+        "ip": "192.168.1.20",
+        "version": "3.3"
+    },
+    {
+        "name": "smart plug 2",
+        "id": "bf06e943faa47dbf26gcek",
+        "key": "-?3-eyTfe:Z`a}jY",
+        "mac": "18:de:50:b5:a3:f0",
+        "uuid": "b6014fea0169be2f",
+        "category": "cz",
+        "product_name": "smart plug",
+        "product_id": "g30xstbrfn01skee",
+        "biz_type": 0,
+        "model": "\u767e\u89c6\u76fe\u4e0d\u5e26\u8ba1\u91cf",
+        "sub": false,
+        "icon": "https://images.tuyaeu.com/smart/icon/ay15107356719526e3ps/fa1a3c94f69e4e40a0331f531530f906.png",
+        "mapping": {
+            "1": {
+                "code": "switch_1",
+                "type": "Boolean",
+                "values": {}
+            },
+            "9": {
+                "code": "countdown_1",
+                "type": "Integer",
+                "values": {
+                    "unit": "s",
+                    "min": 0,
+                    "max": 86400,
+                    "scale": 0,
+                    "step": 1
+                }
+            },
+            "38": {
+                "code": "relay_status",
+                "type": "Enum",
+                "values": {
+                    "range": [
+                        "power_off",
+                        "power_on",
+                        "last"
+                    ]
+                }
+            },
+            "39": {
+                "code": "light_mode",
+                "type": "Enum",
+                "values": {
+                    "range": [
+                        "relay",
+                        "pos",
+                        "none"
+                    ]
+                }
+            },
+            "40": {
+                "code": "child_lock",
+                "type": "Boolean",
+                "values": {}
+            },
+            "41": {
+                "code": "cycle_time",
+                "type": "String",
+                "values": "{}"
+            },
+            "42": {
+                "code": "random_time",
+                "type": "String",
+                "values": "{}"
+            },
+            "43": {
+                "code": "switch_inching",
+                "type": "String",
+                "values": "{}"
+            }
+        },
+        "ip": "192.168.1.22",
+        "version": "3.5"
+    },
+    {
+        "name": "Sunset Lamp",
+        "id": "bfbbdaiiuhpmuaoi",
+        "key": "A9B0E5227E5449C7",
+        "mac": "DC:23:50:8C:C6:10",
+        "uuid": "uuidaef2c5ad4b11",
+        "category": "dd",
+        "product_name": "Sunset Lamp",
+        "product_id": "6jxcdae1",
+        "biz_type": 0,
+        "model": "\u65b0\u4eae\u5ea6-\u843d\u65e5\u706f",
+        "sub": false,
+        "icon": "https://images.tuyaeu.com/smart/icon/bay16191755140180B2P/f11098b07ee7d7269bc59546de219053.png",
+        "mapping": {
+            "1": {
+                "code": "switch_led",
+                "type": "Boolean",
+                "values": {}
+            },
+            "2": {
+                "code": "work_mode",
+                "type": "Enum",
+                "values": {
+                    "range": [
+                        "white",
+                        "colour"
+                    ]
+                }
+            }
+        },
+        "ip": "",
+        "version": ""
+    }
+]

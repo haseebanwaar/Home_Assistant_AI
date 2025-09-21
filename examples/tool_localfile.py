@@ -9,9 +9,9 @@ from autogen_ext.tools.langchain import LangChainToolAdapter
 from langchain_community.agent_toolkits import FileManagementToolkit
 from langchain_community.tools import DuckDuckGoSearchRun
 
-from providers.local_openAI import model_llm
+from providers.local_openAI import model_vlm
 
-working_directory = TemporaryDirectory(dir=r'F:\temp')
+working_directory = TemporaryDirectory(dir=r'f:/models/')
 toolkit = FileManagementToolkit(
     root_dir=str(working_directory.name)
 )  # If you don't provide a root_dir, operations will default to the current working directory
@@ -21,7 +21,7 @@ l = toolkit.get_tools()
 async def main() -> None:
     tool = [LangChainToolAdapter(i) for i in l]
     tool = [*tool, LangChainToolAdapter(DuckDuckGoSearchRun())]
-    model_client = model_llm
+    model_client = model_function_callling
     agent = AssistantAgent(
         "assistant",
         # tools=[tool],
@@ -31,8 +31,8 @@ async def main() -> None:
     )
     await Console(
         agent.on_messages_stream(
-            # [TextMessage(content="1- Search the web for Allama Iqbal.\n2- Create a new file locally with name iqbal.txt.\n3- write the resulting text of search in iqbal.txt", source="user")], CancellationToken()
-            [TextMessage(content="""search the web for elon""", source="user")], CancellationToken()
+            [TextMessage(content="1- Search the web for Allama Iqbal.\n2- Create a new file locally with name iqbal.txt.\n3- write the resulting text of search in iqbal.txt", source="user")], CancellationToken()
+            # [TextMessage(content="""please list the directory contents""", source="user")], CancellationToken()
         )
     )
 

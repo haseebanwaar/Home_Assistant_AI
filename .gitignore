@@ -1,3 +1,12 @@
+
+/smart_devices
+/utils
+/examples
+/temp_media
+todo.py
+
+
+
 # .idea folder
 .idea/
 .garbage/
@@ -39,4 +48,3 @@ coverage/
 target/
 dist/
 build/
-/garbage/
