@@ -12,7 +12,7 @@ def whisper_transcribe(data):
                                           without_timestamps=True)
     transcription = ''
     for segment in segments:
-        # print("\nfrom whisper: [%.2fs -> %.2fs] %s" % (segment.start, segment.end, segment.text))
+
         transcription += segment.text
     return transcription
 
