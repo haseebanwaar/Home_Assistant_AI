@@ -4,7 +4,7 @@
 # 🤖 Home/Personal Companion AI
 ### Towards Agents-based Home and Personal Assistant AI (VLM)
 
-> **A next-generation, local-first multimodal assistant designed to perceive, reason, and interact in real-time.**
+> **A privacy and local-first cognitive companion designed to perceive, reason, and interact in real-time.**
 
 ---
 
@@ -41,8 +41,8 @@ The "brain" is a sophisticated orchestration of models:
 * **Reranker:** Retrieved memory chunks are re-ranked to ensure only the most *contextually relevant* history is fed to the LLM.
 * **Reasoning & Perception Engine (VLM):** The core logic fuses current visual context (Screen/Camera), audio transcripts, and retrieved long-term memories to generate a response.
 
-### 3. Agent Spawner 🛠️
-The Core Unit acts as a **Dispatcher**, not just a chatbot.
+### 3. Agent Spawner (Todo) 🛠️
+The Core Unit acts as a **Dispatcher**, not just a chatbot. uses autogen for creating new agents.
 * Based on request complexity, it triggers the **Agent Spawner**.
 * Initializes specialized sub-agents (e.g., 🧑‍💻 *Coding Agent*, 📅 *Calendar Agent*, 🔍 *Search Agent*) to execute multi-step tasks autonomously.
 
@@ -51,6 +51,17 @@ The Core Unit acts as a **Dispatcher**, not just a chatbot.
   The final response is delivered via high-quality TTS driving a visual "Talking Portrait" avatar, creating a genuine face-to-face interaction experience.
 
 ---
+
+### Goals 
+* **Productivity Enhancer**
+  It enhances your productivty while working by helping you cambat distractions. it can watch videos along side you helping you grasp difficult concepts.
+
+* **Proactivity**
+  Availability of near realtime context and past momory helps the agent to analyze your situation proactively. this proactive assistance grows more helpful and consistant as it knows your daily patterns more closely.
+
+* **Lifelong Learning**
+  The agent evolves alongside you. By continuously consolidating daily logs and visual context into its vector store, it builds a permanent, growing knowledge base. It remembers your preferences, projects, and history, ensuring that its personalization deepens over months and years of usage.
+
 
 ## ⚡ Quick Stats
 
