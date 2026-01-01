@@ -1,57 +1,72 @@
 # Home Assistant AI
-<img width="1024" height="490" alt="image" src="https://github.com/user-attachments/assets/dd2441e4-2e12-40cc-80eb-a4e9d3e181ff" />
+<img width="1024" height="484" alt="image" src="https://github.com/user-attachments/assets/7bc0c609-4f9d-4cfe-bc20-6ec884d32aae" />
 
-**Description:**
-Towards Agents-based Home and Personal Assistant AI (LLM, VLM, Omni)
+# 🤖 Home/Personal Companion AI
+### Towards Agents-based Home and Personal Assistant AI (VLM)
 
-## What does this project do?
-Home Assistant AI is a multimodal personal assistant that listens to your speech, understands it, and speaks back. It combines:
-- Voice Activity Detection (Silero VAD) to split your audio into speech segments.
-- Automatic Speech Recognition (Whisper) to transcribe each spoken segment.
-- An LLM/VLM accessed via an OpenAI-compatible local server to understand context and optionally reason over images/video.
-- Text-to-Speech (multiple backends like Kokoro, Orpheus, Chatterbox, Kitten) to generate a natural-sounding voice response.
-- Optional visual response generation hooks for talking-head video (experimental, commented in code).
+> **A privacy and local-first cognitive companion designed to perceive, reason, and interact in real-time.**
 
-In short: you send audio (and optionally an image/video), it transcribes, reasons, and returns spoken (or text) responses through a simple FastAPI server.
+---
 
-## Overview
-Home Assistant AI is an initiative to develop a next-generation, agents-based system for home and personal assistant functionality. This project leverages the power of Large Language Models (LLMs), Vision-Language Models (VLMs), and omnidirectional capabilities to create a versatile, intelligent, and adaptive assistant.
+## 📖 Overview
 
-## Quick start
-- Install dependencies (PyTorch, FastAPI, uvicorn, pydub, soundfile, OpenAI client, etc.).
-- Run the API server: `python app.py` (it launches uvicorn at http://0.0.0.0:8000).
-- POST to one of the endpoints with base64-encoded payloads:
-  - POST /chat/audio — body: `{ "data": <base64-audio>, "image"?: <base64-image>, "video"?: <base64-video> }`
-  - POST /chat/video — same body; enables experimental video mode.
-- The server performs VAD + ASR, then TTS, and streams a textual summary. Audio bytes from TTS are produced internally (see providers/tts/*), and can be adapted to your client needs.
+**Home/Personal Companion AI** bridges the gap between *passive listening* and *active perception*. Unlike traditional assistants, this project integrates continuous **Screen** and **Camera** streams with **Long-term Memory**, creating a companion that truly understands your context.
 
-## Goals
-1. **Intelligent Agents**: Develop modular agents for specific tasks (e.g., scheduling, reminders, home automation).
-2. **Multimodal Interactions**: Utilize both language and vision capabilities for rich, context-aware interactions.
-3. **Personalization**: Adapt to individual user preferences and habits over time.
-4. **Seamless Integration**: Work across various platforms and devices.
+### 🧠 The Core Engine
+At the heart of the system is the **Core Vision-Language Model (VLM)** for perception and reasoning.
+- **Model:** Qwen3-VL 8B
+- **Hosting:** Local `vLLM` instance.
+- **Performance:** Thanks to 3D pooling, it processes **1 minute of video in just 10 seconds** on an RTX 3090.
+- **Features:** Leverages an unusually large context window and robust community support.
 
-## Components
-### ASR
-- Whisper-based transcription via providers/asr/whisper.py.
+---
 
-### LLM/VLM
-- OpenAI-compatible client (providers/local_openAI.py) targeting a locally served model (e.g., via llama.cpp, vLLM, LMDeploy). Adjust base_url/model per your setup.
+## 🚀 Key Concepts & Architecture
 
-### TTS
-| Model | Realtime Factor | VRAM (GB) | Quality | Extra | Zero-shot Voice Cloning |Sample|
-|---|---|---|---|---|---|---|
-| VibeVoice 1.5B (bfloat16) | 1.65 | 6 | high | Expressive | yes |---|
-| Kokoro | 0.02 | 2.5 | low | Bit robotic | - |---|
-| Orpheus 0.1 ft (Q2_k gguf) | 0.63 | 2.3 | high | Expressive, emotions | - |---|
-| Chatterbox | 1 | 5.2 | high | Plain | yes |---|
-| Kitten TTS | 0.44 | 0.8 | low | Noisy, robotic | - |---|
+The system operates on a modular pipeline designed for local deployment:
 
-## API endpoints
-- POST /chat/audio — streams back the recognized query and runs TTS; accepts optional image/video for multimodal context.
-- POST /chat/video — same as above but toggles experimental video response path (currently commented in code).
+### 1. Multimodal Perception Streams 👁️
+* **🎙️ Voice Input**
+  Captures audio commands using **Parakeet ASR** (English, very high Real-Time Factor) or the multilingual **Whisper** model.
 
-## Notes
-- Silero VAD parameters (thresholds) are configurable in app.py.
-- Example scripts live in examples/ for agents and VLM usage.
-- Some TTS and video features are experimental; see providers/tts and comments in app.py for guidance.
+* **🖥️ Screen Stream**
+  A continuous feed of your desktop environment. It detects on-screen changes, sends context to the VLM **every minute, all day**, and saves it to the vector store. The AI sees active windows, reads text, and assists with workflows.
+
+* **📹 Camera Stream**
+  Connects to your IP cameras to provide real-world context. It detects changes and interactions happening **all around your house**, storing physical-world events in the vector store.
+
+### 2. The Core Processing Unit & Memory 💾
+The "brain" is a sophisticated orchestration of models:
+* **Memory Retriever (RAG):** Before answering, the system queries a **Vector Store** (Long-term Memory) using an Embedding Model.
+* **Reranker:** Retrieved memory chunks are re-ranked to ensure only the most *contextually relevant* history is fed to the LLM.
+* **Reasoning & Perception Engine (VLM):** The core logic fuses current visual context (Screen/Camera), audio transcripts, and retrieved long-term memories to generate a response.
+
+### 3. Agent Spawner (Todo) 🛠️
+The Core Unit acts as a **Dispatcher**, not just a chatbot. uses autogen for creating new agents.
+* Based on request complexity, it triggers the **Agent Spawner**.
+* Initializes specialized sub-agents (e.g., 🧑‍💻 *Coding Agent*, 📅 *Calendar Agent*, 🔍 *Search Agent*) to execute multi-step tasks autonomously.
+
+### 4. Interactive Output 🗣️
+* **Talking Portrait** *(Optional, Compute Heavy)*
+  The final response is delivered via high-quality TTS driving a visual "Talking Portrait" avatar, creating a genuine face-to-face interaction experience.
+
+---
+
+### Goals 
+* **Productivity Enhancer**
+  It enhances your productivty while working by helping you cambat distractions. it can watch videos along side you helping you grasp difficult concepts.
+
+* **Proactivity**
+  Availability of near realtime context and past momory helps the agent to analyze your situation proactively. this proactive assistance grows more helpful and consistant as it knows your daily patterns more closely.
+
+* **Lifelong Learning**
+  The agent evolves alongside you. By continuously consolidating daily logs and visual context into its vector store, it builds a permanent, growing knowledge base. It remembers your preferences, projects, and history, ensuring that its personalization deepens over months and years of usage.
+
+
+## ⚡ Quick Stats
+
+| Component | Technology | Speed/Capability |
+| :--- | :--- | :--- |
+| **VLM Engine** | Qwen3-VL 8B (vLLM) | 1 min video → 10s processing (RTX 3090) |
+| **ASR** | Parakeet / Whisper | Ultra-low latency / Multilingual |
+| **Memory** | Vector Store + Reranker | Full-day context retention |
