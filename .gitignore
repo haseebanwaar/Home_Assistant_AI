@@ -47,3 +47,4 @@ build/
 /smart_devices/
 /temp_media/
 /utils/
+/qdrant_db/

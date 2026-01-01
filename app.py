@@ -5,7 +5,6 @@ import json
 import re
 import asyncio
 import time
-import uuid
 import wave
 
 import cv2
@@ -14,27 +13,33 @@ import numpy as np
 import pydub
 import requests
 import soundfile as sf
-import torch
 import uvicorn
 from PIL import Image
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from line_profiler_pycharm import profile
+from qdrant_client import QdrantClient
+from lmdeploy.vl.utils import encode_image_base64
 from starlette.responses import StreamingResponse
 
 from agents.event_bus import EventBus
 from agents.event_extractor_agent import EventExtractorAgent
 from agents.perception_agent import PerceptionAgent
 from agents.talker_agent import TalkerAgent
+from providers.asr.parakeet import nemo_transcribe
 # from providers.asr.parakeet import nemo_transcribe
 from providers.local_openAI import client, get_model_name_vlm
 # from providers.tts.Orpheus.orpheus import run_orpheus
 from providers.tts.kokoro.kokoro_tts import run_kokoro
-from vecttor_store.activity_logger import ActivityLogger
+from vector_store.activity_logger import ActivityLogger
 from sources.screen import RealtimeScreenCapture
+from sources.rtsp import RealtimeCameraStream
+from vector_store.rag.activity_retriever import ActivityRetriever
+
+
 nest_asyncio.apply()
 
-app = FastAPI()
+app = FastAPI(title="Home Assistant AI")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,85 +49,120 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-model_name_vlm = ''
-
-
-async def get_running_model():
-    global model_name_vlm
-    model_name_vlm = await get_model_name_vlm()
-    print("Model:", model_name_vlm)
-
-
-asyncio.run(get_running_model())
-
-# In-memory store for the conversation history for a single user.
+# === GLOBALS ===
 _chat_history = []
+event_bus = EventBus()
+vlm_model = None
+talker_agent = None
+perception_agent = None
+screen_stream = None
+
+# Create a single, shared Qdrant client instance
+qdrant_client = QdrantClient(path='./qdrant_db')
+
+past_memory = ActivityRetriever(client=qdrant_client)
+activity_logger = ActivityLogger(client=qdrant_client)
+
+# === STARTUP ===
+@app.on_event("startup")
+async def startup_event():
+    global vlm_model, talker_agent, perception_agent, screen_stream, activity_logger
+
+    print("Loading model...")
+    vlm_model = await get_model_name_vlm()
+    print(f"✅ Model loaded: {vlm_model}")
+    screen_stream = RealtimeScreenCapture(
+        video_source="",  # Not used
+        model_name_vlm=vlm_model,
+        window_size=60,
+
+        monitor_index=2,  # Capture the primary monitor
+        activity_logger=activity_logger  # we pass activity logger here
+        # target_resolution=(1720, 720), # Reduce resolution to 1280x720
+    )
+    talker_agent = TalkerAgent(vlm_model, event_bus, run_kokoro)
+    # perception_agent = PerceptionAgent(vlm_model, event_bus, run_kokoro)
+    # asyncio.create_task(talker_agent.run())
+    asyncio.create_task(event_bus.run_forever())
+    print("✅ TalkerAgent and EventBus started.")
 
 
-async def main():
-    event_bus = EventBus()
-    vlm = get_running_model()  # your single shared VLM
-    qdrant = ActivityLogger()
-
-    agents = [
-        PerceptionAgent(vlm, event_bus, RealtimeScreenCapture, embed_func, qdrant),
-        EventExtractorAgent(vlm, event_bus),
-        FaceRecognitionAgent(vlm, event_bus, face_db),
-        TalkerAgent(vlm, event_bus, run_kokoro)
-    ]
-
-    for agent in agents:
-        asyncio.create_task(agent.run())
-
-    await event_bus.run_forever()
-
-
+# === API ===
 @app.post("/chat/audio")
 async def live_chat(request: Request):
-    video = False
-    wav_bytes = await request.body()
-    wav_bytes = wav_bytes.decode('utf-8')
-    wav_bytes = json.loads(wav_bytes)
-    wav_bytes_audio = wav_bytes['data']
+    body = await request.body()
+    data = json.loads(body.decode("utf-8"))
 
-    wav_bytes_image = wav_bytes.get('image')
-    wav_bytes_video = wav_bytes.get('video')
-    clear_history = wav_bytes.get('clear_history', False)
+    wav_bytes_audio = data["data"]
+    wav_bytes_image = data.get("image")
+    wav_bytes_video = data.get("video")  # do i really need it?
+    clear_history = data.get("clear_history", False)
+    concise = data.get("talking", False)
+    context = data.get("context")
+    live = data.get("live")
+    memory = data.get("memory")
 
     if clear_history:
         _chat_history.clear()
         print("Chat history cleared.")
 
     return StreamingResponse(
-        generate_response(wav_bytes_audio, wav_bytes_image, wav_bytes_video, video, _chat_history),
-        media_type="application/x-ndjson",
-        headers={"Content-type": "text/plain"},
+        generate_response(wav_bytes_audio, wav_bytes_image, _chat_history, concise, context,live, memory),
+        media_type="application/x-ndjson"
     )
 
+MEMORY_TOOL_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "retrieve_memory",
+            "description": "Search user history from vector store",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_query": { "type": "string" ,                        "description": "The topic to look for. String value for semantic search in vector db."
+},
+                    "time_value": { "type": "number" ,                        "description": "The numerical value for the time range (e.g., 2.5, 10, 1)."
+},
+                    "time_unit": {
+                        "type": "string",
+                        "enum": ["minutes", "hours", "days", "weeks", "months"],
+                        "description": "The unit of time to look back."
 
-@profile
-async def generate_response(wav_bytes_audio, wav_bytes_image, wav_bytes_video, video, chat_history):
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Absolute date in YYYY-MM-DD"
+                    }
+                }
+            }
+        }
+    }
+]
+
+# === RESPONSE GENERATION ===
+async def generate_response(wav_bytes_audio, wav_bytes_image, chat_history, concise, context, live, memory):
+    """Handle incoming audio and generate streamed text + TTS output."""
+    # Convert audio bytes to WAV
     res = bytes(wav_bytes_audio)
-    a = pydub.AudioSegment.from_raw(io.BytesIO(res), sample_width=2, frame_rate=16000, channels=1)
-
+    audio_seg = pydub.AudioSegment.from_raw(io.BytesIO(res), sample_width=2, frame_rate=16000, channels=1)
     wav_io = io.BytesIO()
     with wave.open(wav_io, 'wb') as wav_file:
-        wav_file.setnchannels(a.channels)  # 1,2
-        wav_file.setsampwidth(a.sample_width)  # 2,3,4
-        wav_file.setframerate(a.frame_rate)  # 16000,22050, 48000
-        wav_file.writeframesraw(a.raw_data)
+        wav_file.setnchannels(audio_seg.channels)
+        wav_file.setsampwidth(audio_seg.sample_width)
+        wav_file.setframerate(audio_seg.frame_rate)
+        wav_file.writeframesraw(audio_seg.raw_data)
     res = wav_io.getvalue()
 
     tim = time.perf_counter()
     data, samplerate = sf.read(io.BytesIO(res))
-    # full_transcription = nemo_transcribe(data)
-    full_transcription = """"""
+    transcription = nemo_transcribe(data)
+    # transcription = "what is happening ?"
     print(f'ASR took: {time.perf_counter() - tim} seconds')
 
-    user_content = [
-        {"type": "text", "text": f'{full_transcription}'},
-    ]
-    if wav_bytes_image:
+    # Prepare prompt
+    user_content = [{"type": "text", "text": transcription}]
+    if wav_bytes_image and not live:
         user_content.insert(0, {
             "type": "image_url",
             "image_url": {
@@ -130,28 +170,93 @@ async def generate_response(wav_bytes_audio, wav_bytes_image, wav_bytes_video, v
             },
         })
 
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-    ]
-    messages.extend(chat_history)
-    messages.append({
-        "role": "user",
-        "content": user_content,
-    })
+    if live :
+        # lets suppose i m watching movie, and every minute context of the movie is saved by Realtimescreen capture
+        # in vector db with timestamps. now if user asks after watching movie 15 mins, 'what the story so far?'
+        # so as live is True, ill also transcribe remaining frames in queue so i am live, not <min in past.
+        if context == 'screen':
+            for img in screen_stream.frame_buffer:
+                user_content.append({'type': 'image_url', 'image_url': {'max_dynamic_patch': 9, 'url': f'data:image/jpeg;base64,{encode_image_base64(img)}'}})
+        elif context == 'camera':
+            for img in RealtimeCameraStream.frame_buffer:
+                user_content.append({'type': 'image_url', 'image_url': {'max_dynamic_patch': 9, 'url': f'data:image/jpeg;base64,{encode_image_base64(img)}'}})
+
+    # 2. Initialize messages with the base system prompt
+    if not concise:
+        system_prompt_content = "You are a helpful assistant."
+    else:
+        system_prompt_content = """You are a conversational AI designed for a real-time Speech-to-Speech (S2S) system. Your primary function is to engage in natural, fluid conversation.
+
+    Follow these critical rules:
+    1.  **Be Concise:** Keep your responses short, typically one or two sentences. Avoid long paragraphs at all costs.
+    2.  **Sound Natural:** Speak like a real person. Use contractions (e.g., "it's," "don't," "you're") and a friendly, conversational tone.
+    3.  **TTS-Friendly:** Your responses will be spoken aloud by a Text-to-Speech (TTS) engine. Use simple sentence structures and common vocabulary that are easy to pronounce and sound natural when spoken.
+    4.  **No Formatting:** Do not use lists, bullet points, markdown, or any text formatting. Your output is for voice only.
+
+    Your goal is to keep the conversation moving, not to provide exhaustive, written-out answers.
+    """
+
+    messages = [{"role": "system", "content": system_prompt_content}]
+
+    # 3. Add past memory if available
+    past_activities = None
+    if memory:
+        # so continue the prev discussion of watching movie, live is True so fresh description of frames is also added
+        # but user asked what has happened uptil now, that 15 mins of movie, ill need to fetch last 15 mins of
+        # db content with flag 'screen' or i should also introduce sub flag that in addition differentiating bw screen
+        # and camera also helps put boundries onuser task, like user sets it to moviegame, coding, browsing manually from UI
+        # so how it all goes?
+
+        memmsg=[{"role": "system",
+                 "content": "you are provided with callable functions, based on user query decide with what parameters you will call it with"}]
+        memmsg.append({"role": "user", "content": transcription})
+        chat_response = await client.chat.completions.create(
+            model=vlm_model,
+            messages=memmsg,
+            tools=MEMORY_TOOL_SCHEMA,
+            tool_choice="auto",
+        )
+
+        choice = chat_response.choices[0]
+        tool_calls = choice.message.tool_calls
+        tool_call = tool_calls[0]
+
+        fn_name = tool_call.function.name
+        fn_args = json.loads(tool_call.function.arguments)
+
+        if fn_name == "retrieve_memory":
+            result = past_memory.retrieve_memory(
+                search_query=fn_args.get("search_query"),
+                time_value=fn_args.get("time_value"),
+                time_unit=fn_args.get("time_unit"),
+            )
+
+
+        # past_activities = past_memory.retrieve_memory(transcription, context,screen_stream.current_minute_apps[-1])
+            print(f"function args: {fn_args}")
+            if result:
+                if isinstance(result, list):
+                    past_activities_text = "\n".join(result)
+                else:
+                    past_activities_text = str(result)
+
+                #todo, count tokens here and summerize if memory was too long with another vlm call
+                messages.append({"role": "user", "content": f"Here is some relevant past memory for context: {past_activities_text}"})
+
+    # 4. Extend with chat history
+    if chat_history:
+        messages.extend(chat_history)
+
+    # 5. Append the current user message
+    messages.append({"role": "user", "content": user_content})
 
     chat_response = await client.chat.completions.create(
-        model=model_name_vlm,
-        messages=messages,
-        stream=True,  # Enable streaming from the VLM
+    model=vlm_model,
+    messages=messages,
+    stream=True
     )
 
-    # 1. Send the user's transcribed query text to the client
-    query_payload = {
-        "type": "query",
-        "text": full_transcription
-    }
-    yield (json.dumps(query_payload) + "\n").encode('utf-8')
-    print(f"Sent query text: {full_transcription}")
+    yield json.dumps({"type": "query", "text": transcription}) + "\n"
 
     # 2. Stream the VLM response and TTS audio
     full_assistant_response = ""
@@ -165,7 +270,6 @@ async def generate_response(wav_bytes_audio, wav_bytes_image, wav_bytes_video, v
     chat_history.append({"role": "assistant", "content": full_assistant_response})
 
 
-@profile
 async def stream_vlm_and_audio(chat_response_stream):
     """
     Streams VLM text sentence by sentence and generated audio in batches.
@@ -242,5 +346,5 @@ async def stream_vlm_and_audio(chat_response_stream):
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # asyncio.run(main())
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
