@@ -1,5 +1,5 @@
 # Home Assistant AI
-<img width="1024" height="490" alt="image" src="https://github.com/user-attachments/assets/dd2441e4-2e12-40cc-80eb-a4e9d3e181ff" />
+<img width="1024" height="484" alt="image" src="https://github.com/user-attachments/assets/7bc0c609-4f9d-4cfe-bc20-6ec884d32aae" />
 
 # 🤖 Home/Personal Companion AI
 ### Towards Agents-based Home and Personal Assistant AI (VLM)
