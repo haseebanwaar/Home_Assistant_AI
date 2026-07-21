@@ -10,26 +10,30 @@ Requirements:
 Usage: edit CREDENTIALS list (username/password pairs to try) and run.
 """
 
+import os
 import re
 import socket
 import time
 from urllib.parse import urlparse
 
+from dotenv import load_dotenv
 from requests.auth import HTTPDigestAuth
 from wsdiscovery import WSDiscovery
 from onvif import ONVIFCamera, exceptions as onvif_exceptions
 import requests
+
+load_dotenv()
 
 # === User config ===
 # MAC you want to match (optional). If you have MAC, we'll match later via ARP if needed.
 TARGET_MAC = None  # e.g. "50:0f:f5:70:f5:08" or None
 
 # Credentials to try against discovered devices. Put the camera's username/password first.
+# Loaded from CAMERA_CREDENTIALS in .env as "user:pass;user:pass;..." (priority order).
 CREDENTIALS = [
-    ("admin", "dummy"),
-    ("admin", "dummy"),
-    ("admin", "dummy"),
-    ("admin", "dummy"),
+    tuple(pair.split(":", 1))
+    for pair in os.getenv("CAMERA_CREDENTIALS", "").split(";")
+    if ":" in pair
 ]
 
 HTTP_ENDPOINTS = [

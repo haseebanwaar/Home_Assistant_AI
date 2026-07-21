@@ -1,9 +1,14 @@
+import os
 import time
 from typing import List, Dict
+
+from dotenv import load_dotenv
 from qdrant_client import QdrantClient, models
 
+load_dotenv()
+
 class ActivityLogger:
-    def __init__(self, client: QdrantClient, embedding_model_name="BAAI/bge-small-en-v1.5"):
+    def __init__(self, client: QdrantClient, embedding_model_name=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")):
         """
         Args:
             client: An existing instance of QdrantClient.

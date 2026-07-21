@@ -1,6 +1,7 @@
 import io
 import os
 import sys
+from dotenv import load_dotenv
 import requests
 import json
 import time
@@ -28,7 +29,8 @@ print(f"Using device: {snac_device}")
 model = model.to(snac_device)
 
 # llama-server -m c:/d/orpheus-3b-0.1-ft-q2_k.gguf -c 4096 -ngl 100 -t 12
-API_URL = "http://127.0.0.1:8080/v1/completions"
+load_dotenv()
+API_URL = os.getenv("ORPHEUS_API_URL", "http://127.0.0.1:8080/v1/completions")
 HEADERS = {
     "Content-Type": "application/json"
 }

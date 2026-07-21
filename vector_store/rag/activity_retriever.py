@@ -1,14 +1,19 @@
+import os
 import time
 from datetime import datetime
 from typing import List, Dict
+
+from dotenv import load_dotenv
 from qdrant_client import QdrantClient, models
 from sentence_transformers import CrossEncoder
+
+load_dotenv()
 
 
 class ActivityRetriever:
     def __init__(self, client: QdrantClient,
-                 embedding_model_name="BAAI/bge-small-en-v1.5",
-                 reranker_model_name="cross-encoder/ms-marco-MiniLM-L-6-v2"):
+                 embedding_model_name=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
+                 reranker_model_name=os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")):
         """
         Args:
             client: An existing instance of QdrantClient.

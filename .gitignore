@@ -45,6 +45,6 @@ dist/
 build/
 /examples/
 /smart_devices/
-/temp_media/
+/.temp_media/
 /utils/
 /qdrant_db/

@@ -2,6 +2,7 @@ import base64
 import datetime
 import io
 import json
+import os
 import re
 import asyncio
 import time
@@ -9,6 +10,7 @@ import wave
 
 import cv2
 import nest_asyncio
+from dotenv import load_dotenv
 import numpy as np
 import pydub
 import requests
@@ -37,6 +39,7 @@ from sources.rtsp import RealtimeCameraStream
 from vector_store.rag.activity_retriever import ActivityRetriever
 
 
+load_dotenv()
 nest_asyncio.apply()
 
 app = FastAPI(title="Home Assistant AI")
@@ -58,7 +61,7 @@ perception_agent = None
 screen_stream = None
 
 # Create a single, shared Qdrant client instance
-qdrant_client = QdrantClient(path='./qdrant_db')
+qdrant_client = QdrantClient(path=os.getenv("QDRANT_PATH", "./qdrant_db"))
 
 past_memory = ActivityRetriever(client=qdrant_client)
 activity_logger = ActivityLogger(client=qdrant_client)
@@ -347,4 +350,4 @@ async def stream_vlm_and_audio(chat_response_stream):
 
 if __name__ == "__main__":
     # asyncio.run(main())
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host=os.getenv("APP_HOST", "0.0.0.0"), port=int(os.getenv("APP_PORT", "8000")), log_level="info")
