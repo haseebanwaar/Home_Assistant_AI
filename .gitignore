@@ -48,3 +48,6 @@ build/
 /.temp_media/
 /utils/
 /qdrant_db/
+
+# Step 0: recorded captures + replay/debug artifacts
+/data/

@@ -1,9 +1,12 @@
 import time
+import logging
 from collections import deque
 from threading import Thread, Lock
 
 import cv2
 from PIL import Image
+
+logger = logging.getLogger("home_assistant")
 
 
 class RealtimeCameraStream:
@@ -20,6 +23,8 @@ class RealtimeCameraStream:
         self.frame_buffer = deque(maxlen=window_size)
         self.lock = Lock()
         self.running = True
+        self.healthy = False
+        self.last_error = None
 
         # Start frame capture thread
         self.capture_thread = Thread(target=self._capture_frames)
@@ -28,32 +33,50 @@ class RealtimeCameraStream:
 
     def _capture_frames(self):
         video = cv2.VideoCapture(self.video_source)
-        frame_count = 0
+
+        if not video.isOpened():
+            self.last_error = "camera source could not be opened"
+            self.running = False
+            logger.error(self.last_error)
+            video.release()
+            return
+
+        self.healthy = True
 
         while self.running:
             ret, frame = video.read()
             if not ret:
+                self.last_error = "camera stream stopped returning frames"
+                self.healthy = False
+                logger.warning(self.last_error)
                 break
 
-            if frame_count % (24 // self.fps) == 0:  # Assuming 30fps video
-                # Convert frame to PIL Image for VLM compatibility
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_image = Image.fromarray(frame_rgb)
+            # Convert frame to PIL Image for VLM compatibility
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(frame_rgb)
+            with self.lock:
+                self.frame_buffer.append(pil_image)
 
-                timestamp = time.time()
-                with self.lock:
-                    # self.frame_buffer.append({
-                    #     'image': pil_image,
-                    #     'timestamp': timestamp
-                    # })
-                    self.frame_buffer.append(pil_image)
-                time.sleep(0.99)
-
-            frame_count += 1
+            # Sample roughly self.fps frames per second.
+            time.sleep(1.0 / self.fps)
 
         video.release()
+        self.healthy = False
 
     def cleanup(self):
         self.running = False
-        self.capture_thread.join()
+        self.capture_thread.join(timeout=5)
+
+    def frames(self):
+        with self.lock:
+            return list(self.frame_buffer)
+
+    def status(self):
+        return {
+            "configured": True,
+            "healthy": self.healthy and self.capture_thread.is_alive(),
+            "running": self.running,
+            "frames": len(self.frame_buffer),
+            "error": self.last_error,
+        }
 

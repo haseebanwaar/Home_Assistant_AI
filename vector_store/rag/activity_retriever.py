@@ -1,13 +1,24 @@
+import logging
 import os
 import time
 from datetime import datetime
-from typing import List, Dict
 
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient, models
 from sentence_transformers import CrossEncoder
 
 load_dotenv()
+
+logger = logging.getLogger("home_assistant")
+
+# Approximate seconds per unit for time-range filtering.
+_UNIT_SECONDS = {
+    "minute": 60,
+    "hour": 3600,
+    "day": 86400,
+    "week": 604800,
+    "month": 2592000,  # ~30 days
+}
 
 
 class ActivityRetriever:
@@ -26,56 +37,45 @@ class ActivityRetriever:
 
         # Load the Reranker (Cross-Encoder)
         # This downloads the model locally on first run
-        print(f"Loading reranker: {reranker_model_name}...")
+        logger.info("Loading reranker: %s...", reranker_model_name)
         self.reranker = CrossEncoder(reranker_model_name)
 
 
     #todo, reranker can mess up, esp in temporal quries or hybrid
-    def retrieve_memory(self, search_query: str = None, time_value: float =None, time_unit: str = None, date: str = None):
+    def retrieve_memory(self, search_query: str = None, time_value: float = None, time_unit: str = None):
         """
         HYBRID SEARCH:
         Combines Vector Similarity (Content) + Metadata Filtering (Time) + Reranking.
+        Missing/incomplete time arguments are handled safely (no time filter applied).
         """
         # 1. Build the Filter List
         filter_conditions = []
         now = time.time()
+
+        # A time filter is only usable when we have BOTH a value and a unit.
+        has_time = time_value is not None and bool(time_unit)
         seconds_to_subtract = 0
+        if has_time:
+            unit = time_unit.lower().strip()
+            per_unit = next((sec for key, sec in _UNIT_SECONDS.items() if key in unit), 3600)
+            seconds_to_subtract = time_value * per_unit
 
-        # Standardize inputs
-        unit = time_unit.lower().strip()
-
-        if "minute" in unit:
-            seconds_to_subtract = time_value * 60
-        elif "hour" in unit:
-            seconds_to_subtract = time_value * 3600
-        elif "day" in unit:
-            seconds_to_subtract = time_value * 86400
-        elif "week" in unit:
-            seconds_to_subtract = time_value * 604800
-        elif "month" in unit:
-            # Approximate 30 days per month
-            seconds_to_subtract = time_value * 2592000
-        else:
-            # Default fallback to 1 hour if unit is weird
-            seconds_to_subtract = 3600
-
-
-        start_timestamp = now - seconds_to_subtract
-
-        if seconds_to_subtract <= 3600:       # <= 1 hour
-            limit = 30                           # Enough for a short chat context
-        elif seconds_to_subtract <= 86400:    # <= 1 day
-            limit = 150                          # Need more chunks to summarize a whole day
-        elif seconds_to_subtract <= 604800:   # <= 1 week
-            limit = 200                          # Broad overview
-        else:                                    # > 1 week
+        if not has_time:                       # semantic-only / no window
+            limit = 30
+        elif seconds_to_subtract <= 3600:      # <= 1 hour
+            limit = 30                          # Enough for a short chat context
+        elif seconds_to_subtract <= 86400:     # <= 1 day
+            limit = 150                         # Need more chunks to summarize a whole day
+        elif seconds_to_subtract <= 604800:    # <= 1 week
+            limit = 200                         # Broad overview
+        else:                                   # > 1 week
             limit = 800
-        # Optional: Log for debugging
-        human_readable_start = datetime.fromtimestamp(start_timestamp).strftime('%Y-%m-%d %H:%M:%S')
-        print(f"DEBUG: Searching from {human_readable_start} ({unit} ago)")
 
         # Add Time Filter if requested
-        if time_value is not None:
+        if has_time:
+            start_timestamp = now - seconds_to_subtract
+            human_readable_start = datetime.fromtimestamp(start_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+            logger.debug("Searching memory from %s (%s ago)", human_readable_start, time_unit)
             filter_conditions.append(
                 models.FieldCondition(
                     key="timestamp",
@@ -92,8 +92,8 @@ class ActivityRetriever:
         qdrant_filter = models.Filter(must=filter_conditions)
 
         # 3. Execute Query
-        if search_query and not time_value:
-            # Case A: Semantic + Time (e.g., "PowerPoint yesterday")
+        if search_query:
+            # Case A: Semantic search, optionally constrained by time.
             # Qdrant finds vectors close to "PowerPoint" BUT only within the timestamp range
 
             # Retrieve more candidates for reranking
@@ -115,10 +115,17 @@ class ActivityRetriever:
                 if hit.metadata and "document" in hit.metadata
             ]
 
+            if not cross_encoder_inputs:
+                return []
+
             scores = self.reranker.predict(cross_encoder_inputs)
 
+            document_hits = [
+                hit for hit in hits if hit.metadata and "document" in hit.metadata
+            ]
+
             ranked_hits = sorted(
-                zip(hits, scores),
+                zip(document_hits, scores),
                 key=lambda x: x[1],
                 reverse=True
             )
@@ -138,5 +145,5 @@ class ActivityRetriever:
                 with_payload=True
             )
             # Sort chronologically for storytelling
-            points.sort(key=lambda x: x.payload['timestamp'])
-            return [p.payload['document'] for p in points]
+            points.sort(key=lambda x: x.payload.get('timestamp', 0))
+            return [p.payload['document'] for p in points if 'document' in p.payload]
