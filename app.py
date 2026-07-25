@@ -30,6 +30,7 @@ from vector_store.activity_logger import ActivityLogger
 from sources.screen import RealtimeScreenCapture
 from sources.camera_manager import CameraManager
 from vector_store.rag.activity_retriever import ActivityRetriever
+from memory.retrieval.evidence import EvidenceRetriever
 from tools.registry import ToolRegistry, register_default_tools
 from agents.proactive import ProactiveNarrator
 
@@ -173,6 +174,13 @@ qdrant_client = QdrantClient(path=os.getenv("QDRANT_PATH", "./qdrant_db"))
 past_memory = ActivityRetriever(client=qdrant_client)
 activity_logger = ActivityLogger(client=qdrant_client)
 
+# The single retrieval path shared by /memory/search, room chat and the grounded
+# assistant, so all three answer the same question the same way. Reuses
+# past_memory's cross-encoder instead of loading a second copy; its graph handle
+# is attached at startup, once Neo4j is known to be up.
+evidence_retriever = EvidenceRetriever(
+    qdrant_client=qdrant_client, reranker=past_memory.reranker)
+
 # Tools the assistant may call (function-calling, not MCP — see tools/registry.py).
 tool_registry = ToolRegistry()
 register_default_tools(tool_registry, past_memory)
@@ -267,6 +275,8 @@ async def startup_event():
         logger.info("LIVE_MEMORY enabled (graph=%s).", neo4j_store is not None)
     else:
         logger.info("LIVE_MEMORY disabled (legacy per-minute logging).")
+
+    evidence_retriever.neo4j = neo4j_store
 
     # Give the assistant graph-backed memory tools when the graph is available.
     if neo4j_store is not None:
@@ -763,10 +773,20 @@ async def room_chat(room_id: str, request: Request):
     ctx = neo4j_store.room_context(room_id)
     history = neo4j_store.room_messages(room_id, limit=10)
 
+    # Retrieve on the actual question, scoped to this room, instead of pasting
+    # whatever happened to be recent. Falls back to the room's newest events when
+    # the question carries no content terms ("what have I been up to in here?").
+    relevant = evidence_retriever.retrieve(
+        message, limit=8, kinds=["event", "note", "claim"], room_id=room_id)
+    relevant_lines = [
+        f"({item.get('kind')}) {item.get('text')}"
+        for item in relevant if item.get("text")]
+
     grounding = (
         f"You are the user's assistant, chatting inside the '{room.get('name', room_id)}' room. "
         "This room collects the user's activity, notes, and your past chat on this topic. "
         "Use the context to answer; be concise and specific.\n\n"
+        f"Most relevant to this question:\n- " + "\n- ".join(relevant_lines or ["(none)"]) + "\n\n"
         f"Recent activity in this room:\n- " + "\n- ".join(ctx["events"][:8] or ["(none)"]) + "\n\n"
         f"User's notes here:\n- " + "\n- ".join(ctx["notes"][:8] or ["(none)"]) + "\n\n"
         f"Key things seen here: {', '.join(ctx['entities'][:15]) or '(none)'}"
@@ -855,35 +875,12 @@ async def memory_search(q: str, limit: int = 40, kinds: str = None,
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": f"invalid date: {exc}"})
 
-    results = []
-    if neo4j_store is not None:
-        results = neo4j_store.memory_search(
-            q, limit=limit, kinds=selected, start=start, end=end, room_id=room_id)
-        for item in results:
-            item.setdefault("match", "keyword")
-
-    # Semantic retrieval currently indexes events. Merge it when its unfiltered
-    # results cannot violate a room/date constraint.
-    event_allowed = selected is None or "event" in selected
-    if semantic and event_allowed and not room_id and start is None and end is None:
-        semantic_result = await debug_hybrid(q=q, limit=min(limit, 20))
-        if isinstance(semantic_result, dict) and not semantic_result.get("error"):
-            seen = {(item.get("kind"), item.get("id")) for item in results}
-            for hit in semantic_result.get("results", []):
-                key = ("event", hit.get("event_id"))
-                if key in seen:
-                    continue
-                results.append({
-                    "kind": "event", "id": hit.get("event_id"),
-                    "title": hit.get("profile") or "Semantic match",
-                    "text": hit.get("summary"), "ts": hit.get("span_start"),
-                    "rooms": [], "entities": hit.get("entities") or [],
-                    "score": 70, "match": "semantic",
-                })
-                seen.add(key)
-    results.sort(key=lambda item: (item.get("score") or 0, item.get("ts") or 0),
-                 reverse=True)
-    return {"query": q, "results": results[:max(1, min(limit, 200))]}
+    # Semantic hits are scoped by the same room/date window as the keyword ones
+    # (see EvidenceRetriever), so filters no longer disable vector search.
+    results = evidence_retriever.retrieve(
+        q, limit=limit, kinds=selected, start=start, end=end,
+        room_id=room_id, semantic=semantic)
+    return {"query": q, "results": results}
 
 
 @app.get("/memory/events/{event_id}")
@@ -1144,7 +1141,7 @@ async def assistant_conversation_message(conversation_id: str, request: Request)
     elif conversation.get("scope") == "room":
         room_id = conversation.get("room_id")
 
-    evidence = neo4j_store.memory_search(
+    evidence = evidence_retriever.retrieve(
         message, limit=10, kinds=["event", "note", "claim"],
         start=start, end=end, room_id=room_id)
     citations = [{

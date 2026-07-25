@@ -14,6 +14,8 @@ import re
 
 from neo4j import GraphDatabase
 
+from memory.retrieval.terms import tokenize
+
 logger = logging.getLogger("home_assistant")
 
 # Uniqueness constraints (also create backing indexes). Keyed by the stable ids
@@ -210,17 +212,22 @@ class Neo4jStore:
     # -- Phase 2: Memory Explorer -----------------------------------------
     def memory_search(self, query, limit=40, kinds=None, start=None, end=None,
                       room_id=None):
-        """Keyword search across graph-backed memory types.
+        """Term-based keyword search across graph-backed memory types.
 
         Results share a stable shape so the API can merge them with semantic
         vector hits without exposing database-specific records to the client.
+
+        Returns [] for a query with no content terms ("what did I do today");
+        that is a scope question, and EvidenceRetriever answers it chronologically.
         """
         needle = self._norm(query)
-        if not needle:
+        terms = tokenize(query)
+        if not needle or not terms:
             return []
         allowed = set(kinds or ("event", "note", "message", "entity", "claim", "room"))
         params = {
-            "needle": needle, "limit": max(1, min(int(limit), 200)),
+            "needle": needle, "terms": terms,
+            "limit": max(1, min(int(limit), 200)),
             "start": start, "end": end, "room_id": room_id,
         }
         results = []
@@ -241,6 +248,24 @@ class Neo4jStore:
             reverse=True,
         )
         return results[:params["limit"]]
+
+    def recent_events(self, start=None, end=None, room_id=None, limit=20):
+        """Newest events inside a scope, ignoring keywords (scope-only questions)."""
+        return [dict(row) for row in self.run(
+            _RECENT_EVENTS_CYPHER, start=start, end=end, room_id=room_id,
+            limit=max(1, min(int(limit), 200)))]
+
+    def events_in_room(self, event_ids, room_id):
+        """Subset of `event_ids` that the room contains — post-filter for vector hits.
+
+        Room membership lives in the graph, so semantic hits are filtered here
+        rather than by a Qdrant payload field (which older points would lack).
+        """
+        ids = [i for i in (event_ids or []) if i]
+        if not ids or not room_id:
+            return set()
+        return {row["event_id"] for row in self.run(
+            _EVENTS_IN_ROOM_CYPHER, ids=ids, room_id=room_id)}
 
     def entity_detail(self, entity_id):
         rows = self.run(_ENTITY_DETAIL_CYPHER, entity_id=self._norm(entity_id))
@@ -982,55 +1007,69 @@ RETURN e.event_id AS event, n.name AS name, n.type AS type,
        m.role AS role, m.co_presence AS co_presence
 """
 
+# Keyword search scores every record by how many query TERMS its text contains
+# (`hits`), plus a bonus when the full query phrase appears verbatim. Matching
+# the whole question as one substring — the previous behaviour — meant a
+# natural-language query never matched anything. See memory/retrieval/terms.py.
 _SEARCH_EVENTS_CYPHER = """
 MATCH (e:Event)
 OPTIONAL MATCH (r:Room)-[:CONTAINS]->(e)
 WITH e, collect(DISTINCT {room_id: r.room_id, name: r.name}) AS rooms
-WHERE toLower(coalesce(e.summary, '')) CONTAINS $needle
-  AND ($start IS NULL OR e.span_start >= $start)
+WHERE ($start IS NULL OR e.span_start >= $start)
   AND ($end IS NULL OR e.span_start < $end)
   AND ($room_id IS NULL OR any(room IN rooms WHERE room.room_id = $room_id))
+WITH e, rooms, toLower(coalesce(e.summary, '')) AS hay
+WITH e, rooms, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
+WHERE hits > 0
 RETURN 'event' AS kind, e.event_id AS id,
        coalesce(e.application, e.activity_type, 'Activity') AS title,
        e.summary AS text, e.span_start AS ts, rooms,
-       100 + CASE WHEN toLower(coalesce(e.summary, '')) STARTS WITH $needle
-                  THEN 20 ELSE 0 END AS score
+       100 + 8 * hits + CASE WHEN hay CONTAINS $needle THEN 25 ELSE 0 END AS score
 ORDER BY score DESC, ts DESC
 LIMIT $limit
 """
 
 _SEARCH_NOTES_CYPHER = """
 MATCH (r:Room)-[:HAS_NOTE]->(n:RoomNote)
-WHERE toLower(coalesce(n.text, '')) CONTAINS $needle
-  AND ($start IS NULL OR n.ts >= $start)
+WHERE ($start IS NULL OR n.ts >= $start)
   AND ($end IS NULL OR n.ts < $end)
   AND ($room_id IS NULL OR r.room_id = $room_id)
+WITH r, n, toLower(coalesce(n.text, '')) AS hay
+WITH r, n, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
+WHERE hits > 0
 RETURN 'note' AS kind, n.note_id AS id, r.name AS title, n.text AS text,
-       n.ts AS ts, [{room_id: r.room_id, name: r.name}] AS rooms, 90 AS score
-ORDER BY ts DESC
+       n.ts AS ts, [{room_id: r.room_id, name: r.name}] AS rooms,
+       90 + 8 * hits + CASE WHEN hay CONTAINS $needle THEN 25 ELSE 0 END AS score
+ORDER BY score DESC, ts DESC
 LIMIT $limit
 """
 
 _SEARCH_MESSAGES_CYPHER = """
 MATCH (r:Room)-[:HAS_MESSAGE]->(m:RoomMessage)
-WHERE toLower(coalesce(m.text, '')) CONTAINS $needle
-  AND ($start IS NULL OR m.ts >= $start)
+WHERE ($start IS NULL OR m.ts >= $start)
   AND ($end IS NULL OR m.ts < $end)
   AND ($room_id IS NULL OR r.room_id = $room_id)
+WITH r, m, toLower(coalesce(m.text, '')) AS hay
+WITH r, m, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
+WHERE hits > 0
 RETURN 'message' AS kind, m.message_id AS id,
        r.name + ' · ' + coalesce(m.role, 'message') AS title,
        m.text AS text, m.ts AS ts,
-       [{room_id: r.room_id, name: r.name}] AS rooms, 80 AS score
-ORDER BY ts DESC
+       [{room_id: r.room_id, name: r.name}] AS rooms,
+       80 + 8 * hits + CASE WHEN hay CONTAINS $needle THEN 25 ELSE 0 END AS score
+ORDER BY score DESC, ts DESC
 LIMIT $limit
 """
 
 _SEARCH_ENTITIES_CYPHER = """
 MATCH (n:Entity)
-WHERE toLower(coalesce(n.name, '')) CONTAINS $needle
+WITH n, toLower(coalesce(n.name, '')) AS hay
+WITH n, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
+WHERE hits > 0
 RETURN 'entity' AS kind, n.entity_id AS id, n.name AS title,
        coalesce(n.type, 'entity') AS text, null AS ts, [] AS rooms,
-       110 + CASE WHEN toLower(n.name) = $needle THEN 40 ELSE 0 END AS score
+       110 + 8 * hits + CASE WHEN hay = $needle THEN 40
+                             WHEN hay CONTAINS $needle THEN 20 ELSE 0 END AS score
 ORDER BY score DESC, title
 LIMIT $limit
 """
@@ -1039,24 +1078,53 @@ _SEARCH_CLAIMS_CYPHER = """
 MATCH (c:Claim)<-[:SUPPORTS]-(e:Event)
 OPTIONAL MATCH (r:Room)-[:CONTAINS]->(e)
 WITH c, e, collect(DISTINCT {room_id: r.room_id, name: r.name}) AS rooms
-WHERE toLower(coalesce(c.text, '')) CONTAINS $needle
-  AND ($start IS NULL OR e.span_start >= $start)
+WHERE ($start IS NULL OR e.span_start >= $start)
   AND ($end IS NULL OR e.span_start < $end)
   AND ($room_id IS NULL OR any(room IN rooms WHERE room.room_id = $room_id))
+WITH c, e, rooms, toLower(coalesce(c.text, '')) AS hay
+WITH c, e, rooms, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
+WHERE hits > 0
 RETURN 'claim' AS kind, c.claim_id AS id, 'Claim' AS title, c.text AS text,
-       e.span_start AS ts, rooms, 95 AS score
-ORDER BY ts DESC
+       e.span_start AS ts, rooms,
+       95 + 8 * hits + CASE WHEN hay CONTAINS $needle THEN 25 ELSE 0 END AS score
+ORDER BY score DESC, ts DESC
 LIMIT $limit
 """
 
 _SEARCH_ROOMS_CYPHER = """
 MATCH (r:Room)
-WHERE toLower(coalesce(r.name, '') + ' ' + coalesce(r.description, '')) CONTAINS $needle
+WITH r, toLower(coalesce(r.name, '') + ' ' + coalesce(r.description, '')) AS hay
+WITH r, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
+WHERE hits > 0
 RETURN 'room' AS kind, r.room_id AS id, r.name AS title,
        coalesce(r.description, r.kind) AS text, null AS ts,
-       [{room_id: r.room_id, name: r.name}] AS rooms, 105 AS score
-ORDER BY title
+       [{room_id: r.room_id, name: r.name}] AS rooms,
+       105 + 8 * hits + CASE WHEN hay CONTAINS $needle THEN 25 ELSE 0 END AS score
+ORDER BY score DESC, title
 LIMIT $limit
+"""
+
+# Chronological fetch used when a question carries no content terms at all
+# ("what did I do today") — the answer comes from the scope, not from keywords.
+_RECENT_EVENTS_CYPHER = """
+MATCH (e:Event)
+OPTIONAL MATCH (r:Room)-[:CONTAINS]->(e)
+WITH e, collect(DISTINCT {room_id: r.room_id, name: r.name}) AS rooms
+WHERE ($start IS NULL OR e.span_start >= $start)
+  AND ($end IS NULL OR e.span_start < $end)
+  AND ($room_id IS NULL OR any(room IN rooms WHERE room.room_id = $room_id))
+  AND coalesce(e.summary, '') <> ''
+RETURN 'event' AS kind, e.event_id AS id,
+       coalesce(e.application, e.activity_type, 'Activity') AS title,
+       e.summary AS text, e.span_start AS ts, rooms, 60 AS score
+ORDER BY ts DESC
+LIMIT $limit
+"""
+
+_EVENTS_IN_ROOM_CYPHER = """
+MATCH (r:Room {room_id: $room_id})-[:CONTAINS]->(e:Event)
+WHERE e.event_id IN $ids
+RETURN e.event_id AS event_id
 """
 
 _ENTITY_DETAIL_CYPHER = """
