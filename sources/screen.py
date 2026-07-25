@@ -68,6 +68,10 @@ class RealtimeScreenCapture:
         self.frame_buffer = deque(maxlen=window_size)
         self.lock = Lock()
         self.running = True
+        # When paused, the capture loop keeps the thread alive but stops grabbing
+        # frames and processing batches, so screen memory can be halted from the UI
+        # without tearing down the stream. Resume picks straight back up.
+        self.paused = False
         self.healthy = False
         self.last_error = None
         self.monitor_index = monitor_index
@@ -476,6 +480,19 @@ Create a retrievable memory record that preserves what matters most for future r
             last_frame = None
 
             while self.running:
+                # Paused: hold the thread but capture/process nothing. Reset the
+                # per-minute state so we don't emit a stale batch on resume.
+                if self.paused:
+                    if self.current_minute_apps or self.current_minute_processes:
+                        with self.lock:
+                            self.frame_buffer.clear()
+                        self.current_minute_apps = list()
+                        self.current_minute_processes = list()
+                        seconds = 0
+                        last_frame = None
+                    time.sleep(0.3)
+                    continue
+
                 # Poll the active window every iteration so window switches during
                 # the minute are all captured (not just the one focused at start).
                 self._track_active_window(monitor)
@@ -555,6 +572,15 @@ Create a retrievable memory record that preserves what matters most for future r
             self.activity_logger.reset()
             # self.description_history.clear()
 
+    def pause(self):
+        """Stop capturing/processing without tearing down the thread."""
+        self.paused = True
+        logger.info("Screen capture paused.")
+
+    def resume(self):
+        self.paused = False
+        logger.info("Screen capture resumed.")
+
     def cleanup(self):
         self.running = False
         self._mailbox_wake.set()  # unblock the worker so it can exit
@@ -576,10 +602,12 @@ Create a retrievable memory record that preserves what matters most for future r
             return list(self.frame_buffer)
 
     def status(self):
+        alive = self.capture_thread is not None and self.capture_thread.is_alive()
         return {
             "configured": True,
-            "healthy": self.healthy and self.capture_thread is not None and self.capture_thread.is_alive(),
+            "healthy": self.healthy and alive and not self.paused,
             "running": self.running,
+            "paused": self.paused,
             "frames": len(self.frame_buffer),
             "monitor_index": self.monitor_index,
             "error": self.last_error,

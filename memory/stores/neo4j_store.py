@@ -27,6 +27,10 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT room_id IF NOT EXISTS FOR (r:Room) REQUIRE r.room_id IS UNIQUE",
     "CREATE CONSTRAINT room_note_id IF NOT EXISTS FOR (n:RoomNote) REQUIRE n.note_id IS UNIQUE",
     "CREATE CONSTRAINT room_message_id IF NOT EXISTS FOR (m:RoomMessage) REQUIRE m.message_id IS UNIQUE",
+    "CREATE CONSTRAINT memory_correction_id IF NOT EXISTS FOR (c:MemoryCorrection) REQUIRE c.correction_id IS UNIQUE",
+    "CREATE CONSTRAINT conversation_id IF NOT EXISTS FOR (c:Conversation) REQUIRE c.conversation_id IS UNIQUE",
+    "CREATE CONSTRAINT assistant_message_id IF NOT EXISTS FOR (m:AssistantMessage) REQUIRE m.message_id IS UNIQUE",
+    "CREATE CONSTRAINT focus_session_id IF NOT EXISTS FOR (f:FocusSession) REQUIRE f.focus_id IS UNIQUE",
 ]
 
 # Secondary indexes for span-aware and lookup queries.
@@ -203,6 +207,282 @@ class Neo4jStore:
             "RETURN n.name AS name, n.type AS type, count(m) AS mentions "
             "ORDER BY mentions DESC LIMIT $limit", limit=limit)]
 
+    # -- Phase 2: Memory Explorer -----------------------------------------
+    def memory_search(self, query, limit=40, kinds=None, start=None, end=None,
+                      room_id=None):
+        """Keyword search across graph-backed memory types.
+
+        Results share a stable shape so the API can merge them with semantic
+        vector hits without exposing database-specific records to the client.
+        """
+        needle = self._norm(query)
+        if not needle:
+            return []
+        allowed = set(kinds or ("event", "note", "message", "entity", "claim", "room"))
+        params = {
+            "needle": needle, "limit": max(1, min(int(limit), 200)),
+            "start": start, "end": end, "room_id": room_id,
+        }
+        results = []
+        searches = {
+            "event": _SEARCH_EVENTS_CYPHER,
+            "note": _SEARCH_NOTES_CYPHER,
+            "message": _SEARCH_MESSAGES_CYPHER,
+            "entity": _SEARCH_ENTITIES_CYPHER,
+            "claim": _SEARCH_CLAIMS_CYPHER,
+            "room": _SEARCH_ROOMS_CYPHER,
+        }
+        for kind, cypher in searches.items():
+            if kind not in allowed:
+                continue
+            results.extend(dict(row) for row in self.run(cypher, **params))
+        results.sort(
+            key=lambda item: (item.get("score") or 0, item.get("ts") or 0),
+            reverse=True,
+        )
+        return results[:params["limit"]]
+
+    def entity_detail(self, entity_id):
+        rows = self.run(_ENTITY_DETAIL_CYPHER, entity_id=self._norm(entity_id))
+        if not rows:
+            return None
+        entity = dict(rows[0])
+        entity["events"] = [dict(r) for r in self.run(
+            _ENTITY_DETAIL_EVENTS_CYPHER, entity_id=self._norm(entity_id), limit=100)]
+        entity["claims"] = [dict(r) for r in self.run(
+            _ENTITY_DETAIL_CLAIMS_CYPHER, entity_id=self._norm(entity_id), limit=50)]
+        entity["rooms"] = [dict(r) for r in self.run(
+            _ENTITY_DETAIL_ROOMS_CYPHER, entity_id=self._norm(entity_id), limit=30)]
+        entity["co_occurring"] = self.co_occurring_entities(entity_id, limit=30)
+        return entity
+
+    def event_detail(self, event_id):
+        rows = self.run(_EVENT_DETAIL_CYPHER, event_id=event_id)
+        if not rows:
+            return None
+        out = dict(rows[0])
+        out["entities"] = [dict(r) for r in self.run(
+            _EVENT_DETAIL_ENTITIES_CYPHER, event_id=event_id)]
+        out["claims"] = [dict(r) for r in self.run(
+            _EVENT_DETAIL_CLAIMS_CYPHER, event_id=event_id)]
+        out["rooms"] = [dict(r) for r in self.run(
+            _EVENT_DETAIL_ROOMS_CYPHER, event_id=event_id)]
+        return out
+
+    def update_event_summary(self, event_id, summary):
+        import uuid as _uuid
+        rows = self.run(
+            _UPDATE_EVENT_SUMMARY_CYPHER, event_id=event_id, summary=summary,
+            correction_id=_uuid.uuid4().hex)
+        return dict(rows[0]) if rows else None
+
+    def update_entity(self, entity_id, name=None, entity_type=None):
+        import uuid as _uuid
+        rows = self.run(
+            _UPDATE_ENTITY_CYPHER, entity_id=self._norm(entity_id),
+            name=name, entity_type=entity_type,
+            correction_id=_uuid.uuid4().hex)
+        return dict(rows[0]) if rows else None
+
+    def merge_entities(self, source_id, target_id):
+        """Merge one entity into another while preserving mention evidence."""
+        source_id, target_id = self._norm(source_id), self._norm(target_id)
+        if source_id == target_id:
+            raise ValueError("source and target must differ")
+
+        def _tx(tx):
+            nodes = list(tx.run(
+                "MATCH (source:Entity {entity_id: $source_id}), "
+                "(target:Entity {entity_id: $target_id}) "
+                "RETURN source.entity_id AS source, target.entity_id AS target",
+                source_id=source_id, target_id=target_id))
+            if not nodes:
+                return None
+            mentions = list(tx.run(_ENTITY_MENTIONS_FOR_MERGE_CYPHER,
+                                   source_id=source_id))
+            for mention in mentions:
+                tx.run(_MERGE_ENTITY_MENTION_CYPHER, target_id=target_id,
+                       event_id=mention["event_id"],
+                       confidence=mention["confidence"], role=mention["role"],
+                       co_presence=mention["co_presence"])
+            tx.run("MATCH (source:Entity {entity_id: $source_id}) DETACH DELETE source",
+                   source_id=source_id)
+            return {"source_id": source_id, "target_id": target_id,
+                    "moved_mentions": len(mentions)}
+
+        with self._driver.session(database=self.database) as session:
+            return session.execute_write(_tx)
+
+    def split_entity(self, source_id, new_entity_id, name, entity_type, event_ids):
+        """Move selected event mentions from an entity into a new entity."""
+        source_id, new_entity_id = self._norm(source_id), self._norm(new_entity_id)
+        if not event_ids:
+            raise ValueError("at least one event_id is required")
+        if self.entity_detail(new_entity_id) is not None:
+            raise ValueError("new entity_id already exists")
+
+        def _tx(tx):
+            source = list(tx.run(
+                "MATCH (n:Entity {entity_id: $source_id}) RETURN n.entity_id AS id",
+                source_id=source_id))
+            if not source:
+                return None
+            tx.run(_CREATE_SPLIT_ENTITY_CYPHER, entity_id=new_entity_id,
+                   name=name, entity_type=entity_type)
+            moved = 0
+            for event_id in event_ids:
+                rows = list(tx.run(
+                    _MOVE_ENTITY_MENTION_CYPHER, source_id=source_id,
+                    target_id=new_entity_id, event_id=event_id))
+                moved += 1 if rows else 0
+            return {"source_id": source_id, "entity_id": new_entity_id,
+                    "moved_mentions": moved}
+
+        with self._driver.session(database=self.database) as session:
+            return session.execute_write(_tx)
+
+    def update_claim(self, claim_id, text):
+        import uuid as _uuid
+        rows = self.run(
+            _UPDATE_CLAIM_CYPHER, claim_id=claim_id, text=text,
+            correction_id=_uuid.uuid4().hex)
+        return dict(rows[0]) if rows else None
+
+    def delete_claim(self, claim_id):
+        rows = self.run(_DELETE_CLAIM_CYPHER, claim_id=claim_id)
+        return bool(rows and rows[0]["deleted"])
+
+    def forget_event(self, event_id):
+        rows = self.run(_FORGET_EVENT_CYPHER, event_id=event_id)
+        if rows and rows[0]["deleted"]:
+            self.run("MATCH (n:Entity) WHERE NOT (n)<-[:MENTIONS]-(:Event) DETACH DELETE n")
+        return dict(rows[0]) if rows else None
+
+    def forget_session(self, session_id):
+        rows = self.run(_SESSION_EVENT_IDS_CYPHER, session_id=session_id)
+        event_ids = [row["event_id"] for row in rows]
+        for event_id in event_ids:
+            self.forget_event(event_id)
+        removed = self.run(_DELETE_EMPTY_SESSION_CYPHER, session_id=session_id)
+        return {"session_id": session_id, "event_ids": event_ids,
+                "deleted": bool(removed and removed[0]["deleted"])}
+
+    def forget_day(self, date_str):
+        rows = self.run(_DAY_EVENT_IDS_CYPHER, date=date_str)
+        event_ids = [row["event_id"] for row in rows]
+        for event_id in event_ids:
+            self.forget_event(event_id)
+        self.run(_DELETE_EMPTY_DAY_CYPHER, date=date_str)
+        return {"date": date_str, "event_ids": event_ids, "deleted": True}
+
+    def forget_entity(self, entity_id):
+        rows = self.run(_FORGET_ENTITY_CYPHER, entity_id=self._norm(entity_id))
+        return bool(rows and rows[0]["deleted"])
+
+    # -- Phase 3: grounded assistant + focus -------------------------------
+    def create_conversation(self, title="New conversation", scope="all",
+                            room_id=None, from_ts=None, to_ts=None):
+        import uuid as _uuid
+        conversation_id = _uuid.uuid4().hex
+        rows = self.run(
+            _CREATE_CONVERSATION_CYPHER, conversation_id=conversation_id,
+            title=title, scope=scope, room_id=room_id,
+            from_ts=from_ts, to_ts=to_ts)
+        return dict(rows[0]) if rows else None
+
+    def list_conversations(self, limit=100):
+        return [dict(row) for row in self.run(
+            _LIST_CONVERSATIONS_CYPHER, limit=max(1, min(int(limit), 200)))]
+
+    def get_conversation(self, conversation_id, message_limit=200):
+        import json as _json
+        rows = self.run(_GET_CONVERSATION_CYPHER,
+                        conversation_id=conversation_id)
+        if not rows:
+            return None
+        result = dict(rows[0])
+        result["messages"] = [dict(row) for row in self.run(
+            _CONVERSATION_MESSAGES_CYPHER,
+            conversation_id=conversation_id,
+            limit=max(1, min(int(message_limit), 500)))]
+        for message in result["messages"]:
+            try:
+                message["citations"] = _json.loads(
+                    message.pop("citations_json") or "[]")
+            except (TypeError, ValueError):
+                message["citations"] = []
+        return result
+
+    def update_conversation(self, conversation_id, changes):
+        current = self.get_conversation(conversation_id, message_limit=1)
+        if current is None:
+            return None
+        values = {
+            "conversation_id": conversation_id,
+            "title": changes.get("title", current.get("title")),
+            "scope": changes.get("scope", current.get("scope") or "all"),
+            "room_id": changes.get("room_id", current.get("room_id")),
+            "from_ts": changes.get("from_ts", current.get("from_ts")),
+            "to_ts": changes.get("to_ts", current.get("to_ts")),
+        }
+        rows = self.run(_UPDATE_CONVERSATION_CYPHER, **values)
+        return dict(rows[0]) if rows else None
+
+    def add_conversation_message(self, conversation_id, role, text,
+                                 citations=None, ts=None):
+        import json as _json
+        import time as _time
+        import uuid as _uuid
+        rows = self.run(
+            _ADD_CONVERSATION_MESSAGE_CYPHER,
+            conversation_id=conversation_id,
+            message_id=_uuid.uuid4().hex, role=role, text=text,
+            citations_json=_json.dumps(citations or []),
+            ts=ts if ts is not None else _time.time())
+        return dict(rows[0]) if rows else None
+
+    def delete_conversation(self, conversation_id):
+        rows = self.run(_DELETE_CONVERSATION_CYPHER,
+                        conversation_id=conversation_id)
+        return bool(rows and rows[0]["deleted"])
+
+    def start_focus_session(self, goal, room_id=None, planned_minutes=25):
+        import time as _time
+        import uuid as _uuid
+        focus_id = _uuid.uuid4().hex
+        rows = self.run(
+            _START_FOCUS_CYPHER, focus_id=focus_id, goal=goal,
+            room_id=room_id, planned_minutes=planned_minutes,
+            started_at=_time.time())
+        return dict(rows[0]) if rows else None
+
+    def active_focus_session(self):
+        rows = self.run(_ACTIVE_FOCUS_CYPHER)
+        return dict(rows[0]) if rows else None
+
+    def list_focus_sessions(self, limit=50):
+        return [dict(row) for row in self.run(
+            _LIST_FOCUS_CYPHER, limit=max(1, min(int(limit), 200)))]
+
+    def stop_focus_session(self, focus_id):
+        import time as _time
+        ended_at = _time.time()
+        rows = self.run(_STOP_FOCUS_CYPHER, focus_id=focus_id,
+                        ended_at=ended_at)
+        if not rows:
+            return None
+        result = dict(rows[0])
+        metrics = self.run(
+            _FOCUS_METRICS_CYPHER, start=result["started_at"],
+            end=ended_at, room_id=result.get("room_id"))
+        result["metrics"] = dict(metrics[0]) if metrics else {
+            "events": 0, "active_seconds": 0, "applications": []}
+        self.run(_SAVE_FOCUS_SUMMARY_CYPHER, focus_id=focus_id,
+                 ended_at=ended_at,
+                 events=result["metrics"].get("events") or 0,
+                 active_seconds=result["metrics"].get("active_seconds") or 0)
+        return result
+
     # -- Rooms (Phase 1) ---------------------------------------------------
     def _load_rooms(self):
         import json as _json
@@ -212,6 +492,7 @@ class Neo4jStore:
                 "MATCH (r:Room) RETURN r.room_id AS room_id, r.name AS name, "
                 "r.kind AS kind, r.auto AS auto, r.matcher_json AS matcher_json, "
                 "r.description AS description, r.color AS color, r.icon AS icon, "
+                "r.instructions AS instructions, "
                 "r.archived AS archived, r.pinned AS pinned, r.position AS position, "
                 "r.created_at AS created_at, r.updated_at AS updated_at"):
             matcher = RoomMatcher()
@@ -224,6 +505,7 @@ class Neo4jStore:
                                kind=r.get("kind") or "topic",
                                auto=bool(r.get("auto")), matcher=matcher,
                                description=r.get("description") or "",
+                               instructions=r.get("instructions") or "",
                                color=r.get("color") or "#8B7CF6",
                                icon=r.get("icon") or "forum",
                                archived=bool(r.get("archived")),
@@ -232,6 +514,22 @@ class Neo4jStore:
                                created_at=r.get("created_at"),
                                updated_at=r.get("updated_at")))
         return rooms
+
+    def ensure_camera_room(self, camera_id, name):
+        """Idempotently create a per-camera room that events from this camera
+        route into. Keyed on camera_id (the app token the camera worker stamps on
+        each event) so routing is deterministic even if two cameras share a model
+        name. Safe to call every startup — ON MATCH preserves user edits."""
+        import json as _json
+        from memory.models.room import Room, RoomMatcher
+        room = Room(
+            room_id=camera_id, name=name, kind="camera", auto=True,
+            matcher=RoomMatcher(apps=[camera_id]),
+            description=f"Live feed and events seen by the {name} camera.",
+            color="#F59E0B", icon="videocam",
+        )
+        self.run(_MERGE_ROOM_CYPHER, **_room_params(room, _json))
+        return self.get_room(camera_id)
 
     def create_room(self, room):
         """Create a user-managed topic room. Raises ValueError on duplicate id."""
@@ -251,7 +549,7 @@ class Neo4jStore:
         room = next((r for r in self._load_rooms() if r.room_id == room_id), None)
         if room is None:
             return None
-        allowed = {"name", "description", "color", "icon", "archived", "pinned",
+        allowed = {"name", "description", "instructions", "color", "icon", "archived", "pinned",
                    "position", "matcher"}
         for key, value in changes.items():
             if key in allowed:
@@ -311,6 +609,7 @@ class Neo4jStore:
         rows = self.run("MATCH (r:Room {room_id: $room_id}) "
                         "RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind, "
                         "r.auto AS auto, r.description AS description, r.color AS color, "
+                        "r.instructions AS instructions, "
                         "r.icon AS icon, r.archived AS archived, r.pinned AS pinned, "
                         "r.position AS position, r.matcher_json AS matcher_json",
                         room_id=room_id)
@@ -601,6 +900,7 @@ def _room_params(room, json_module):
         "auto": room.auto,
         "matcher_json": json_module.dumps(matcher),
         "description": room.description,
+        "instructions": room.instructions,
         "color": room.color,
         "icon": room.icon,
         "archived": room.archived,
@@ -682,6 +982,400 @@ RETURN e.event_id AS event, n.name AS name, n.type AS type,
        m.role AS role, m.co_presence AS co_presence
 """
 
+_SEARCH_EVENTS_CYPHER = """
+MATCH (e:Event)
+OPTIONAL MATCH (r:Room)-[:CONTAINS]->(e)
+WITH e, collect(DISTINCT {room_id: r.room_id, name: r.name}) AS rooms
+WHERE toLower(coalesce(e.summary, '')) CONTAINS $needle
+  AND ($start IS NULL OR e.span_start >= $start)
+  AND ($end IS NULL OR e.span_start < $end)
+  AND ($room_id IS NULL OR any(room IN rooms WHERE room.room_id = $room_id))
+RETURN 'event' AS kind, e.event_id AS id,
+       coalesce(e.application, e.activity_type, 'Activity') AS title,
+       e.summary AS text, e.span_start AS ts, rooms,
+       100 + CASE WHEN toLower(coalesce(e.summary, '')) STARTS WITH $needle
+                  THEN 20 ELSE 0 END AS score
+ORDER BY score DESC, ts DESC
+LIMIT $limit
+"""
+
+_SEARCH_NOTES_CYPHER = """
+MATCH (r:Room)-[:HAS_NOTE]->(n:RoomNote)
+WHERE toLower(coalesce(n.text, '')) CONTAINS $needle
+  AND ($start IS NULL OR n.ts >= $start)
+  AND ($end IS NULL OR n.ts < $end)
+  AND ($room_id IS NULL OR r.room_id = $room_id)
+RETURN 'note' AS kind, n.note_id AS id, r.name AS title, n.text AS text,
+       n.ts AS ts, [{room_id: r.room_id, name: r.name}] AS rooms, 90 AS score
+ORDER BY ts DESC
+LIMIT $limit
+"""
+
+_SEARCH_MESSAGES_CYPHER = """
+MATCH (r:Room)-[:HAS_MESSAGE]->(m:RoomMessage)
+WHERE toLower(coalesce(m.text, '')) CONTAINS $needle
+  AND ($start IS NULL OR m.ts >= $start)
+  AND ($end IS NULL OR m.ts < $end)
+  AND ($room_id IS NULL OR r.room_id = $room_id)
+RETURN 'message' AS kind, m.message_id AS id,
+       r.name + ' · ' + coalesce(m.role, 'message') AS title,
+       m.text AS text, m.ts AS ts,
+       [{room_id: r.room_id, name: r.name}] AS rooms, 80 AS score
+ORDER BY ts DESC
+LIMIT $limit
+"""
+
+_SEARCH_ENTITIES_CYPHER = """
+MATCH (n:Entity)
+WHERE toLower(coalesce(n.name, '')) CONTAINS $needle
+RETURN 'entity' AS kind, n.entity_id AS id, n.name AS title,
+       coalesce(n.type, 'entity') AS text, null AS ts, [] AS rooms,
+       110 + CASE WHEN toLower(n.name) = $needle THEN 40 ELSE 0 END AS score
+ORDER BY score DESC, title
+LIMIT $limit
+"""
+
+_SEARCH_CLAIMS_CYPHER = """
+MATCH (c:Claim)<-[:SUPPORTS]-(e:Event)
+OPTIONAL MATCH (r:Room)-[:CONTAINS]->(e)
+WITH c, e, collect(DISTINCT {room_id: r.room_id, name: r.name}) AS rooms
+WHERE toLower(coalesce(c.text, '')) CONTAINS $needle
+  AND ($start IS NULL OR e.span_start >= $start)
+  AND ($end IS NULL OR e.span_start < $end)
+  AND ($room_id IS NULL OR any(room IN rooms WHERE room.room_id = $room_id))
+RETURN 'claim' AS kind, c.claim_id AS id, 'Claim' AS title, c.text AS text,
+       e.span_start AS ts, rooms, 95 AS score
+ORDER BY ts DESC
+LIMIT $limit
+"""
+
+_SEARCH_ROOMS_CYPHER = """
+MATCH (r:Room)
+WHERE toLower(coalesce(r.name, '') + ' ' + coalesce(r.description, '')) CONTAINS $needle
+RETURN 'room' AS kind, r.room_id AS id, r.name AS title,
+       coalesce(r.description, r.kind) AS text, null AS ts,
+       [{room_id: r.room_id, name: r.name}] AS rooms, 105 AS score
+ORDER BY title
+LIMIT $limit
+"""
+
+_ENTITY_DETAIL_CYPHER = """
+MATCH (n:Entity {entity_id: $entity_id})
+OPTIONAL MATCH (n)<-[:MENTIONS]-(e:Event)
+RETURN n.entity_id AS entity_id, n.name AS name, n.type AS type,
+       n.memory_status AS memory_status, n.max_confidence AS max_confidence,
+       count(DISTINCT e) AS mentions, min(e.span_start) AS first_seen,
+       max(e.span_end) AS last_seen
+"""
+
+_ENTITY_DETAIL_EVENTS_CYPHER = """
+MATCH (n:Entity {entity_id: $entity_id})<-[m:MENTIONS]-(e:Event)
+RETURN e.event_id AS event_id, e.summary AS summary,
+       e.application AS application, e.activity_type AS activity_type,
+       e.span_start AS span_start, e.span_end AS span_end,
+       m.confidence AS confidence, m.role AS role
+ORDER BY e.span_start DESC
+LIMIT $limit
+"""
+
+_ENTITY_DETAIL_CLAIMS_CYPHER = """
+MATCH (n:Entity {entity_id: $entity_id})<-[:MENTIONS]-(e:Event)-[:SUPPORTS]->(c:Claim)
+RETURN DISTINCT c.claim_id AS claim_id, c.text AS text,
+       c.confidence AS confidence, max(e.span_start) AS last_seen
+ORDER BY last_seen DESC
+LIMIT $limit
+"""
+
+_ENTITY_DETAIL_ROOMS_CYPHER = """
+MATCH (n:Entity {entity_id: $entity_id})<-[:MENTIONS]-(e:Event)<-[:CONTAINS]-(r:Room)
+RETURN r.room_id AS room_id, r.name AS name, count(DISTINCT e) AS events
+ORDER BY events DESC
+LIMIT $limit
+"""
+
+_EVENT_DETAIL_CYPHER = """
+MATCH (e:Event {event_id: $event_id})<-[:HAS_EVENT]-(s:Session)
+RETURN e.event_id AS event_id, e.summary AS summary,
+       e.original_summary AS original_summary, e.corrected_at AS corrected_at,
+       e.application AS application, e.activity_type AS activity_type,
+       e.project_id AS project_id, e.span_start AS span_start,
+       e.span_end AS span_end, e.span_seconds AS span_seconds,
+       e.boundary_label AS boundary_label, s.session_id AS session_id
+"""
+
+_EVENT_DETAIL_ENTITIES_CYPHER = """
+MATCH (e:Event {event_id: $event_id})-[m:MENTIONS]->(n:Entity)
+RETURN n.entity_id AS entity_id, n.name AS name, n.type AS type,
+       m.confidence AS confidence, m.role AS role
+ORDER BY m.confidence DESC
+"""
+
+_EVENT_DETAIL_CLAIMS_CYPHER = """
+MATCH (e:Event {event_id: $event_id})-[:SUPPORTS]->(c:Claim)
+RETURN c.claim_id AS claim_id, c.text AS text, c.confidence AS confidence
+ORDER BY c.confidence DESC
+"""
+
+_EVENT_DETAIL_ROOMS_CYPHER = """
+MATCH (r:Room)-[rel:CONTAINS]->(e:Event {event_id: $event_id})
+RETURN r.room_id AS room_id, r.name AS name, rel.assignment AS assignment,
+       rel.manual AS manual
+ORDER BY assignment
+"""
+
+_UPDATE_EVENT_SUMMARY_CYPHER = """
+MATCH (e:Event {event_id: $event_id})
+CREATE (c:MemoryCorrection {
+  correction_id: $correction_id, target_type: 'event', target_id: $event_id,
+  field: 'summary', old_value: e.summary, new_value: $summary,
+  created_at: timestamp()
+})
+SET e.original_summary = coalesce(e.original_summary, e.summary),
+    e.summary = $summary, e.corrected_at = timestamp()
+RETURN e.event_id AS event_id, e.summary AS summary,
+       e.original_summary AS original_summary, e.corrected_at AS corrected_at
+"""
+
+_UPDATE_ENTITY_CYPHER = """
+MATCH (n:Entity {entity_id: $entity_id})
+CREATE (c:MemoryCorrection {
+  correction_id: $correction_id, target_type: 'entity', target_id: $entity_id,
+  field: 'name/type', old_value: coalesce(n.name, '') + '|' + coalesce(n.type, ''),
+  new_value: coalesce($name, n.name) + '|' + coalesce($entity_type, n.type),
+  created_at: timestamp()
+})
+SET n.name = coalesce($name, n.name), n.type = coalesce($entity_type, n.type),
+    n.corrected_at = timestamp()
+RETURN n.entity_id AS entity_id, n.name AS name, n.type AS type
+"""
+
+_ENTITY_MENTIONS_FOR_MERGE_CYPHER = """
+MATCH (e:Event)-[m:MENTIONS]->(:Entity {entity_id: $source_id})
+RETURN e.event_id AS event_id, m.confidence AS confidence,
+       m.role AS role, m.co_presence AS co_presence
+"""
+
+_MERGE_ENTITY_MENTION_CYPHER = """
+MATCH (e:Event {event_id: $event_id}), (target:Entity {entity_id: $target_id})
+MERGE (e)-[m:MENTIONS]->(target)
+SET m.confidence = CASE
+      WHEN m.confidence IS NULL OR coalesce($confidence, 0) > m.confidence
+      THEN $confidence ELSE m.confidence END,
+    m.role = coalesce(m.role, $role),
+    m.co_presence = coalesce(m.co_presence, $co_presence)
+"""
+
+_CREATE_SPLIT_ENTITY_CYPHER = """
+MERGE (n:Entity {entity_id: $entity_id})
+ON CREATE SET n.name = $name, n.type = $entity_type,
+              n.memory_status = 'quarantined', n.created_at = timestamp()
+"""
+
+_MOVE_ENTITY_MENTION_CYPHER = """
+MATCH (e:Event {event_id: $event_id})-[old:MENTIONS]->
+      (source:Entity {entity_id: $source_id}),
+      (target:Entity {entity_id: $target_id})
+MERGE (e)-[m:MENTIONS]->(target)
+SET m.confidence = old.confidence, m.role = old.role,
+    m.co_presence = old.co_presence
+DELETE old
+RETURN e.event_id AS event_id
+"""
+
+_UPDATE_CLAIM_CYPHER = """
+MATCH (cl:Claim {claim_id: $claim_id})
+CREATE (c:MemoryCorrection {
+  correction_id: $correction_id, target_type: 'claim', target_id: $claim_id,
+  field: 'text', old_value: cl.text, new_value: $text, created_at: timestamp()
+})
+SET cl.original_text = coalesce(cl.original_text, cl.text),
+    cl.text = $text, cl.corrected_at = timestamp()
+RETURN cl.claim_id AS claim_id, cl.text AS text
+"""
+
+_DELETE_CLAIM_CYPHER = """
+OPTIONAL MATCH (c:Claim {claim_id: $claim_id})
+WITH c, c IS NOT NULL AS existed
+FOREACH (_ IN CASE WHEN existed THEN [1] ELSE [] END | DETACH DELETE c)
+RETURN existed AS deleted
+"""
+
+_FORGET_EVENT_CYPHER = """
+OPTIONAL MATCH (e:Event {event_id: $event_id})
+OPTIONAL MATCH (e)-[:SUPPORTS]->(claim:Claim)
+WITH e, collect(DISTINCT claim) AS claims, e IS NOT NULL AS existed
+FOREACH (_ IN CASE WHEN existed THEN [1] ELSE [] END | DETACH DELETE e)
+WITH existed,
+     [claim IN claims WHERE NOT (claim)<-[:SUPPORTS]-(:Event)] AS orphan_claims
+FOREACH (claim IN orphan_claims | DETACH DELETE claim)
+RETURN existed AS deleted, $event_id AS event_id
+"""
+
+_SESSION_EVENT_IDS_CYPHER = """
+MATCH (s:Session {session_id: $session_id})-[:HAS_EVENT]->(e:Event)
+RETURN e.event_id AS event_id
+"""
+
+_DELETE_EMPTY_SESSION_CYPHER = """
+OPTIONAL MATCH (s:Session {session_id: $session_id})
+WITH s, s IS NOT NULL AS existed
+FOREACH (_ IN CASE WHEN existed THEN [1] ELSE [] END | DETACH DELETE s)
+RETURN existed AS deleted
+"""
+
+_DAY_EVENT_IDS_CYPHER = """
+MATCH (d:Day {date: $date})-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(e:Event)
+RETURN DISTINCT e.event_id AS event_id
+"""
+
+_DELETE_EMPTY_DAY_CYPHER = """
+OPTIONAL MATCH (d:Day {date: $date})
+OPTIONAL MATCH (d)-[:HAS_SESSION]->(s:Session)
+WITH d, collect(s) AS sessions
+FOREACH (s IN sessions | DETACH DELETE s)
+FOREACH (_ IN CASE WHEN d IS NULL THEN [] ELSE [1] END | DETACH DELETE d)
+RETURN true AS deleted
+"""
+
+_FORGET_ENTITY_CYPHER = """
+OPTIONAL MATCH (n:Entity {entity_id: $entity_id})
+WITH n, n IS NOT NULL AS existed
+FOREACH (_ IN CASE WHEN existed THEN [1] ELSE [] END | DETACH DELETE n)
+RETURN existed AS deleted
+"""
+
+_CREATE_CONVERSATION_CYPHER = """
+CREATE (c:Conversation {
+  conversation_id: $conversation_id, title: $title, scope: $scope,
+  room_id: $room_id, from_ts: $from_ts, to_ts: $to_ts,
+  created_at: timestamp(), updated_at: timestamp()
+})
+RETURN c.conversation_id AS conversation_id, c.title AS title,
+       c.scope AS scope, c.room_id AS room_id,
+       c.from_ts AS from_ts, c.to_ts AS to_ts,
+       c.created_at AS created_at
+"""
+
+_LIST_CONVERSATIONS_CYPHER = """
+MATCH (c:Conversation)
+OPTIONAL MATCH (c)-[:HAS_ASSISTANT_MESSAGE]->(m:AssistantMessage)
+RETURN c.conversation_id AS conversation_id, c.title AS title,
+       c.scope AS scope, c.room_id AS room_id,
+       c.from_ts AS from_ts, c.to_ts AS to_ts,
+       count(m) AS messages, max(m.ts) AS last_message,
+       c.created_at AS created_at
+ORDER BY coalesce(last_message, created_at) DESC
+LIMIT $limit
+"""
+
+_GET_CONVERSATION_CYPHER = """
+MATCH (c:Conversation {conversation_id: $conversation_id})
+RETURN c.conversation_id AS conversation_id, c.title AS title,
+       c.scope AS scope, c.room_id AS room_id,
+       c.from_ts AS from_ts, c.to_ts AS to_ts,
+       c.created_at AS created_at, c.updated_at AS updated_at
+"""
+
+_UPDATE_CONVERSATION_CYPHER = """
+MATCH (c:Conversation {conversation_id: $conversation_id})
+SET c.title = $title, c.scope = $scope, c.room_id = $room_id,
+    c.from_ts = $from_ts, c.to_ts = $to_ts, c.updated_at = timestamp()
+RETURN c.conversation_id AS conversation_id, c.title AS title,
+       c.scope AS scope, c.room_id AS room_id,
+       c.from_ts AS from_ts, c.to_ts AS to_ts
+"""
+
+_ADD_CONVERSATION_MESSAGE_CYPHER = """
+MATCH (c:Conversation {conversation_id: $conversation_id})
+CREATE (m:AssistantMessage {
+  message_id: $message_id, role: $role, text: $text,
+  citations_json: $citations_json, ts: $ts
+})
+CREATE (c)-[:HAS_ASSISTANT_MESSAGE]->(m)
+SET c.updated_at = timestamp(),
+    c.title = CASE
+      WHEN c.title = 'New conversation' AND $role = 'user'
+      THEN substring($text, 0, 64) ELSE c.title END
+RETURN m.message_id AS message_id, m.role AS role, m.text AS text,
+       m.citations_json AS citations_json, m.ts AS ts
+"""
+
+_CONVERSATION_MESSAGES_CYPHER = """
+MATCH (:Conversation {conversation_id: $conversation_id})
+      -[:HAS_ASSISTANT_MESSAGE]->(m:AssistantMessage)
+RETURN m.message_id AS message_id, m.role AS role, m.text AS text,
+       m.citations_json AS citations_json, m.ts AS ts
+ORDER BY m.ts
+LIMIT $limit
+"""
+
+_DELETE_CONVERSATION_CYPHER = """
+OPTIONAL MATCH (c:Conversation {conversation_id: $conversation_id})
+OPTIONAL MATCH (c)-[:HAS_ASSISTANT_MESSAGE]->(m:AssistantMessage)
+WITH c, collect(m) AS messages, c IS NOT NULL AS existed
+FOREACH (message IN messages | DETACH DELETE message)
+FOREACH (_ IN CASE WHEN existed THEN [1] ELSE [] END | DETACH DELETE c)
+RETURN existed AS deleted
+"""
+
+_START_FOCUS_CYPHER = """
+CREATE (f:FocusSession {
+  focus_id: $focus_id, goal: $goal, room_id: $room_id,
+  planned_minutes: $planned_minutes, started_at: $started_at,
+  state: 'active', created_at: timestamp()
+})
+RETURN f.focus_id AS focus_id, f.goal AS goal, f.room_id AS room_id,
+       f.planned_minutes AS planned_minutes, f.started_at AS started_at,
+       f.state AS state
+"""
+
+_ACTIVE_FOCUS_CYPHER = """
+MATCH (f:FocusSession {state: 'active'})
+RETURN f.focus_id AS focus_id, f.goal AS goal, f.room_id AS room_id,
+       f.planned_minutes AS planned_minutes, f.started_at AS started_at,
+       f.state AS state
+ORDER BY f.started_at DESC
+LIMIT 1
+"""
+
+_LIST_FOCUS_CYPHER = """
+MATCH (f:FocusSession)
+RETURN f.focus_id AS focus_id, f.goal AS goal, f.room_id AS room_id,
+       f.planned_minutes AS planned_minutes, f.started_at AS started_at,
+       f.ended_at AS ended_at, f.state AS state, f.events AS events,
+       f.active_seconds AS active_seconds
+ORDER BY f.started_at DESC
+LIMIT $limit
+"""
+
+_STOP_FOCUS_CYPHER = """
+MATCH (f:FocusSession {focus_id: $focus_id, state: 'active'})
+SET f.state = 'completed', f.ended_at = $ended_at
+RETURN f.focus_id AS focus_id, f.goal AS goal, f.room_id AS room_id,
+       f.planned_minutes AS planned_minutes, f.started_at AS started_at,
+       f.ended_at AS ended_at, f.state AS state
+"""
+
+_FOCUS_METRICS_CYPHER = """
+MATCH (e:Event)
+WHERE e.span_start < $end AND e.span_end > $start
+OPTIONAL MATCH (r:Room)-[:CONTAINS]->(e)
+WITH e, collect(DISTINCT r.room_id) AS room_ids
+WHERE $room_id IS NULL OR $room_id IN room_ids
+RETURN count(DISTINCT e) AS events,
+       sum(CASE
+         WHEN e.span_end > $end THEN $end ELSE e.span_end END -
+           CASE WHEN e.span_start < $start THEN $start ELSE e.span_start END
+       ) AS active_seconds,
+       collect(DISTINCT e.application) AS applications
+"""
+
+_SAVE_FOCUS_SUMMARY_CYPHER = """
+MATCH (f:FocusSession {focus_id: $focus_id})
+SET f.ended_at = $ended_at, f.events = $events,
+    f.active_seconds = $active_seconds
+"""
+
 _CONSOLIDATE_CYPHER = """
 MATCH (n:Entity)
 OPTIONAL MATCH (n)<-[m:MENTIONS]-(e:Event)
@@ -714,11 +1408,13 @@ _MERGE_ROOM_CYPHER = """
 MERGE (r:Room {room_id: $room_id})
   ON CREATE SET r.name = $name, r.kind = $kind, r.auto = $auto,
                 r.matcher_json = $matcher_json, r.description = $description,
+                r.instructions = $instructions,
                 r.color = $color, r.icon = $icon, r.archived = $archived,
                 r.pinned = $pinned, r.position = $position,
                 r.created_at = timestamp(), r.updated_at = timestamp()
   ON MATCH SET r.name = coalesce(r.name, $name), r.kind = coalesce(r.kind, $kind),
                r.description = coalesce(r.description, $description),
+               r.instructions = coalesce(r.instructions, $instructions),
                r.color = coalesce(r.color, $color), r.icon = coalesce(r.icon, $icon),
                r.archived = coalesce(r.archived, false),
                r.pinned = coalesce(r.pinned, $pinned),
@@ -738,6 +1434,7 @@ WHERE $include_archived OR NOT coalesce(r.archived, false)
 OPTIONAL MATCH (r)-[:CONTAINS]->(e:Event)
 RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind,
        r.auto AS auto, r.description AS description, r.color AS color,
+       r.instructions AS instructions,
        r.icon AS icon, coalesce(r.archived, false) AS archived,
        coalesce(r.pinned, false) AS pinned, coalesce(r.position, 0) AS position,
        count(e) AS events, max(e.span_end) AS last_active
@@ -802,22 +1499,25 @@ _CREATE_ROOM_CYPHER = """
 CREATE (r:Room {
   room_id: $room_id, name: $name, kind: $kind, auto: $auto,
   matcher_json: $matcher_json, description: $description, color: $color,
+  instructions: $instructions,
   icon: $icon, archived: $archived, pinned: $pinned, position: $position,
   created_at: timestamp(), updated_at: timestamp()
 })
 RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind,
        r.description AS description, r.color AS color, r.icon AS icon,
+       r.instructions AS instructions,
        r.archived AS archived, r.pinned AS pinned, r.position AS position
 """
 
 _UPDATE_ROOM_CYPHER = """
 MATCH (r:Room {room_id: $room_id})
-SET r.name = $name, r.description = $description, r.color = $color,
+SET r.name = $name, r.description = $description, r.instructions = $instructions, r.color = $color,
     r.icon = $icon, r.archived = $archived, r.pinned = $pinned,
     r.position = $position, r.matcher_json = $matcher_json,
     r.updated_at = timestamp()
 RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind,
        r.description AS description, r.color AS color, r.icon AS icon,
+       r.instructions AS instructions,
        r.archived AS archived, r.pinned AS pinned, r.position AS position
 """
 
@@ -879,7 +1579,7 @@ ORDER BY s.start
 
 _DAY_ENTITIES_CYPHER = """
 MATCH (d:Day {date: $date})-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(:Event)-[m:MENTIONS]->(n:Entity)
-RETURN n.name AS name, n.type AS type, count(m) AS mentions
+RETURN n.entity_id AS entity_id, n.name AS name, n.type AS type, count(m) AS mentions
 ORDER BY mentions DESC, name
 LIMIT $limit
 """

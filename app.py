@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import asyncio
+import datetime
 import time
 import uuid
 import wave
@@ -27,7 +28,7 @@ from providers.local_openAI import client, get_model_name_vlm
 from providers.tts.kokoro.kokoro_tts import run_kokoro
 from vector_store.activity_logger import ActivityLogger
 from sources.screen import RealtimeScreenCapture
-from sources.rtsp import RealtimeCameraStream
+from sources.camera_manager import CameraManager
 from vector_store.rag.activity_retriever import ActivityRetriever
 from tools.registry import ToolRegistry, register_default_tools
 from agents.proactive import ProactiveNarrator
@@ -88,7 +89,8 @@ _chat_history = []
 _current_context = "talker"
 vlm_model = None
 screen_stream = None
-camera_stream = None
+camera_manager = None
+camera_bootstrap_task = None
 proactive = None
 mobile_activity_task = None
 memory_pipeline = None   # Step-a: live sessions/events/knowledge pipeline
@@ -204,12 +206,16 @@ def validate_configuration():
         env_int("SCREEN_MONITOR_INDEX", 1)
         env_int("SCREEN_WINDOW_SECONDS", 60)
         env_float("SCREEN_FPS", 1.0)
+    if env_bool("CAMERA_CAPTURE_ENABLED", True):
+        env_int("CAMERA_WINDOW_SECONDS", 60)
+        env_float("CAMERA_FPS", 1.0)
 
 
 # === STARTUP ===
 @app.on_event("startup")
 async def startup_event():
-    global vlm_model, screen_stream, camera_stream, proactive, mobile_activity_task
+    global vlm_model, screen_stream, camera_manager, camera_bootstrap_task
+    global proactive, mobile_activity_task
     global memory_pipeline, neo4j_store
 
     validate_configuration()
@@ -238,9 +244,9 @@ async def startup_event():
 
     # Step-a: optional live memory pipeline (sessions/events/knowledge + stores).
     # Fully opt-in — unset LIVE_MEMORY leaves the legacy per-minute path unchanged.
-    if env_bool("LIVE_MEMORY", False):
+    if env_bool("LIVE_MEMORY", True):
         from memory.pipeline import MemoryPipeline
-        if env_bool("MEMORY_NEO4J", False):
+        if env_bool("MEMORY_NEO4J", True):
             try:
                 from memory.stores.neo4j_store import Neo4jStore
                 neo4j_store = Neo4jStore()
@@ -283,13 +289,22 @@ async def startup_event():
     else:
         logger.info("Screen capture disabled.")
 
-    # Camera stream is optional — only start it when an RTSP URL is configured.
-    camera_url = os.getenv("CAMERA_RTSP_URL")
-    if camera_url:
-        camera_stream = RealtimeCameraStream(camera_url)
-        logger.info("Camera stream configured: %s", camera_url)
+    # Cameras: discover live ONVIF cameras (+ any explicit RTSP URLs) and run a
+    # worker per camera, each feeding its own room. Discovery does blocking
+    # network I/O, so bootstrap it off the event loop and let cameras come online
+    # shortly after startup rather than blocking the whole app on WS-Discovery.
+    if env_bool("CAMERA_CAPTURE_ENABLED", True):
+        camera_manager = CameraManager(
+            model_name_vlm=vlm_model, neo4j_store=neo4j_store,
+            activity_logger=activity_logger,
+            window_seconds=env_int("CAMERA_WINDOW_SECONDS", 60),
+            fps=env_float("CAMERA_FPS", 1.0),
+        )
+        camera_bootstrap_task = asyncio.create_task(
+            asyncio.to_thread(camera_manager.discover_and_start))
+        logger.info("Camera discovery started in background.")
     else:
-        logger.info("No CAMERA_RTSP_URL set — camera stream disabled.")
+        logger.info("Camera capture disabled (CAMERA_CAPTURE_ENABLED=0).")
 
     logger.info("Single-user POC pipeline ready.")
     mobile_activity_task = asyncio.create_task(process_mobile_activity())
@@ -303,10 +318,16 @@ async def shutdown_event():
             await mobile_activity_task
         except asyncio.CancelledError:
             pass
+    if camera_bootstrap_task is not None:
+        camera_bootstrap_task.cancel()
+        try:
+            await camera_bootstrap_task
+        except (asyncio.CancelledError, Exception):
+            pass
     if screen_stream is not None:
         screen_stream.cleanup()   # also flushes the live memory pipeline
-    if camera_stream is not None:
-        camera_stream.cleanup()
+    if camera_manager is not None:
+        camera_manager.cleanup_all()
     if neo4j_store is not None:
         try:
             neo4j_store.close()
@@ -345,8 +366,7 @@ async def status():
         "history_turns": len(_chat_history) // 2,
         "screen_stream": screen_stream.status() if screen_stream else {"configured": False},
         "screen_frames": len(screen_stream.frame_buffer) if screen_stream else 0,
-        "camera_stream": camera_stream.status() if camera_stream else {"configured": False},
-        "camera_frames": len(camera_stream.frame_buffer) if camera_stream else 0,
+        "cameras": camera_manager.status_all() if camera_manager else [],
         "mobile_capture": mobile_stream.status(),
         "pipeline": dict(_pipeline_status),
         "debug_verbose": DEBUG_VERBOSE,
@@ -371,6 +391,53 @@ async def capture_control(request: Request):
     else:
         return JSONResponse(status_code=400, content={"error": "invalid capture action/source"})
     return mobile_stream.status()
+
+
+@app.post("/screen/control")
+async def screen_control(request: Request):
+    """Pause or resume the desktop screen capture from the UI."""
+    if screen_stream is None:
+        return JSONResponse(status_code=400, content={"error": "screen capture disabled"})
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid JSON: {exc}"})
+    action = data.get("action") if isinstance(data, dict) else None
+    if action == "pause":
+        screen_stream.pause()
+    elif action == "resume":
+        screen_stream.resume()
+    else:
+        return JSONResponse(status_code=400, content={"error": "action must be pause|resume"})
+    return screen_stream.status()
+
+
+@app.get("/cameras")
+async def cameras_list():
+    """Per-camera status (live health, paused, events logged)."""
+    return {"cameras": camera_manager.status_all() if camera_manager else []}
+
+
+@app.post("/cameras/{camera_id:path}/control")
+async def camera_control(camera_id: str, request: Request):
+    """Pause or resume a single camera worker."""
+    if camera_manager is None:
+        return JSONResponse(status_code=400, content={"error": "camera capture disabled"})
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid JSON: {exc}"})
+    action = data.get("action") if isinstance(data, dict) else None
+    if action == "pause":
+        ok = camera_manager.pause(camera_id)
+    elif action == "resume":
+        ok = camera_manager.resume(camera_id)
+    else:
+        return JSONResponse(status_code=400, content={"error": "action must be pause|resume"})
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "camera not found"})
+    worker = camera_manager.workers.get(camera_id)
+    return worker.status() if worker else {"ok": True}
 
 
 @app.post("/capture/frame")
@@ -493,6 +560,7 @@ async def rooms_create(request: Request):
         room = Room(
             room_id=room_id, name=name, kind="topic", auto=False, matcher=matcher,
             description=str(data.get("description") or "").strip(),
+            instructions=str(data.get("instructions") or "").strip(),
             color=str(data.get("color") or "#8B7CF6"),
             icon=str(data.get("icon") or "forum"),
             pinned=bool(data.get("pinned", False)),
@@ -703,6 +771,8 @@ async def room_chat(room_id: str, request: Request):
         f"User's notes here:\n- " + "\n- ".join(ctx["notes"][:8] or ["(none)"]) + "\n\n"
         f"Key things seen here: {', '.join(ctx['entities'][:15]) or '(none)'}"
     )
+    if room.get("instructions"):
+        grounding += f"\n\nRoom-specific user instructions:\n{room['instructions']}"
     messages = [{"role": "system", "content": grounding}]
     for m in history[:-1]:  # prior turns (exclude the just-added user message)
         messages.append({"role": m["role"], "content": m["text"]})
@@ -768,9 +838,427 @@ async def memory_entity(name: str):
 
 
 @app.get("/memory/search")
-async def memory_search(q: str, limit: int = 8):
-    """Hybrid search: event summaries (Qdrant) enriched with graph entities."""
-    return await debug_hybrid(q=q, limit=limit)
+async def memory_search(q: str, limit: int = 40, kinds: str = None,
+                        from_date: str = None, to_date: str = None,
+                        room_id: str = None, semantic: bool = True):
+    """Unified graph + semantic search across all user-visible memory types."""
+    if not q.strip():
+        return {"query": q, "results": []}
+    selected = [v.strip() for v in kinds.split(",") if v.strip()] if kinds else None
+    start = end = None
+    try:
+        if from_date:
+            start = datetime.datetime.fromisoformat(from_date).timestamp()
+        if to_date:
+            end = (datetime.datetime.fromisoformat(to_date)
+                   + datetime.timedelta(days=1)).timestamp()
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid date: {exc}"})
+
+    results = []
+    if neo4j_store is not None:
+        results = neo4j_store.memory_search(
+            q, limit=limit, kinds=selected, start=start, end=end, room_id=room_id)
+        for item in results:
+            item.setdefault("match", "keyword")
+
+    # Semantic retrieval currently indexes events. Merge it when its unfiltered
+    # results cannot violate a room/date constraint.
+    event_allowed = selected is None or "event" in selected
+    if semantic and event_allowed and not room_id and start is None and end is None:
+        semantic_result = await debug_hybrid(q=q, limit=min(limit, 20))
+        if isinstance(semantic_result, dict) and not semantic_result.get("error"):
+            seen = {(item.get("kind"), item.get("id")) for item in results}
+            for hit in semantic_result.get("results", []):
+                key = ("event", hit.get("event_id"))
+                if key in seen:
+                    continue
+                results.append({
+                    "kind": "event", "id": hit.get("event_id"),
+                    "title": hit.get("profile") or "Semantic match",
+                    "text": hit.get("summary"), "ts": hit.get("span_start"),
+                    "rooms": [], "entities": hit.get("entities") or [],
+                    "score": 70, "match": "semantic",
+                })
+                seen.add(key)
+    results.sort(key=lambda item: (item.get("score") or 0, item.get("ts") or 0),
+                 reverse=True)
+    return {"query": q, "results": results[:max(1, min(limit, 200))]}
+
+
+@app.get("/memory/events/{event_id}")
+async def memory_event_detail(event_id: str):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    event = neo4j_store.event_detail(event_id)
+    if event is None:
+        return JSONResponse(status_code=404, content={"error": "event not found"})
+    return {"event": event}
+
+
+@app.patch("/memory/events/{event_id}")
+async def memory_event_update(event_id: str, request: Request):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    data = await request.json()
+    summary = (data.get("summary") or "").strip() if isinstance(data, dict) else ""
+    if not summary:
+        return JSONResponse(status_code=400, content={"error": "summary is required"})
+    event = neo4j_store.update_event_summary(event_id, summary)
+    if event is None:
+        return JSONResponse(status_code=404, content={"error": "event not found"})
+    detail = neo4j_store.event_detail(event_id)
+    if activity_logger is not None and detail:
+        try:
+            activity_logger.log_event(
+                summary=summary, event_id=event_id,
+                session_id=detail.get("session_id"),
+                span_start=detail.get("span_start"), span_end=detail.get("span_end"),
+                timestamp=detail.get("span_start"))
+        except Exception as exc:
+            logger.warning("event re-embedding failed: %s", exc)
+    return {"event": event}
+
+
+@app.delete("/memory/events/{event_id}")
+async def memory_event_forget(event_id: str):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    result = neo4j_store.forget_event(event_id)
+    if not result or not result.get("deleted"):
+        return JSONResponse(status_code=404, content={"error": "event not found"})
+    if activity_logger is not None:
+        try:
+            activity_logger.delete_event(event_id)
+        except Exception as exc:
+            logger.warning("event vector deletion failed: %s", exc)
+    return result
+
+
+@app.get("/memory/entities/{entity_id}")
+async def memory_entity_detail(entity_id: str):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    entity = neo4j_store.entity_detail(entity_id)
+    if entity is None:
+        return JSONResponse(status_code=404, content={"error": "entity not found"})
+    return {"entity": entity}
+
+
+@app.patch("/memory/entities/{entity_id}")
+async def memory_entity_update(entity_id: str, request: Request):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    data = await request.json()
+    name = str(data.get("name")).strip() if data.get("name") is not None else None
+    entity_type = (str(data.get("type")).strip()
+                   if data.get("type") is not None else None)
+    if name == "" or entity_type == "":
+        return JSONResponse(status_code=400, content={"error": "values cannot be empty"})
+    entity = neo4j_store.update_entity(entity_id, name=name, entity_type=entity_type)
+    if entity is None:
+        return JSONResponse(status_code=404, content={"error": "entity not found"})
+    return {"entity": entity}
+
+
+@app.delete("/memory/entities/{entity_id}")
+async def memory_entity_forget(entity_id: str):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    if not neo4j_store.forget_entity(entity_id):
+        return JSONResponse(status_code=404, content={"error": "entity not found"})
+    return {"deleted": True, "entity_id": entity_id}
+
+
+@app.post("/memory/entities/{entity_id}/merge")
+async def memory_entity_merge(entity_id: str, request: Request):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    data = await request.json()
+    target_id = str(data.get("target_id") or "").strip()
+    if not target_id:
+        return JSONResponse(status_code=400, content={"error": "target_id is required"})
+    try:
+        result = neo4j_store.merge_entities(entity_id, target_id)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if result is None:
+        return JSONResponse(status_code=404, content={"error": "source or target not found"})
+    return result
+
+
+@app.post("/memory/entities/{entity_id}/split")
+async def memory_entity_split(entity_id: str, request: Request):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    data = await request.json()
+    name = str(data.get("name") or "").strip()
+    entity_type = str(data.get("type") or "").strip()
+    event_ids = data.get("event_ids") if isinstance(data.get("event_ids"), list) else []
+    if not name or not entity_type or not event_ids:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "name, type and event_ids are required"})
+    from memory.rooms.registry import _slug
+    new_entity_id = str(data.get("entity_id") or _slug(name))
+    try:
+        result = neo4j_store.split_entity(
+            entity_id, new_entity_id, name, entity_type,
+            [str(value) for value in event_ids])
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if result is None:
+        return JSONResponse(status_code=404, content={"error": "source entity not found"})
+    return result
+
+
+@app.patch("/memory/claims/{claim_id}")
+async def memory_claim_update(claim_id: str, request: Request):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    data = await request.json()
+    text = (data.get("text") or "").strip() if isinstance(data, dict) else ""
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "text is required"})
+    claim = neo4j_store.update_claim(claim_id, text)
+    if claim is None:
+        return JSONResponse(status_code=404, content={"error": "claim not found"})
+    return {"claim": claim}
+
+
+@app.delete("/memory/claims/{claim_id}")
+async def memory_claim_forget(claim_id: str):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    if not neo4j_store.delete_claim(claim_id):
+        return JSONResponse(status_code=404, content={"error": "claim not found"})
+    return {"deleted": True, "claim_id": claim_id}
+
+
+@app.delete("/memory/sessions/{session_id}")
+async def memory_session_forget(session_id: str):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    result = neo4j_store.forget_session(session_id)
+    for event_id in result["event_ids"]:
+        if activity_logger is not None:
+            try:
+                activity_logger.delete_event(event_id)
+            except Exception as exc:
+                logger.warning("session vector deletion failed: %s", exc)
+    return result
+
+
+@app.delete("/memory/days/{date}")
+async def memory_day_forget(date: str):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid date: {exc}"})
+    result = neo4j_store.forget_day(date)
+    for event_id in result["event_ids"]:
+        if activity_logger is not None:
+            try:
+                activity_logger.delete_event(event_id)
+            except Exception as exc:
+                logger.warning("day vector deletion failed: %s", exc)
+    return result
+
+
+# === PHASE 3: GROUNDED ASSISTANT, REVIEWS, AND FOCUS ======================
+@app.get("/assistant/conversations")
+async def assistant_conversations():
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    return {"conversations": neo4j_store.list_conversations()}
+
+
+@app.post("/assistant/conversations")
+async def assistant_conversation_create(request: Request):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    data = await request.json()
+    scope = str(data.get("scope") or "all")
+    if scope not in {"all", "room", "today", "range"}:
+        return JSONResponse(status_code=400, content={"error": "invalid scope"})
+    room_id = data.get("room_id")
+    if scope == "room" and not room_id:
+        return JSONResponse(status_code=400, content={"error": "room_id is required"})
+    conversation = neo4j_store.create_conversation(
+        title=str(data.get("title") or "New conversation"),
+        scope=scope, room_id=room_id,
+        from_ts=data.get("from_ts"), to_ts=data.get("to_ts"))
+    return JSONResponse(status_code=201, content={"conversation": conversation})
+
+
+@app.get("/assistant/conversations/{conversation_id}")
+async def assistant_conversation_get(conversation_id: str):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    conversation = neo4j_store.get_conversation(conversation_id)
+    if conversation is None:
+        return JSONResponse(status_code=404, content={"error": "conversation not found"})
+    return {"conversation": conversation}
+
+
+@app.patch("/assistant/conversations/{conversation_id}")
+async def assistant_conversation_update(conversation_id: str, request: Request):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    data = await request.json()
+    conversation = neo4j_store.update_conversation(conversation_id, data)
+    if conversation is None:
+        return JSONResponse(status_code=404, content={"error": "conversation not found"})
+    return {"conversation": conversation}
+
+
+@app.delete("/assistant/conversations/{conversation_id}")
+async def assistant_conversation_delete(conversation_id: str):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    if not neo4j_store.delete_conversation(conversation_id):
+        return JSONResponse(status_code=404, content={"error": "conversation not found"})
+    return {"deleted": True}
+
+
+@app.post("/assistant/conversations/{conversation_id}/messages")
+async def assistant_conversation_message(conversation_id: str, request: Request):
+    """Answer from an explicit memory scope and return inspectable citations."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    data = await request.json()
+    message = (data.get("message") or "").strip() if isinstance(data, dict) else ""
+    if not message:
+        return JSONResponse(status_code=400, content={"error": "message is required"})
+    conversation = neo4j_store.get_conversation(conversation_id, message_limit=30)
+    if conversation is None:
+        return JSONResponse(status_code=404, content={"error": "conversation not found"})
+
+    start, end, room_id = conversation.get("from_ts"), conversation.get("to_ts"), None
+    if conversation.get("scope") == "today":
+        start = datetime.datetime.combine(
+            datetime.date.today(), datetime.time.min).timestamp()
+        end = start + 86400
+    elif conversation.get("scope") == "room":
+        room_id = conversation.get("room_id")
+
+    evidence = neo4j_store.memory_search(
+        message, limit=10, kinds=["event", "note", "claim"],
+        start=start, end=end, room_id=room_id)
+    citations = [{
+        "number": index + 1, "kind": item.get("kind"), "id": item.get("id"),
+        "title": item.get("title"), "text": item.get("text"),
+        "ts": item.get("ts"), "rooms": item.get("rooms") or [],
+    } for index, item in enumerate(evidence)]
+    evidence_text = "\n".join(
+        f"[{item['number']}] ({item['kind']}) {item['text']}"
+        for item in citations) or "(No matching stored memory was found.)"
+    system = (
+        "You are the user's private, local-first assistant. Answer only from the "
+        "provided memory evidence and ordinary reasoning. Never invent remembered "
+        "facts. Cite supporting memories inline using [1], [2], etc. If evidence "
+        "is insufficient, say so clearly.\n\nMemory evidence:\n" + evidence_text
+    )
+    if room_id:
+        room = neo4j_store.get_room(room_id)
+        if room and room.get("instructions"):
+            system += "\n\nRoom-specific user instructions:\n" + room["instructions"]
+    messages = [{"role": "system", "content": system}]
+    for prior in conversation.get("messages", [])[-12:]:
+        if prior.get("role") in {"user", "assistant"}:
+            messages.append({"role": prior["role"], "content": prior["text"]})
+    messages.append({"role": "user", "content": message})
+    neo4j_store.add_conversation_message(conversation_id, "user", message)
+    try:
+        response = await client.chat.completions.create(
+            model=vlm_model, messages=messages, max_tokens=700)
+        reply = (response.choices[0].message.content or "").strip()
+    except Exception as exc:
+        logger.warning("grounded assistant failed: %s", exc)
+        return JSONResponse(status_code=502, content={"error": f"assistant failed: {exc}"})
+    saved = neo4j_store.add_conversation_message(
+        conversation_id, "assistant", reply, citations=citations)
+    return {"reply": reply, "citations": citations, "message": saved}
+
+
+@app.get("/reviews/daily")
+async def review_daily(date: str = None):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    from memory.summary.coach import format_report
+    day = date or _today_iso()
+    metrics = neo4j_store.daily_metrics(day)
+    claims = neo4j_store.day_claims(day, limit=8)
+    entities = neo4j_store.day_entities(day, limit=12)
+    return {"date": day, "metrics": metrics, "claims": claims,
+            "entities": entities,
+            "report": format_report(metrics, claims=claims, entities=entities)}
+
+
+@app.get("/reviews/weekly")
+async def review_weekly(end_date: str = None):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    try:
+        end = datetime.date.fromisoformat(end_date) if end_date else datetime.date.today()
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid date: {exc}"})
+    days = []
+    for offset in range(6, -1, -1):
+        day = end - datetime.timedelta(days=offset)
+        days.append(neo4j_store.daily_metrics(day.isoformat()))
+    active = sum(day.get("active_minutes") or 0 for day in days)
+    events = sum(day.get("events") or 0 for day in days)
+    switches = sum(day.get("switches") or 0 for day in days)
+    focus_days = [day.get("focus_score") or 0 for day in days if day.get("events")]
+    return {
+        "start_date": days[0]["date"], "end_date": days[-1]["date"], "days": days,
+        "summary": {
+            "active_minutes": round(active, 1), "events": events,
+            "switches": switches,
+            "average_focus_score": round(sum(focus_days) / len(focus_days))
+            if focus_days else 0,
+        },
+    }
+
+
+@app.get("/focus/sessions")
+async def focus_sessions():
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    return {"active": neo4j_store.active_focus_session(),
+            "sessions": neo4j_store.list_focus_sessions()}
+
+
+@app.post("/focus/sessions")
+async def focus_session_start(request: Request):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    if neo4j_store.active_focus_session() is not None:
+        return JSONResponse(status_code=409, content={"error": "a focus session is already active"})
+    data = await request.json()
+    goal = (data.get("goal") or "").strip() if isinstance(data, dict) else ""
+    if not goal:
+        return JSONResponse(status_code=400, content={"error": "goal is required"})
+    try:
+        minutes = max(5, min(int(data.get("planned_minutes") or 25), 240))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "planned_minutes must be an integer"})
+    focus = neo4j_store.start_focus_session(
+        goal, room_id=data.get("room_id"), planned_minutes=minutes)
+    return JSONResponse(status_code=201, content={"focus": focus})
+
+
+@app.post("/focus/sessions/{focus_id}/stop")
+async def focus_session_stop(focus_id: str):
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    focus = neo4j_store.stop_focus_session(focus_id)
+    if focus is None:
+        return JSONResponse(status_code=404, content={"error": "active focus session not found"})
+    return {"focus": focus}
 
 
 @app.get("/debug/co-occurrence")
@@ -1054,9 +1542,14 @@ def _frames_for_context(context):
         mobile_frames = mobile_stream.frames("camera")
         if mobile_frames:
             return mobile_frames, "mobile_camera", None
-        if camera_stream is None or not camera_stream.status()["healthy"]:
+        # Use the first live camera's frames for the generic "camera" context.
+        worker = None
+        if camera_manager is not None:
+            worker = next((w for w in camera_manager.workers.values()
+                           if w.status().get("connected")), None)
+        if worker is None:
             return [], "camera", "camera stream unavailable"
-        return camera_stream.frames(), "camera", None
+        return worker.stream.frames(), "camera", None
     return [], context, None
 
 

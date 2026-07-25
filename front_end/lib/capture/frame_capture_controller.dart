@@ -50,6 +50,12 @@ class FrameCaptureController {
   static const _method = MethodChannel('com.example.untitled/capture');
   static const _events = EventChannel('com.example.untitled/capture_events');
 
+  /// The native capture service only exists on Android. Everywhere else
+  /// (web, desktop, iOS) the platform channels have no handler, so we must
+  /// not touch them — doing so throws [MissingPluginException].
+  static final bool _supported =
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
   final _statusController = StreamController<CaptureStatus>.broadcast();
   StreamSubscription? _eventSub;
   CaptureStatus _last = CaptureStatus.idle;
@@ -57,7 +63,11 @@ class FrameCaptureController {
   Stream<CaptureStatus> get status => _statusController.stream;
   CaptureStatus get lastStatus => _last;
 
+  /// Whether native frame capture is available on this platform.
+  bool get isSupported => _supported;
+
   FrameCaptureController() {
+    if (!_supported) return;
     _eventSub = _events.receiveBroadcastStream().listen(
       (event) {
         if (event is Map && event['type'] == 'status') {
@@ -77,6 +87,7 @@ class FrameCaptureController {
   /// Ensure the runtime permissions needed for [source] are granted.
   /// Returns true if capture can proceed.
   Future<bool> ensurePermissions(CaptureSource source) async {
+    if (!_supported) return false;
     // Notifications are needed for the foreground service on Android 13+.
     await Permission.notification.request();
 
@@ -98,6 +109,7 @@ class FrameCaptureController {
     required String ip,
     bool frontCamera = false,
   }) async {
+    if (!_supported) return;
     await _method.invokeMethod('start', {
       'source': source == CaptureSource.screen ? 'screen' : 'camera',
       'fps': fps.clamp(1, 60),
@@ -107,14 +119,17 @@ class FrameCaptureController {
   }
 
   Future<void> setFps(int fps) async {
+    if (!_supported) return;
     await _method.invokeMethod('setFps', {'fps': fps.clamp(1, 60)});
   }
 
   Future<void> stop() async {
+    if (!_supported) return;
     await _method.invokeMethod('stop');
   }
 
   Future<bool> isRunning() async {
+    if (!_supported) return false;
     return (await _method.invokeMethod<bool>('isRunning')) ?? false;
   }
 

@@ -134,6 +134,8 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     final name = TextEditingController(text: room?['name']?.toString() ?? '');
     final description =
         TextEditingController(text: room?['description']?.toString() ?? '');
+    final instructions =
+        TextEditingController(text: room?['instructions']?.toString() ?? '');
     final color =
         TextEditingController(text: room?['color']?.toString() ?? '#8B7CF6');
     final activities = TextEditingController(
@@ -160,6 +162,7 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
               children: [
                 _dialogField(name, 'Name'),
                 _dialogField(description, 'Description', lines: 2),
+                _dialogField(instructions, 'Assistant instructions', lines: 3),
                 _dialogField(color, 'Color (hex)'),
                 const Padding(
                   padding: EdgeInsets.only(top: 10, bottom: 6),
@@ -192,6 +195,7 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     final payload = {
       'name': name.text.trim(),
       'description': description.text.trim(),
+      'instructions': instructions.text.trim(),
       'color': color.text.trim(),
       'matcher': {
         'activity_types': _csv(activities.text),
@@ -301,6 +305,11 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
       ..sort((a, b) {
         if (a['kind'] == 'daily') return -1;
         if (b['kind'] == 'daily') return 1;
+        if (a['pinned'] == true && b['pinned'] != true) return -1;
+        if (b['pinned'] == true && a['pinned'] != true) return 1;
+        final position = ((a['position'] ?? 0) as num)
+            .compareTo((b['position'] ?? 0) as num);
+        if (position != 0) return position;
         return ((b['events'] ?? 0) as num).compareTo((a['events'] ?? 0) as num);
       });
     return Scaffold(
@@ -491,6 +500,7 @@ class _RoomScreenState extends State<RoomScreen> {
     final text = _input.text.trim();
     if (text.isEmpty || _sending) return;
     final isChat = _mode == 'chat';
+    final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
     setState(() {
       _sending = true;
       // Optimistically echo the outgoing item so the feed isn't blank while
@@ -499,9 +509,22 @@ class _RoomScreenState extends State<RoomScreen> {
         'kind': isChat ? 'message' : 'note',
         'role': 'user',
         'text': text,
-        'ts': DateTime.now().millisecondsSinceEpoch / 1000.0,
+        'ts': now,
         '_pending': true,
       });
+      // For chat, also show a "thinking" placeholder immediately — the model
+      // is a single-sequence vLLM shared with screen capture, so the reply can
+      // take a while to come back. This gives instant acknowledgement.
+      if (isChat) {
+        _feed.add({
+          'kind': 'message',
+          'role': 'assistant',
+          'text': '',
+          'ts': now + 0.001,
+          '_pending': true,
+          '_thinking': true,
+        });
+      }
     });
     _input.clear();
     _jumpToBottom();
@@ -716,6 +739,7 @@ class _RoomScreenState extends State<RoomScreen> {
     if (kind == 'note') return _noteCard(it, text);
     if (kind == 'message') {
       final role = (it['role'] ?? 'assistant').toString();
+      if (it['_thinking'] == true) return const _ThinkingBubble();
       if (role == 'coach') return _coachCard(text);
       return _bubble(text, role == 'user');
     }
@@ -1019,6 +1043,70 @@ class _RoomScreenState extends State<RoomScreen> {
       backgroundColor: _panelRaised,
       side: const BorderSide(color: _line),
       onSelected: (_) => setState(() => _mode = value),
+    );
+  }
+}
+
+/// A left-aligned assistant bubble with animated dots, shown while the reply
+/// is in flight (the model can take a while — single-sequence vLLM).
+class _ThinkingBubble extends StatefulWidget {
+  const _ThinkingBubble();
+
+  @override
+  State<_ThinkingBubble> createState() => _ThinkingBubbleState();
+}
+
+class _ThinkingBubbleState extends State<_ThinkingBubble>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 1200))
+        ..repeat();
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 5),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: _panelRaised,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: _line),
+        ),
+        child: AnimatedBuilder(
+          animation: _c,
+          builder: (context, _) {
+            return Row(
+              mainAxisSize: MainAxisSize.min,
+              children: List.generate(3, (i) {
+                final t = ((_c.value + i / 3) % 1.0);
+                final opacity = 0.3 + 0.7 * (1 - (2 * t - 1).abs());
+                return Padding(
+                  padding: EdgeInsets.only(right: i < 2 ? 5 : 0),
+                  child: Opacity(
+                    opacity: opacity,
+                    child: Container(
+                      width: 7,
+                      height: 7,
+                      decoration: const BoxDecoration(
+                        color: _mint,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                  ),
+                );
+              }),
+            );
+          },
+        ),
+      ),
     );
   }
 }

@@ -32,6 +32,7 @@ class Room(BaseModel):
     auto: bool = True            # auto-created vs user-defined
     matcher: RoomMatcher = Field(default_factory=RoomMatcher)
     description: str = ""
+    instructions: str = ""
     color: str = "#8B7CF6"
     icon: str = "forum"
     archived: bool = False

@@ -10,12 +10,24 @@ from openai import AsyncOpenAI
 
 load_dotenv()
 
-client = AsyncOpenAI(
-    api_key=os.getenv("VLM_API_KEY"),
-    # Alternates: lmdeploy :23333, llama.cpp :8080, vllm :8000 — set VLM_BASE_URL in .env
-    # base_url=os.getenv("VLM_BASE_URL", "http://0.0.0.0:8000/v1"),
-    base_url=os.getenv("VLM_BASE_URL"),
-)
+def new_vlm_client() -> AsyncOpenAI:
+    """A fresh AsyncOpenAI pointed at the VLM server.
+
+    Each background capture worker (screen, and one per camera) drives the VLM
+    from its own thread via asyncio.run. httpx's async connection pool is bound to
+    the loop that first used it, so sharing ONE client across concurrent worker
+    threads can corrupt that pool. Give each concurrent worker its own client so
+    every client stays single-threaded.
+    """
+    return AsyncOpenAI(
+        api_key=os.getenv("VLM_API_KEY"),
+        # Alternates: lmdeploy :23333, llama.cpp :8080, vllm :8000 — set VLM_BASE_URL in .env
+        base_url=os.getenv("VLM_BASE_URL"),
+    )
+
+
+# Shared client for the main app loop and the (single) screen worker thread.
+client = new_vlm_client()
 
 # async getter instead of a global variable
 async def get_model_name_vlm() -> str:

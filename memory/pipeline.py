@@ -32,12 +32,15 @@ logger = logging.getLogger("home_assistant")
 
 class MemoryPipeline:
     def __init__(self, id_strategy="counter", expected_seconds=60.0,
-                 neo4j_store=None, activity_logger=None, jsonl=False):
+                 neo4j_store=None, activity_logger=None, jsonl=False,
+                 log_context="screen"):
         self.manager = SessionManager(id_strategy=id_strategy)
         self.expected_seconds = expected_seconds
         self.neo4j = neo4j_store
         self.activity_logger = activity_logger
         self.jsonl = jsonl  # rewrite data/debug/sessions.jsonl + events.jsonl live
+        # Qdrant context label for events from this pipeline ("screen"/"camera").
+        self.log_context = log_context
 
         self._prev_ctx = None
         self._prev_frame = None
@@ -230,7 +233,7 @@ class MemoryPipeline:
                         summary=info["text"], event_id=event.event_id,
                         session_id=session.session_id, span_start=event.span_start,
                         span_end=event.span_end, profile=info.get("profile"),
-                        timestamp=event.span_start,
+                        timestamp=event.span_start, context=self.log_context,
                     )
         except Exception as exc:
             # Never let a store failure kill the capture loop.

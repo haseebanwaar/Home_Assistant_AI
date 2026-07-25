@@ -84,3 +84,12 @@ class ExtractionResult(BaseModel):
             return None
         s = str(v).strip()
         return None if s.lower() in _NULLISH else s
+
+    @field_validator("boundary_signal", mode="before")
+    @classmethod
+    def _coerce_boundary_signal(cls, v):
+        # Nothing downstream reads boundary_signal (the pipeline computes its own
+        # boundary from visual/app change), yet the VLM sometimes puts an
+        # event_type value like "idle" here. Coerce anything unrecognized to the
+        # default instead of failing the whole extraction into a prose fallback.
+        return v if v in BoundarySignal.__args__ else "continuation"

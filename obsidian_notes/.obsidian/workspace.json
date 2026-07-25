@@ -4,11 +4,11 @@
     "type": "split",
     "children": [
       {
-        "id": "808435ec465fd1a3",
+        "id": "1550ffb81f66f382",
         "type": "tabs",
         "children": [
           {
-            "id": "16625e1f98b731a4",
+            "id": "9410867dd78d3a7c",
             "type": "leaf",
             "state": {
               "type": "markdown",
@@ -183,8 +183,11 @@
       "bases:Create new base": false
     }
   },
-  "active": "16625e1f98b731a4",
+  "active": "9410867dd78d3a7c",
   "lastOpenFiles": [
+    "ai-agent-book.md",
+    "Daily/2026-07-23.md",
+    "Fan speed, RPM.md",
     "Pending-Merges.md",
     "Welcome.md",
     "GPU usage, %.md"

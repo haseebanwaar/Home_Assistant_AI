@@ -12,6 +12,7 @@ import 'package:audioplayers/audioplayers.dart';
 import 'capture/frame_capture_controller.dart';
 import 'memory/timeline_screen.dart';
 import 'rooms/rooms_screen.dart';
+import 'assistant/assistant_screen.dart';
 
 void main() => runApp(const HomeMindApp());
 
@@ -88,6 +89,8 @@ class _MyAppState extends State<MyApp> {
   static const _violet = Color(0xFF9B8AFB);
   static const _muted = Color(0xFF91A0B8);
 
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+  int _workspaceIndex = 0;
   final TextEditingController _ipTextController = TextEditingController();
 
   Uint8List? _fileImage;
@@ -516,6 +519,36 @@ class _MyAppState extends State<MyApp> {
     await _pollBackendStatus();
   }
 
+  /// Pause/resume the desktop screen capture on the backend.
+  Future<void> _toggleScreen(bool pause) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$_apiBase/screen/control'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({'action': pause ? 'pause' : 'resume'}),
+      ).timeout(const Duration(seconds: 5));
+      if (response.statusCode != 200) throw Exception(response.body);
+      await _pollBackendStatus();
+    } catch (e) {
+      _showSnack('Failed to ${pause ? 'pause' : 'resume'} screen: $e');
+    }
+  }
+
+  /// Pause/resume a single camera worker on the backend.
+  Future<void> _toggleCamera(String cameraId, bool pause) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$_apiBase/cameras/$cameraId/control'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({'action': pause ? 'pause' : 'resume'}),
+      ).timeout(const Duration(seconds: 5));
+      if (response.statusCode != 200) throw Exception(response.body);
+      await _pollBackendStatus();
+    } catch (e) {
+      _showSnack('Failed to ${pause ? 'pause' : 'resume'} camera: $e');
+    }
+  }
+
   int get _fps {
     final v = int.tryParse(_fpsController.text.trim()) ?? 5;
     return v.clamp(1, 60);
@@ -613,7 +646,147 @@ class _MyAppState extends State<MyApp> {
     );
   }
 
+  /// A row for one capture source: status dot + label + pause/resume toggle.
+  Widget _captureSourceRow({
+    required IconData icon,
+    required String label,
+    required String statusText,
+    required Color dotColor,
+    required bool paused,
+    required bool available,
+    required VoidCallback? onToggle,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        children: [
+          Icon(Icons.circle, size: 10, color: dotColor),
+          const SizedBox(width: 8),
+          Icon(icon, size: 16, color: Colors.white70),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label,
+                    style: const TextStyle(
+                        fontSize: 13, fontWeight: FontWeight.w600)),
+                Text(statusText,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 11, color: Colors.white54)),
+              ],
+            ),
+          ),
+          if (available)
+            IconButton(
+              tooltip: paused ? 'Resume' : 'Pause',
+              visualDensity: VisualDensity.compact,
+              iconSize: 20,
+              icon: Icon(paused ? Icons.play_circle_fill : Icons.pause_circle_filled,
+                  color: paused ? Colors.greenAccent : Colors.amber),
+              onPressed: onToggle,
+            )
+          else
+            const SizedBox(width: 40),
+        ],
+      ),
+    );
+  }
+
+  /// Live capture sources — desktop screen + each discovered camera — with an
+  /// activity indicator and a pause/resume control for each.
+  Widget _buildCaptureSourcesPanel() {
+    final screen = (_backendStatus['screen_stream'] as Map?) ?? const {};
+    final screenConfigured = screen['configured'] == true;
+    final screenPaused = screen['paused'] == true;
+    final screenHealthy = screen['healthy'] == true;
+    final cameras = (_backendStatus['cameras'] as List?) ?? const [];
+
+    final rows = <Widget>[];
+    if (screenConfigured) {
+      rows.add(_captureSourceRow(
+        icon: Icons.desktop_windows,
+        label: 'Desktop screen',
+        statusText: screenPaused
+            ? 'Paused'
+            : (screenHealthy
+                ? 'Recording · ${screen['frames'] ?? 0} frames'
+                : 'Starting…'),
+        dotColor: screenPaused
+            ? Colors.amber
+            : (screenHealthy ? Colors.green : Colors.grey),
+        paused: screenPaused,
+        available: true,
+        onToggle: () => _toggleScreen(!screenPaused),
+      ));
+    }
+    for (final c in cameras) {
+      final cam = (c as Map);
+      final id = '${cam['camera_id']}';
+      final paused = cam['paused'] == true;
+      final connected = cam['connected'] == true;
+      final events = cam['events_logged'] ?? 0;
+      final summary = '${cam['last_summary'] ?? ''}';
+      final motion = (cam['last_motion'] as Map?);
+      final idle = motion != null &&
+          motion['warming'] != true &&
+          (motion['motion_frames'] ?? 0) == 0;
+      rows.add(_captureSourceRow(
+        icon: Icons.videocam,
+        label: '${cam['name'] ?? id}',
+        statusText: !connected
+            ? 'Offline${cam['error'] != null ? ' · ${cam['error']}' : ''}'
+            : paused
+                ? 'Paused · $events events'
+                : idle
+                    ? 'Idle · watching for motion · $events events'
+                    : (summary.isNotEmpty ? summary : 'Watching · $events events'),
+        dotColor: !connected
+            ? Colors.red
+            : (paused ? Colors.amber : Colors.green),
+        paused: paused,
+        available: connected,
+        onToggle: () => _toggleCamera(id, !paused),
+      ));
+    }
+    if (rows.isEmpty) {
+      rows.add(const Padding(
+        padding: EdgeInsets.symmetric(vertical: 6),
+        child: Text('No capture sources active',
+            style: TextStyle(fontSize: 12, color: Colors.white54)),
+      ));
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: _panel.withOpacity(.7),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _line),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(bottom: 4),
+            child: Text('CAPTURE SOURCES',
+                style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.2,
+                    color: Colors.white60)),
+          ),
+          ...rows,
+        ],
+      ),
+    );
+  }
+
   Widget _buildCapturePanel() {
+    // Native frame capture is Android-only; hide the controls elsewhere.
+    if (!_capture.isSupported) return const SizedBox.shrink();
     final running = _captureStatus.running;
     return Container(
       padding: const EdgeInsets.all(14),
@@ -625,8 +798,11 @@ class _MyAppState extends State<MyApp> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
+          Wrap(
+            alignment: WrapAlignment.center,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: 6,
+            runSpacing: 6,
             children: [
               const Text('Frame source: ', style: TextStyle(fontSize: 14)),
               ChoiceChip(
@@ -636,7 +812,6 @@ class _MyAppState extends State<MyApp> {
                     ? null
                     : (_) => setState(() => _captureSource = CaptureSource.camera),
               ),
-              const SizedBox(width: 6),
               ChoiceChip(
                 label: const Text('Screen'),
                 selected: _captureSource == CaptureSource.screen,
@@ -807,74 +982,226 @@ class _MyAppState extends State<MyApp> {
     );
   }
 
-  Widget _buildHeader(Size size) {
-    final brand = Row(
-      children: [
-        Container(
-          width: 46,
-          height: 46,
-          decoration: BoxDecoration(
-            gradient: const LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [_mint, _violet],
+  void _openWorkspace(int index, Widget screen) {
+    if (MediaQuery.sizeOf(context).width >= 960) {
+      setState(() => _workspaceIndex = index);
+      return;
+    }
+    if (_scaffoldKey.currentState?.isDrawerOpen == true) {
+      Navigator.of(context).pop();
+    }
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => screen));
+  }
+
+  Widget _workspaceNavItem({
+    required IconData icon,
+    required String label,
+    VoidCallback? onTap,
+    bool selected = false,
+    String? badge,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+      child: Material(
+        color: selected ? _mint.withValues(alpha: .13) : Colors.transparent,
+        borderRadius: BorderRadius.circular(10),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(10),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 10),
+            child: Row(
+              children: [
+                Icon(icon, size: 19, color: selected ? _mint : _muted),
+                const SizedBox(width: 11),
+                Expanded(
+                  child: Text(label,
+                      style: TextStyle(
+                          color: selected ? Colors.white : Colors.white70,
+                          fontSize: 13,
+                          fontWeight:
+                              selected ? FontWeight.w700 : FontWeight.w500)),
+                ),
+                if (badge != null)
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                    decoration: BoxDecoration(
+                        color: _panelRaised,
+                        borderRadius: BorderRadius.circular(10)),
+                    child: Text(badge,
+                        style: const TextStyle(color: _muted, fontSize: 10)),
+                  ),
+              ],
             ),
-            borderRadius: BorderRadius.circular(15),
           ),
-          child: const Icon(Icons.auto_awesome, color: _ink, size: 23),
         ),
-        const SizedBox(width: 13),
-        const Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('HomeMind',
-                  style: TextStyle(
-                      fontSize: 21,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: -.5)),
-              Text('AMBIENT HOME INTELLIGENCE',
+      ),
+    );
+  }
+
+  Widget _buildWorkspaceSidebar({bool drawer = false}) {
+    return Container(
+      width: drawer ? null : 238,
+      color: const Color(0xFF0B111E),
+      child: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 14, 18),
+              child: Row(
+                children: [
+                  Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(colors: [_mint, _violet]),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child:
+                        const Icon(Icons.auto_awesome, color: _ink, size: 20),
+                  ),
+                  const SizedBox(width: 11),
+                  const Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('HomeMind',
+                            style: TextStyle(
+                                fontSize: 17, fontWeight: FontWeight.w800)),
+                        Text('Personal workspace',
+                            style: TextStyle(color: _muted, fontSize: 10)),
+                      ],
+                    ),
+                  ),
+                  if (drawer)
+                    IconButton(
+                      icon: const Icon(Icons.close, color: _muted, size: 20),
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                ],
+              ),
+            ),
+            _workspaceNavItem(
+                icon: Icons.home_rounded,
+                label: 'Home',
+                selected: _workspaceIndex == 0,
+                onTap: () {
+                  if (drawer) {
+                    Navigator.pop(context);
+                  } else {
+                    setState(() => _workspaceIndex = 0);
+                  }
+                }),
+            _workspaceNavItem(
+              icon: Icons.auto_awesome,
+              label: 'Assistant',
+              selected: _workspaceIndex == 1,
+              onTap: () =>
+                  _openWorkspace(1, AssistantScreen(apiBase: _apiBase)),
+            ),
+            _workspaceNavItem(
+              icon: Icons.forum_outlined,
+              label: 'Rooms',
+              selected: _workspaceIndex == 2,
+              onTap: () =>
+                  _openWorkspace(2, RoomsListScreen(apiBase: _apiBase)),
+            ),
+            _workspaceNavItem(
+              icon: Icons.manage_search,
+              label: 'Memory',
+              selected: _workspaceIndex == 3,
+              onTap: () =>
+                  _openWorkspace(3, MemoryTimelineScreen(apiBase: _apiBase)),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(21, 22, 20, 7),
+              child: Text('SYSTEM',
                   style: TextStyle(
                       color: _muted,
                       fontSize: 9,
                       fontWeight: FontWeight.w700,
-                      letterSpacing: 1.7)),
+                      letterSpacing: 1.4)),
+            ),
+            _workspaceNavItem(
+              icon: Icons.center_focus_strong,
+              label: 'Capture & privacy',
+              onTap: _showCaptureSheet,
+            ),
+            _workspaceNavItem(
+              icon: Icons.settings_outlined,
+              label: 'Home hub',
+              onTap: _showConnectionSheet,
+            ),
+            const Spacer(),
+            Container(
+              margin: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: _panel,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: _line),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 9,
+                    height: 9,
+                    decoration: BoxDecoration(
+                      color: _backendConnected
+                          ? _mint
+                          : const Color(0xFFFF718B),
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 9),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                            _backendConnected
+                                ? 'Home hub online'
+                                : 'Home hub offline',
+                            style: const TextStyle(
+                                fontSize: 11, fontWeight: FontWeight.w700)),
+                        Text(_backendActivity,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style:
+                                const TextStyle(color: _muted, fontSize: 9)),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHeader(Size size) {
+    return Row(
+      children: [
+        const Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Home',
+                  style: TextStyle(
+                      fontSize: 24,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: -.5)),
+              Text('Your activity, conversation, and home context',
+                  style: TextStyle(
+                      color: _muted,
+                      fontSize: 11)),
             ],
           ),
         ),
-        IconButton(
-          tooltip: 'Rooms',
-          icon: const Icon(Icons.dashboard_customize, color: _mint),
-          onPressed: () => Navigator.of(context).push(
-            MaterialPageRoute(
-              builder: (_) => RoomsListScreen(apiBase: _apiBase),
-            ),
-          ),
-        ),
-        IconButton(
-          tooltip: 'Memory timeline',
-          icon: const Icon(Icons.timeline, color: _mint),
-          onPressed: () => Navigator.of(context).push(
-            MaterialPageRoute(
-              builder: (_) => MemoryTimelineScreen(apiBase: _apiBase),
-            ),
-          ),
-        ),
-      ],
-    );
-    if (size.width < 600) {
-      return Column(
-        children: [
-          brand,
-          const SizedBox(height: 12),
-          SizedBox(width: double.infinity, child: _bodyTextarea(size)),
-        ],
-      );
-    }
-    return Row(
-      children: [
-        Expanded(child: brand),
-        const SizedBox(width: 20),
         _bodyTextarea(size),
       ],
     );
@@ -942,6 +1269,13 @@ class _MyAppState extends State<MyApp> {
   Widget _buildMobileHeader() {
     return Row(
       children: [
+        IconButton(
+          tooltip: 'Open workspace',
+          onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+          style: IconButton.styleFrom(backgroundColor: _panel),
+          icon: const Icon(Icons.menu_rounded, size: 21),
+        ),
+        const SizedBox(width: 8),
         Container(
           width: 38,
           height: 38,
@@ -1027,6 +1361,8 @@ class _MyAppState extends State<MyApp> {
                 ),
               ),
               const SizedBox(height: 16),
+              _buildCaptureSourcesPanel(),
+              const SizedBox(height: 12),
               _buildCapturePanel(),
               const SizedBox(height: 8),
               SizedBox(
@@ -1218,6 +1554,8 @@ class _MyAppState extends State<MyApp> {
           const SizedBox(height: 10),
           _buildContextSelector(),
           const SizedBox(height: 16),
+          _buildCaptureSourcesPanel(),
+          const SizedBox(height: 12),
           _buildCapturePanel(),
           const SizedBox(height: 12),
           Wrap(
@@ -1245,6 +1583,104 @@ class _MyAppState extends State<MyApp> {
               icon: const Icon(Icons.layers_clear_outlined, size: 18),
               label: const Text('Clear long-term memory'),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildQuickAccessPanel() {
+    Widget action({
+      required IconData icon,
+      required String title,
+      required String subtitle,
+      required Color color,
+      required VoidCallback onTap,
+    }) {
+      return Material(
+        color: _panelRaised.withValues(alpha: .72),
+        borderRadius: BorderRadius.circular(14),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(14),
+          child: Padding(
+            padding: const EdgeInsets.all(13),
+            child: Row(
+              children: [
+                Container(
+                  width: 38,
+                  height: 38,
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: .13),
+                    borderRadius: BorderRadius.circular(11),
+                  ),
+                  child: Icon(icon, color: color, size: 19),
+                ),
+                const SizedBox(width: 11),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(title,
+                          style: const TextStyle(
+                              fontSize: 12, fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 2),
+                      Text(subtitle,
+                          style:
+                              const TextStyle(color: _muted, fontSize: 9.5)),
+                    ],
+                  ),
+                ),
+                const Icon(Icons.chevron_right, color: _muted, size: 18),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: _panel,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: _line),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('QUICK ACCESS',
+              style: TextStyle(
+                  color: _muted,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1.3)),
+          const SizedBox(height: 10),
+          action(
+            icon: Icons.auto_awesome,
+            title: 'Grounded assistant',
+            subtitle: 'Ask with citations from memory',
+            color: _mint,
+            onTap: () =>
+                _openWorkspace(1, AssistantScreen(apiBase: _apiBase)),
+          ),
+          const SizedBox(height: 7),
+          action(
+            icon: Icons.forum_outlined,
+            title: 'Rooms',
+            subtitle: 'Continue a project or topic',
+            color: _violet,
+            onTap: () =>
+                _openWorkspace(2, RoomsListScreen(apiBase: _apiBase)),
+          ),
+          const SizedBox(height: 7),
+          action(
+            icon: Icons.manage_search,
+            title: 'Explore memory',
+            subtitle: 'Search timeline and entities',
+            color: const Color(0xFF62B5FF),
+            onTap: () =>
+                _openWorkspace(3, MemoryTimelineScreen(apiBase: _apiBase)),
           ),
         ],
       ),
@@ -1308,50 +1744,66 @@ class _MyAppState extends State<MyApp> {
   Widget build(BuildContext context) {
     final Size s = MediaQuery.of(context).size;
     return Scaffold(
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: RadialGradient(
-            center: Alignment(-.8, -1),
-            radius: 1.2,
-            colors: [Color(0xFF132235), _ink],
-          ),
+      key: _scaffoldKey,
+      drawer: SizedBox(
+        width: 286,
+        child: Drawer(
+          backgroundColor: const Color(0xFF0B111E),
+          shape: const RoundedRectangleBorder(),
+          child: _buildWorkspaceSidebar(drawer: true),
         ),
-        child: SafeArea(
-          child: LayoutBuilder(builder: (context, constraints) {
-            final desktop = constraints.maxWidth >= 900;
-            final desktopContent = Column(
-              children: [
-                _buildHeader(s),
-                const SizedBox(height: 14),
-                Align(
-                    alignment: Alignment.centerLeft,
-                    child: _buildBackendIndicators()),
-                const SizedBox(height: 14),
-                if (desktop)
-                  Expanded(
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Expanded(child: _buildConversationCard()),
-                        const SizedBox(width: 14),
-                        SizedBox(
-                          width: 370,
-                          child: SingleChildScrollView(
-                              child: _buildControlPanel()),
-                        ),
-                      ],
-                    ),
-                  )
-              ],
-            );
-            return Center(
+      ),
+      body: LayoutBuilder(builder: (context, constraints) {
+        final desktop = constraints.maxWidth >= 960;
+        final home = Container(
+          decoration: const BoxDecoration(
+            gradient: RadialGradient(
+              center: Alignment(-.8, -1),
+              radius: 1.25,
+              colors: [Color(0xFF132235), _ink],
+            ),
+          ),
+          child: SafeArea(
+            child: Center(
               child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 1240),
+                constraints: const BoxConstraints(maxWidth: 1380),
                 child: Padding(
                   padding: EdgeInsets.fromLTRB(
-                      desktop ? 16 : 14, 12, desktop ? 16 : 14, 12),
+                      desktop ? 22 : 14, 14, desktop ? 22 : 14, 14),
                   child: desktop
-                      ? desktopContent
+                      ? Column(
+                          children: [
+                            _buildHeader(s),
+                            const SizedBox(height: 14),
+                            Align(
+                                alignment: Alignment.centerLeft,
+                                child: _buildBackendIndicators()),
+                            const SizedBox(height: 14),
+                            Expanded(
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  Expanded(
+                                      flex: 5,
+                                      child: _buildConversationCard()),
+                                  const SizedBox(width: 14),
+                                  SizedBox(
+                                    width: 348,
+                                    child: SingleChildScrollView(
+                                      child: Column(
+                                        children: [
+                                          _buildQuickAccessPanel(),
+                                          const SizedBox(height: 12),
+                                          _buildControlPanel(),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        )
                       : Column(
                           children: [
                             _buildMobileHeader(),
@@ -1365,10 +1817,32 @@ class _MyAppState extends State<MyApp> {
                         ),
                 ),
               ),
-            );
-          }),
-        ),
-      ),
+            ),
+          ),
+        );
+        if (!desktop) return home;
+        final Widget workspace;
+        switch (_workspaceIndex) {
+          case 1:
+            workspace = AssistantScreen(apiBase: _apiBase);
+            break;
+          case 2:
+            workspace = RoomsListScreen(apiBase: _apiBase);
+            break;
+          case 3:
+            workspace = MemoryTimelineScreen(apiBase: _apiBase);
+            break;
+          default:
+            workspace = home;
+        }
+        return Row(
+          children: [
+            _buildWorkspaceSidebar(),
+            const VerticalDivider(width: 1, thickness: 1, color: _line),
+            Expanded(child: workspace),
+          ],
+        );
+      }),
     );
   }
 
