@@ -2,10 +2,11 @@
 
 ## Active
 
-- **`proactive.py`** — `ProactiveNarrator`. The one working agent: given a
-  minute's screen description it asks the VLM whether to speak an unprompted
-  insight, with a cooldown. Wired in `app.py` (gated by `PROACTIVE_ENABLED`)
-  and driven by `sources/screen.py`'s `insight_callback`.
+- **`proactive.py`** — `ProactiveNarrator`. The initiative layer receives
+  desktop, mobile, and camera observations, combines them with retrieved memory,
+  focus context, and reaction history, then lets the VLM decide whether and how
+  to speak unprompted. It is enabled by default through `PROACTIVE_ENABLED`;
+  cooldown and duplicate suppression pace delivery across capture threads.
 
 ## `_parked/` (not wired, kept for reference)
 

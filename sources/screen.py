@@ -235,7 +235,9 @@ Create a retrievable memory record that preserves what matters most for future r
         titles = window_titles if window_titles is not None else self.current_minute_apps
         # Step 3: route to a domain profile (process_name preferred, title fallback).
         profile = select_profile(procs, titles)
-        system_prompt = build_system_prompt(profile)
+        # Past user merges/renames steer the naming, so corrections stick.
+        naming_hints = self.pipeline.naming_hints() if self.pipeline is not None else None
+        system_prompt = build_system_prompt(profile, naming_hints=naming_hints)
 
         if len(imgs) == 0:
             return ExtractionResult(summary="", confidence=0.0), "empty", profile.name

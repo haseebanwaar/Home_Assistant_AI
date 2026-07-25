@@ -9,7 +9,7 @@ import logging
 
 from pydantic import ValidationError
 
-from memory.models.extraction import ExtractionResult
+from memory.models.extraction import Claim, Entity, ExtractionResult
 from memory.extraction.prompts import RETRY_PREFIX, RETRY_SUFFIX
 
 logger = logging.getLogger("home_assistant")
@@ -39,10 +39,86 @@ def parse_extraction(raw_text):
     return ExtractionResult.model_validate(data)
 
 
+def _salvage_fields(data):
+    """Best-effort ExtractionResult from a dict that failed whole-object validation.
+
+    A response is usually rejected over ONE bad field, so re-validating field by
+    field recovers the summary/entities/claims instead of discarding everything.
+    Returns None when there is no usable summary.
+    """
+    summary = data.get("summary")
+    summary = str(summary).strip() if summary is not None else ""
+    if not summary:
+        return None
+
+    entities = []
+    for raw in data.get("entities") or []:
+        try:
+            entities.append(Entity.model_validate(raw))
+        except (ValidationError, TypeError):
+            continue
+    claims = []
+    for raw in data.get("claims") or []:
+        try:
+            claims.append(Claim.model_validate(raw))
+        except (ValidationError, TypeError):
+            continue
+
+    # Add the optional fields one at a time, re-validating the whole model each
+    # time, so a single bad value falls back to its default instead of being
+    # written straight through (plain setattr skips pydantic validation).
+    base = {"summary": summary, "confidence": 0.3,
+            "entities": entities, "claims": claims}
+    result = ExtractionResult(**base)
+    for field in ("activity_type", "event_type", "project", "importance"):
+        if field not in data:
+            continue
+        try:
+            candidate = ExtractionResult(**{**base, field: data[field]})
+        except (ValidationError, TypeError):
+            continue
+        base[field] = data[field]
+        result = candidate
+    return result
+
+
 def _fallback(raw_text):
-    """Never-crash fallback: keep the prose as summary, no entities."""
-    summary = (raw_text or "").strip() or "No description available."
-    return ExtractionResult(summary=summary, confidence=0.1, entities=[])
+    """Never-crash fallback.
+
+    Crucially this must NEVER store a raw JSON blob as the summary: the summary
+    is what gets embedded, retrieved, cited and spoken, so a leaked blob poisons
+    every downstream surface. When the response IS json-ish we salvage its real
+    fields; when it is prose we keep the prose; otherwise we store a placeholder.
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return ExtractionResult(summary="No description available.",
+                                confidence=0.1, entities=[])
+
+    cleaned = _strip_fences(text)
+    data = None
+    try:
+        data = json.loads(cleaned)
+    except (ValueError, json.JSONDecodeError):
+        pass
+
+    if isinstance(data, dict):
+        salvaged = _salvage_fields(data)
+        if salvaged is not None:
+            return salvaged
+        # Structured but unusable — storing it verbatim is worse than nothing.
+        logger.warning("Extraction fallback: JSON object without a usable summary; "
+                       "discarding the blob.")
+        return ExtractionResult(summary="No description available.",
+                                confidence=0.1, entities=[])
+
+    # Unparseable but still JSON-shaped (e.g. truncated mid-object): not prose.
+    if cleaned.startswith("{") or cleaned.startswith("["):
+        logger.warning("Extraction fallback: malformed JSON, discarding the blob.")
+        return ExtractionResult(summary="No description available.",
+                                confidence=0.1, entities=[])
+
+    return ExtractionResult(summary=text, confidence=0.1, entities=[])
 
 
 async def run_extraction(generate):

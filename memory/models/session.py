@@ -24,6 +24,10 @@ class Event(BaseModel):
     span_seconds: float = 0.0
     boundary_label: str = "append"
     summary: str = ""
+    # The extractor's automatic signal. A user-selected priority is stored
+    # separately in Neo4j so later observations cannot overwrite it.
+    importance: float = Field(0.5, ge=0.0, le=1.0)
+    confidence: float = Field(0.5, ge=0.0, le=1.0)
 
 
 class Session(BaseModel):

@@ -16,15 +16,37 @@ def _opts(literal_type):
     return ", ".join(literal_type.__args__)
 
 
-def build_system_prompt(profile=None):
+def _naming_block(naming_hints):
+    """Render the user's own naming corrections as extraction guidance.
+
+    Without this, curation is Sisyphean: the user merges "Qwen3 VL" into
+    "qwen3-vl" today and the extractor emits the old spelling again tomorrow.
+    Showing the corrections back to the model fixes the naming at the source
+    rather than repairing it downstream forever.
+    """
+    pairs = [(str(wrong).strip(), str(right).strip())
+             for wrong, right in (naming_hints or [])
+             if str(wrong).strip() and str(right).strip()
+             and str(wrong).strip().lower() != str(right).strip().lower()]
+    if not pairs:
+        return ""
+    lines = "\n".join(f'- write "{right}" (not "{wrong}")' for wrong, right in pairs[:20])
+    return ("\nThe user has corrected these names before. Use their spelling "
+            f"exactly:\n{lines}\n")
+
+
+def build_system_prompt(profile=None, naming_hints=None):
     """Compose the extraction system prompt, specialized by domain profile.
 
     When a profile is given, its entity vocabulary and focus guidance replace the
     generic defaults (Step 3), steering the VLM toward domain-specific entities.
+    `naming_hints` is [(wrong_name, canonical_name)] from the user's own merges
+    and renames, so past corrections shape future extractions.
     """
     entity_types = list(profile.entity_types) if profile and profile.entity_types else ENTITY_TYPE_SUGGESTIONS
     focus = profile.focus if profile and profile.focus else ""
     focus_block = f"\nDomain focus:\n{focus}\n" if focus else ""
+    focus_block += _naming_block(naming_hints)
     return f"""You are a visual episodic-memory extractor. You watch a short clip of the \
 user's computer screen and output ONE JSON object describing what happened.
 

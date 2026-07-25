@@ -57,7 +57,11 @@ The Core Unit acts as a **Dispatcher**, not just a chatbot. uses autogen for cre
   It enhances your productivty while working by helping you cambat distractions. it can watch videos along side you helping you grasp difficult concepts.
 
 * **Proactivity**
-  Availability of near realtime context and past momory helps the agent to analyze your situation proactively. this proactive assistance grows more helpful and consistant as it knows your daily patterns more closely.
+  Proactive initiative is enabled by default across desktop, mobile, and camera
+  observations. The model combines live context, long-term memory, active focus
+  goals, and past reactions, then uses its own judgment to decide when and how
+  to contribute without waiting for a request. Cooldowns and duplicate checks
+  pace delivery without prescribing which ideas the model may consider.
 
 * **Lifelong Learning**
   The agent evolves alongside you. By continuously consolidating daily logs and visual context into its vector store, it builds a permanent, growing knowledge base. It remembers your preferences, projects, and history, ensuring that its personalization deepens over months and years of usage.

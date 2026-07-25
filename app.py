@@ -33,6 +33,7 @@ from vector_store.rag.activity_retriever import ActivityRetriever
 from memory.retrieval.evidence import EvidenceRetriever
 from tools.registry import ToolRegistry, register_default_tools
 from agents.proactive import ProactiveNarrator
+from memory.notifications import NotificationCenter
 
 
 load_dotenv()
@@ -94,10 +95,16 @@ camera_manager = None
 camera_bootstrap_task = None
 proactive = None
 mobile_activity_task = None
+daily_report_task = None  # nightly Coach report scheduler
 memory_pipeline = None   # Step-a: live sessions/events/knowledge pipeline
 neo4j_store = None       # optional graph sink for the live pipeline
 _proactive_insights = deque(maxlen=20)
 _proactive_seq = 0
+notification_center = NotificationCenter(
+    path=os.getenv("NOTIFICATION_STORE_PATH", "data/notifications.json"),
+    important_cooldown_seconds=env_int(
+        "NOTIFICATION_COOLDOWN_SECONDS", 600, minimum=0),
+)
 
 
 class MobileFrameStream:
@@ -186,7 +193,16 @@ tool_registry = ToolRegistry()
 register_default_tools(tool_registry, past_memory)
 
 
-CONCISE_SYSTEM_PROMPT = """You are a conversational AI designed for a real-time Speech-to-Speech (S2S) system. Your primary function is to engage in natural, fluid conversation.
+INITIATIVE_PROMPT = """Act as an initiative-taking partner, not a passive question-answering \
+system. Use your own judgment and creativity to notice implications, make connections, \
+anticipate needs, and offer useful next steps or ideas the user did not explicitly request. \
+Do not reduce your judgment to a fixed rubric of what is right or wrong. Stay grounded in \
+the available context and clearly distinguish remembered facts from inference."""
+
+
+CONCISE_SYSTEM_PROMPT = f"""You are a conversational AI designed for a real-time Speech-to-Speech (S2S) system. Your primary function is to engage in natural, fluid conversation.
+
+    {INITIATIVE_PROMPT}
 
     Follow these critical rules:
     1.  **Be Concise:** Keep your responses short, typically one or two sentences. Avoid long paragraphs at all costs.
@@ -223,7 +239,7 @@ def validate_configuration():
 @app.on_event("startup")
 async def startup_event():
     global vlm_model, screen_stream, camera_manager, camera_bootstrap_task
-    global proactive, mobile_activity_task
+    global proactive, mobile_activity_task, daily_report_task
     global memory_pipeline, neo4j_store
 
     validate_configuration()
@@ -240,10 +256,14 @@ async def startup_event():
 
     # Optional proactive narrator: speaks unprompted insights about screen activity.
     insight_callback = None
-    if env_bool("PROACTIVE_ENABLED", False):
+    if env_bool("PROACTIVE_ENABLED", True):
         proactive = ProactiveNarrator(
             vlm_model, client,
-            cooldown_seconds=env_int("PROACTIVE_COOLDOWN_SECONDS", 300),
+            cooldown_seconds=env_int("PROACTIVE_COOLDOWN_SECONDS", 120),
+            focus_cooldown_seconds=env_int("PROACTIVE_FOCUS_COOLDOWN_SECONDS", 60),
+            retriever=evidence_retriever,
+            # Lazy — the graph is connected further down in this same startup.
+            store_getter=lambda: neo4j_store,
         )
         insight_callback = handle_screen_description
         logger.info("Proactive narrator enabled (cooldown=%ds).", proactive.cooldown_seconds)
@@ -271,6 +291,7 @@ async def startup_event():
             neo4j_store=neo4j_store,
             activity_logger=activity_logger,  # event-scoped Qdrant sink
             jsonl=True,                        # keep /debug/timeline populated
+            notification_sink=notification_center.consider_event,
         )
         logger.info("LIVE_MEMORY enabled (graph=%s).", neo4j_store is not None)
     else:
@@ -309,6 +330,8 @@ async def startup_event():
             activity_logger=activity_logger,
             window_seconds=env_int("CAMERA_WINDOW_SECONDS", 60),
             fps=env_float("CAMERA_FPS", 1.0),
+            notification_sink=notification_center.consider_event,
+            insight_callback=handle_observation_description if proactive is not None else None,
         )
         camera_bootstrap_task = asyncio.create_task(
             asyncio.to_thread(camera_manager.discover_and_start))
@@ -319,13 +342,50 @@ async def startup_event():
     logger.info("Single-user POC pipeline ready.")
     mobile_activity_task = asyncio.create_task(process_mobile_activity())
 
+    if neo4j_store is not None and env_bool("DAILY_REPORT_SCHEDULED", True):
+        daily_report_task = asyncio.create_task(run_daily_report_scheduler())
+        logger.info("Daily report scheduled for %02d:%02d local.",
+                    env_int("DAILY_REPORT_HOUR", 23, minimum=0),
+                    env_int("DAILY_REPORT_MINUTE", 30, minimum=0))
+
+
+async def run_daily_report_scheduler():
+    """Generate and post the Coach's daily report each evening.
+
+    The report existed but nothing ever called it, so the Daily room only
+    updated when the user remembered to press a button — which makes a
+    "lifelong memory" feel inert. Runs for the day that is ending.
+    """
+    hour = min(env_int("DAILY_REPORT_HOUR", 23, minimum=0), 23)
+    minute = min(env_int("DAILY_REPORT_MINUTE", 30, minimum=0), 59)
+    while True:
+        now = datetime.datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += datetime.timedelta(days=1)
+        try:
+            await asyncio.sleep((target - now).total_seconds())
+        except asyncio.CancelledError:
+            raise
+        try:
+            result = await daily_report(date=target.date().isoformat(), post=True)
+            logger.info("Scheduled daily report for %s (posted=%s).",
+                        result.get("date"), result.get("posted"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Never let one bad night kill the scheduler.
+            logger.warning("Scheduled daily report failed: %s", exc)
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    if mobile_activity_task is not None:
-        mobile_activity_task.cancel()
+    for task in (mobile_activity_task, daily_report_task):
+        if task is None:
+            continue
+        task.cancel()
         try:
-            await mobile_activity_task
+            await task
         except asyncio.CancelledError:
             pass
     if camera_bootstrap_task is not None:
@@ -582,6 +642,31 @@ async def rooms_create(request: Request):
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
+@app.get("/rooms/hygiene")
+async def rooms_hygiene(stale_days: int = None, thin_minutes: int = None):
+    """What's cluttering the Rooms screen: stale auto rooms and likely duplicates.
+
+    Proposals only — nothing is archived or merged without an explicit call.
+    Registered BEFORE /rooms/{room_id} so it isn't swallowed by that route.
+    """
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    from memory.rooms.hygiene import (
+        DEFAULT_STALE_DAYS, DEFAULT_THIN_MINUTES, merge_suggestions, stale_rooms)
+
+    stats = neo4j_store.room_stats()
+    overlaps = neo4j_store.room_overlap()
+    return {
+        "rooms": len(stats),
+        "stale": stale_rooms(
+            stats,
+            stale_days=stale_days if stale_days is not None else DEFAULT_STALE_DAYS,
+            thin_minutes=(thin_minutes if thin_minutes is not None
+                          else DEFAULT_THIN_MINUTES)),
+        "merges": merge_suggestions(overlaps, stats),
+    }
+
+
 @app.get("/rooms/{room_id}")
 async def room_get(room_id: str):
     if neo4j_store is None:
@@ -636,15 +721,19 @@ async def room_reroute(room_id: str):
 
 @app.get("/rooms/{room_id}/feed")
 async def room_feed(room_id: str, date: str = None, limit: int = 200,
-                    offset: int = 0, kinds: str = None, q: str = None):
+                    offset: int = 0, kinds: str = None, q: str = None,
+                    priorities: str = None, flagged: bool = None):
     """A room's merged feed — events + user notes + chat, newest first."""
     if neo4j_store is None:
         return {"error": "graph not enabled (start with MEMORY_NEO4J=1)"}
     selected_kinds = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+    selected_priorities = ([p.strip() for p in priorities.split(",") if p.strip()]
+                           if priorities else None)
     return {"room_id": room_id, "date": date, "offset": offset, "limit": limit,
             "feed": neo4j_store.room_feed_full(
                 room_id, date_str=date, limit=limit, offset=offset,
-                kinds=selected_kinds, query=q)}
+                kinds=selected_kinds, query=q,
+                priorities=selected_priorities, flagged=flagged)}
 
 
 @app.post("/rooms/daily/report")
@@ -683,6 +772,134 @@ async def daily_report(date: str = None, post: bool = True):
 
     return {"date": ds, "metrics": metrics, "feedback": feedback,
             "report": report, "posted": posted}
+
+
+@app.post("/rooms/hygiene/archive")
+async def rooms_hygiene_archive(request: Request):
+    """Archive the given rooms (reversible — archived rooms can be restored)."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid JSON: {exc}"})
+    room_ids = data.get("room_ids") if isinstance(data, dict) else None
+    if not isinstance(room_ids, list) or not room_ids:
+        return JSONResponse(status_code=400,
+                            content={"error": "room_ids must be a non-empty list"})
+    return {"archived": neo4j_store.archive_rooms(room_ids)}
+
+
+@app.post("/rooms/{room_id}/merge")
+async def room_merge(room_id: str, request: Request):
+    """Merge this room into another, then archive it."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid JSON: {exc}"})
+    target = (data.get("target_room_id") or "").strip() if isinstance(data, dict) else ""
+    if not target:
+        return JSONResponse(status_code=400,
+                            content={"error": "target_room_id is required"})
+    try:
+        merged = neo4j_store.merge_rooms(room_id, target)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if merged is None:
+        return JSONResponse(status_code=404, content={"error": "room not found"})
+    return {"merged": merged}
+
+
+@app.post("/rooms/{room_id}/promote")
+async def room_promote(room_id: str, request: Request):
+    """Keep an auto room for good: makes it user-owned so hygiene ignores it."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    name = (data.get("name") or "").strip() or None if isinstance(data, dict) else None
+    pinned = data.get("pinned") if isinstance(data, dict) else None
+    promoted = neo4j_store.promote_room(room_id, name=name, pinned=pinned)
+    if promoted is None:
+        return JSONResponse(status_code=404, content={"error": "room not found"})
+    return {"room": promoted}
+
+
+@app.get("/rooms/{room_id}/arc")
+async def room_arc(room_id: str, weeks: int = 8, narrate: bool = False):
+    """How a room's work has gone week over week.
+
+    Everything else in the API is day-scoped, which makes long-term memory
+    invisible; this is the view that shows a project's actual arc.
+    """
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    weeks = max(1, min(int(weeks), 52))
+    today = datetime.date.today()
+    # Start on the Monday `weeks` weeks back, so buckets align to whole weeks.
+    this_monday = today - datetime.timedelta(days=today.weekday())
+    first_monday = this_monday - datetime.timedelta(weeks=weeks - 1)
+    start = datetime.datetime.combine(first_monday, datetime.time.min).timestamp()
+    end = datetime.datetime.combine(
+        this_monday + datetime.timedelta(days=7), datetime.time.min).timestamp()
+
+    room = neo4j_store.get_room(room_id)
+    if room is None:
+        return JSONResponse(status_code=404, content={"error": "room not found"})
+
+    buckets = neo4j_store.room_weekly(room_id, start, end)
+    for bucket in buckets:
+        week_start = datetime.date.fromisoformat(bucket["week_start"])
+        week_from = datetime.datetime.combine(
+            week_start, datetime.time.min).timestamp()
+        week_to = week_from + 7 * 86400
+        highlights = neo4j_store.room_week_highlights(room_id, week_from, week_to)
+        bucket["claims"] = highlights["claims"]
+        bucket["entities"] = neo4j_store.room_week_entities(
+            room_id, week_from, week_to)
+
+    total_minutes = sum(b.get("active_minutes") or 0 for b in buckets)
+    result = {
+        "room_id": room_id, "room": room.get("name"), "weeks": weeks,
+        "buckets": buckets,
+        "summary": {
+            "active_minutes": total_minutes,
+            "active_weeks": sum(1 for b in buckets if (b.get("events") or 0) > 0),
+            "events": sum(b.get("events") or 0 for b in buckets),
+        },
+    }
+
+    if narrate and buckets:
+        lines = []
+        for bucket in buckets:
+            if not bucket.get("events"):
+                continue
+            entities = ", ".join(e["name"] for e in bucket.get("entities", [])[:5])
+            lines.append(
+                f"Week of {bucket['week_start']}: "
+                f"{bucket['active_minutes']:.0f} min over {bucket['active_days']} days"
+                + (f"; worked with {entities}" if entities else "")
+                + ("; " + " ".join(bucket["claims"][:3]) if bucket.get("claims") else ""))
+        prompt = (
+            "You are summarizing how a user's project went over several weeks, "
+            "from their own screen-activity records. Write 4-6 sentences describing "
+            "the arc: what they started with, how the focus shifted, what got done, "
+            "and where it stands now. Be specific and do not invent anything.\n\n"
+            f"Project/room: {room.get('name')}\n\n" + "\n".join(lines))
+        try:
+            response = await client.chat.completions.create(
+                model=vlm_model, messages=[{"role": "user", "content": prompt}],
+                max_tokens=400)
+            result["narrative"] = (response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            logger.warning("room arc narration failed: %s", exc)
+            result["narrative"] = None
+
+    return result
 
 
 @app.post("/rooms/{room_id}/note")
@@ -755,19 +972,8 @@ async def event_remove_room(event_id: str, room_id: str):
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
-@app.post("/rooms/{room_id}/chat")
-async def room_chat(room_id: str, request: Request):
-    """Chat with the assistant scoped to a room (grounded in its events/notes)."""
-    if neo4j_store is None:
-        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
-    try:
-        data = await request.json()
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        return JSONResponse(status_code=400, content={"error": f"invalid JSON: {exc}"})
-    message = (data.get("message") or "").strip() if isinstance(data, dict) else ""
-    if not message:
-        return JSONResponse(status_code=400, content={"error": "empty message"})
-
+def _room_chat_turn(room_id, message):
+    """Build the room-chat prompt + citations. Shared by both room chat endpoints."""
     room = neo4j_store.get_room(room_id) or {"name": room_id}
     neo4j_store.add_message(room_id, "user", message)
     ctx = neo4j_store.room_context(room_id)
@@ -778,14 +984,17 @@ async def room_chat(room_id: str, request: Request):
     # the question carries no content terms ("what have I been up to in here?").
     relevant = evidence_retriever.retrieve(
         message, limit=8, kinds=["event", "note", "claim"], room_id=room_id)
+    citations = [{
+        "number": index + 1, "kind": item.get("kind"), "id": item.get("id"),
+        "title": item.get("title"), "text": item.get("text"), "ts": item.get("ts"),
+    } for index, item in enumerate(relevant) if item.get("text")]
     relevant_lines = [
-        f"({item.get('kind')}) {item.get('text')}"
-        for item in relevant if item.get("text")]
+        f"[{item['number']}] ({item['kind']}) {item['text']}" for item in citations]
 
     grounding = (
         f"You are the user's assistant, chatting inside the '{room.get('name', room_id)}' room. "
         "This room collects the user's activity, notes, and your past chat on this topic. "
-        "Use the context to answer; be concise and specific.\n\n"
+        "Use the context to answer; be concise and specific. " + INITIATIVE_PROMPT + "\n\n"
         f"Most relevant to this question:\n- " + "\n- ".join(relevant_lines or ["(none)"]) + "\n\n"
         f"Recent activity in this room:\n- " + "\n- ".join(ctx["events"][:8] or ["(none)"]) + "\n\n"
         f"User's notes here:\n- " + "\n- ".join(ctx["notes"][:8] or ["(none)"]) + "\n\n"
@@ -797,7 +1006,19 @@ async def room_chat(room_id: str, request: Request):
     for m in history[:-1]:  # prior turns (exclude the just-added user message)
         messages.append({"role": m["role"], "content": m["text"]})
     messages.append({"role": "user", "content": message})
+    return messages, citations
 
+
+@app.post("/rooms/{room_id}/chat")
+async def room_chat(room_id: str, request: Request):
+    """Chat with the assistant scoped to a room (grounded in its events/notes)."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    message, error = await _read_message(request)
+    if error is not None:
+        return error
+
+    messages, citations = _room_chat_turn(room_id, message)
     try:
         resp = await client.chat.completions.create(
             model=vlm_model, messages=messages, max_tokens=500)
@@ -807,7 +1028,26 @@ async def room_chat(room_id: str, request: Request):
         return JSONResponse(status_code=502, content={"error": f"chat failed: {exc}"})
 
     neo4j_store.add_message(room_id, "assistant", reply)
-    return {"room_id": room_id, "reply": reply}
+    return {"room_id": room_id, "reply": reply, "citations": citations}
+
+
+@app.post("/rooms/{room_id}/chat/stream")
+async def room_chat_stream(room_id: str, request: Request):
+    """Room chat, streamed: citations first, then tokens."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    message, error = await _read_message(request)
+    if error is not None:
+        return error
+
+    messages, citations = _room_chat_turn(room_id, message)
+
+    def persist(reply):
+        return neo4j_store.add_message(room_id, "assistant", reply)
+
+    return StreamingResponse(
+        _stream_reply(messages, citations, persist, max_tokens=500),
+        media_type="application/x-ndjson")
 
 
 @app.get("/memory/timeline")
@@ -898,14 +1138,32 @@ async def memory_event_update(event_id: str, request: Request):
     if neo4j_store is None:
         return JSONResponse(status_code=400, content={"error": "graph not enabled"})
     data = await request.json()
-    summary = (data.get("summary") or "").strip() if isinstance(data, dict) else ""
-    if not summary:
-        return JSONResponse(status_code=400, content={"error": "summary is required"})
-    event = neo4j_store.update_event_summary(event_id, summary)
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "body must be an object"})
+    if "flagged" in data and not isinstance(data["flagged"], bool):
+        return JSONResponse(status_code=400, content={"error": "flagged must be true or false"})
+    summary = ((data.get("summary") or "").strip()
+               if "summary" in data else None)
+    has_triage = any(key in data for key in ("priority", "flagged", "flag_reason"))
+    if summary == "":
+        return JSONResponse(status_code=400, content={"error": "summary cannot be empty"})
+    if summary is None and not has_triage:
+        return JSONResponse(status_code=400, content={"error": "no event changes supplied"})
+    try:
+        event = (neo4j_store.update_event_summary(event_id, summary)
+                 if summary is not None else neo4j_store.event_detail(event_id))
+        if event is not None and has_triage:
+            event = neo4j_store.update_event_metadata(
+                event_id,
+                priority=data.get("priority") if "priority" in data else None,
+                flagged=data.get("flagged") if "flagged" in data else None,
+                flag_reason=data.get("flag_reason") if "flag_reason" in data else None)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
     if event is None:
         return JSONResponse(status_code=404, content={"error": "event not found"})
     detail = neo4j_store.event_detail(event_id)
-    if activity_logger is not None and detail:
+    if summary is not None and activity_logger is not None and detail:
         try:
             activity_logger.log_event(
                 summary=summary, event_id=event_id,
@@ -1120,19 +1378,8 @@ async def assistant_conversation_delete(conversation_id: str):
     return {"deleted": True}
 
 
-@app.post("/assistant/conversations/{conversation_id}/messages")
-async def assistant_conversation_message(conversation_id: str, request: Request):
-    """Answer from an explicit memory scope and return inspectable citations."""
-    if neo4j_store is None:
-        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
-    data = await request.json()
-    message = (data.get("message") or "").strip() if isinstance(data, dict) else ""
-    if not message:
-        return JSONResponse(status_code=400, content={"error": "message is required"})
-    conversation = neo4j_store.get_conversation(conversation_id, message_limit=30)
-    if conversation is None:
-        return JSONResponse(status_code=404, content={"error": "conversation not found"})
-
+def _assistant_scope(conversation):
+    """(start, end, room_id) for a conversation's declared memory scope."""
     start, end, room_id = conversation.get("from_ts"), conversation.get("to_ts"), None
     if conversation.get("scope") == "today":
         start = datetime.datetime.combine(
@@ -1140,7 +1387,13 @@ async def assistant_conversation_message(conversation_id: str, request: Request)
         end = start + 86400
     elif conversation.get("scope") == "room":
         room_id = conversation.get("room_id")
+    return start, end, room_id
 
+
+def _assistant_turn(conversation, message):
+    """Retrieve evidence and build the prompt. Shared by the blocking and
+    streaming endpoints so both answer identically."""
+    start, end, room_id = _assistant_scope(conversation)
     evidence = evidence_retriever.retrieve(
         message, limit=10, kinds=["event", "note", "claim"],
         start=start, end=end, room_id=room_id)
@@ -1156,7 +1409,8 @@ async def assistant_conversation_message(conversation_id: str, request: Request)
         "You are the user's private, local-first assistant. Answer only from the "
         "provided memory evidence and ordinary reasoning. Never invent remembered "
         "facts. Cite supporting memories inline using [1], [2], etc. If evidence "
-        "is insufficient, say so clearly.\n\nMemory evidence:\n" + evidence_text
+        "is insufficient, say so clearly. " + INITIATIVE_PROMPT
+        + "\n\nMemory evidence:\n" + evidence_text
     )
     if room_id:
         room = neo4j_store.get_room(room_id)
@@ -1167,6 +1421,36 @@ async def assistant_conversation_message(conversation_id: str, request: Request)
         if prior.get("role") in {"user", "assistant"}:
             messages.append({"role": prior["role"], "content": prior["text"]})
     messages.append({"role": "user", "content": message})
+    return messages, citations
+
+
+async def _read_message(request):
+    """(message, error_response) from a JSON body with a `message` field."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return None, JSONResponse(status_code=400,
+                                  content={"error": f"invalid JSON: {exc}"})
+    message = (data.get("message") or "").strip() if isinstance(data, dict) else ""
+    if not message:
+        return None, JSONResponse(status_code=400,
+                                  content={"error": "message is required"})
+    return message, None
+
+
+@app.post("/assistant/conversations/{conversation_id}/messages")
+async def assistant_conversation_message(conversation_id: str, request: Request):
+    """Answer from an explicit memory scope and return inspectable citations."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    message, error = await _read_message(request)
+    if error is not None:
+        return error
+    conversation = neo4j_store.get_conversation(conversation_id, message_limit=30)
+    if conversation is None:
+        return JSONResponse(status_code=404, content={"error": "conversation not found"})
+
+    messages, citations = _assistant_turn(conversation, message)
     neo4j_store.add_conversation_message(conversation_id, "user", message)
     try:
         response = await client.chat.completions.create(
@@ -1178,6 +1462,84 @@ async def assistant_conversation_message(conversation_id: str, request: Request)
     saved = neo4j_store.add_conversation_message(
         conversation_id, "assistant", reply, citations=citations)
     return {"reply": reply, "citations": citations, "message": saved}
+
+
+async def _stream_reply(messages, citations, on_complete, max_tokens=700):
+    """NDJSON token stream, citations first.
+
+    Evidence is known before generation starts, so sending it immediately lets
+    the UI render sources while the answer is still being written — the whole
+    perceived-latency win. Matches the existing /talk NDJSON convention.
+    """
+    yield json.dumps({"type": "citations", "citations": citations}) + "\n"
+    parts = []
+    try:
+        stream = await client.chat.completions.create(
+            model=vlm_model, messages=messages, max_tokens=max_tokens, stream=True)
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            piece = getattr(delta, "content", None)
+            if piece:
+                parts.append(piece)
+                yield json.dumps({"type": "delta", "text": piece}) + "\n"
+    except Exception as exc:
+        logger.warning("streaming assistant failed: %s", exc)
+        yield json.dumps({"type": "error", "error": str(exc)}) + "\n"
+        return
+
+    reply = "".join(parts).strip()
+    saved = None
+    try:
+        saved = on_complete(reply)
+    except Exception as exc:
+        logger.warning("persisting streamed reply failed: %s", exc)
+    yield json.dumps({"type": "done", "reply": reply, "message": saved}) + "\n"
+
+
+@app.post("/assistant/conversations/{conversation_id}/messages/stream")
+async def assistant_conversation_message_stream(conversation_id: str, request: Request):
+    """Same answer as the blocking endpoint, streamed: citations, then tokens."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    message, error = await _read_message(request)
+    if error is not None:
+        return error
+    conversation = neo4j_store.get_conversation(conversation_id, message_limit=30)
+    if conversation is None:
+        return JSONResponse(status_code=404, content={"error": "conversation not found"})
+
+    messages, citations = _assistant_turn(conversation, message)
+    neo4j_store.add_conversation_message(conversation_id, "user", message)
+
+    def persist(reply):
+        return neo4j_store.add_conversation_message(
+            conversation_id, "assistant", reply, citations=citations)
+
+    return StreamingResponse(
+        _stream_reply(messages, citations, persist),
+        media_type="application/x-ndjson")
+
+
+@app.get("/memory/aliases")
+async def memory_aliases():
+    """Naming corrections learned from merges/renames, applied to future captures."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    return {"aliases": neo4j_store.list_entity_aliases(),
+            "naming_hints": [{"wrong": wrong, "canonical": canonical}
+                             for wrong, canonical in neo4j_store.canonical_name_hints()]}
+
+
+@app.delete("/memory/aliases/{alias_id:path}")
+async def memory_alias_delete(alias_id: str):
+    """Undo a learned alias (the entity will be treated as distinct again)."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    if not neo4j_store.delete_entity_alias(alias_id):
+        return JSONResponse(status_code=404, content={"error": "alias not found"})
+    return {"deleted": True, "alias_id": alias_id}
 
 
 @app.get("/reviews/daily")
@@ -1249,13 +1611,87 @@ async def focus_session_start(request: Request):
 
 
 @app.post("/focus/sessions/{focus_id}/stop")
-async def focus_session_stop(focus_id: str):
+async def focus_session_stop(focus_id: str, recap: bool = True):
     if neo4j_store is None:
         return JSONResponse(status_code=400, content={"error": "graph not enabled"})
     focus = neo4j_store.stop_focus_session(focus_id)
     if focus is None:
         return JSONResponse(status_code=404, content={"error": "active focus session not found"})
+    if recap:
+        focus["recap"] = await build_focus_recap(focus, post=True)
     return {"focus": focus}
+
+
+@app.get("/focus/sessions/{focus_id}/recap")
+async def focus_session_recap(focus_id: str, regenerate: bool = False,
+                              post: bool = False):
+    """The stored recap, or a freshly built one (works for past sessions too)."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    focus = neo4j_store.get_focus_session(focus_id)
+    if focus is None:
+        return JSONResponse(status_code=404, content={"error": "focus session not found"})
+    if not regenerate and focus.get("recap"):
+        return {"focus_id": focus_id, "recap": focus["recap"], "cached": True}
+    return {"focus_id": focus_id,
+            "recap": await build_focus_recap(focus, post=post), "cached": False}
+
+
+async def build_focus_recap(focus, post=False):
+    """Classify a finished session's events against its goal, then render a recap.
+
+    Attribution is by time overlap (see _FOCUS_EVENTS_CYPHER), so this also works
+    for sessions that ran before recaps existed.
+    """
+    from memory.summary import focus_recap as recap_mod
+
+    start = focus.get("started_at")
+    end = focus.get("ended_at") or time.time()
+    goal = focus.get("goal") or "(no goal recorded)"
+    if start is None:
+        return None
+
+    events = neo4j_store.focus_events(start, end, room_id=focus.get("room_id"))
+    if not events:
+        breakdown = recap_mod.apply_classification(goal, [], {}, start, end)
+        return recap_mod.format_recap(breakdown, focus.get("planned_minutes"))
+
+    labels = {}
+    try:
+        response = await client.chat.completions.create(
+            model=vlm_model, max_tokens=600,
+            messages=[{"role": "user",
+                       "content": recap_mod.classify_prompt(goal, events)}])
+        labels = recap_mod.parse_labels(
+            response.choices[0].message.content, len(events))
+    except Exception as exc:
+        # Unlabelled events fall into "unknown", which the recap reports honestly
+        # rather than scoring the session as a failure.
+        logger.warning("focus classification failed: %s", exc)
+
+    breakdown = recap_mod.apply_classification(goal, events, labels, start, end)
+
+    feedback = ""
+    if breakdown["on_task_pct"] is not None:
+        try:
+            response = await client.chat.completions.create(
+                model=vlm_model, max_tokens=250,
+                messages=[{"role": "user",
+                           "content": recap_mod.feedback_prompt(breakdown)}])
+            feedback = (response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            logger.warning("focus feedback LLM failed: %s", exc)
+
+    text = recap_mod.format_recap(
+        breakdown, focus.get("planned_minutes"), feedback=feedback)
+    try:
+        neo4j_store.save_focus_recap(focus["focus_id"], text, breakdown)
+        if post:
+            neo4j_store.add_message(
+                focus.get("room_id") or "daily", "coach", text, ts=end)
+    except Exception as exc:
+        logger.warning("saving focus recap failed: %s", exc)
+    return text
 
 
 @app.get("/debug/co-occurrence")
@@ -1374,35 +1810,111 @@ async def proactive_insights(since: int = 0):
     return {"enabled": proactive is not None, "latest_id": _proactive_seq, "insights": items}
 
 
-def handle_screen_description(description, timestamp):
-    """Screen-thread callback: ask the narrator for an insight, synthesize its
+@app.get("/notifications")
+async def notifications_list(since: int = 0, limit: int = 100,
+                             unread_only: bool = False):
+    """Durable critical/important event inbox, newest first."""
+    return notification_center.list(
+        since=since, limit=limit, unread_only=unread_only)
+
+
+@app.post("/notifications/{notification_id}/read")
+async def notification_mark_read(notification_id: str):
+    item = notification_center.mark_read(notification_id)
+    if item is None:
+        return JSONResponse(status_code=404, content={"error": "notification not found"})
+    return {"notification": item}
+
+
+@app.post("/notifications/actions/read-all")
+async def notifications_mark_all_read():
+    return {"updated": notification_center.mark_all_read()}
+
+
+NUDGE_FEEDBACK_VALUES = {"up", "down", "not_now"}
+
+
+@app.post("/proactive/{nudge_id}/feedback")
+async def proactive_feedback(nudge_id: str, request: Request):
+    """Record how the user reacted, so the narrator stops repeating rejected themes.
+
+    Without this the narrator can only get louder, never more selective.
+    """
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid JSON: {exc}"})
+    feedback = (data.get("feedback") or "").strip() if isinstance(data, dict) else ""
+    if feedback not in NUDGE_FEEDBACK_VALUES:
+        return JSONResponse(status_code=400, content={
+            "error": f"feedback must be one of {sorted(NUDGE_FEEDBACK_VALUES)}"})
+    updated = neo4j_store.set_nudge_feedback(nudge_id, feedback)
+    if updated is None:
+        return JSONResponse(status_code=404, content={"error": "nudge not found"})
+    return {"nudge": updated}
+
+
+@app.get("/proactive/history")
+async def proactive_history(limit: int = 50):
+    """Past nudges with their feedback (for tuning what the narrator says)."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    return {"nudges": neo4j_store.list_nudges(limit=limit)}
+
+
+def handle_observation_description(description, timestamp, source="screen", context=None):
+    """Capture-thread callback: ask the narrator for an insight, synthesize its
     speech, and queue it for the end device to play (no server-side playback).
-    Runs in the screen 'describe' thread — mirrors how screen.py already uses
-    asyncio.run for its own VLM call."""
+    May be called by desktop, mobile, or camera workers."""
     global _proactive_seq
     if proactive is None:
         return
     try:
-        insight = asyncio.run(proactive.consider(description))
+        insight = asyncio.run(
+            proactive.consider(description, source=source, context=context))
     except Exception as exc:
         logger.warning("Proactive consider failed: %s", exc)
         return
     if not insight:
         return
+    text = insight["text"]
     # Synthesize speech here so the client can play it on the end device.
     audio_b64 = None
     try:
-        audio_b64 = base64.b64encode(run_kokoro(insight)).decode("utf-8")
+        audio_b64 = base64.b64encode(run_kokoro(text)).decode("utf-8")
     except Exception as exc:
         logger.warning("Proactive TTS failed: %s", exc)
+    # Persist it so the user's reaction can be fed back into future nudges.
+    nudge_id = None
+    if neo4j_store is not None:
+        try:
+            nudge_id = neo4j_store.record_nudge(
+                text, kind=insight.get("kind"), focus_id=insight.get("focus_id"),
+                evidence=insight.get("evidence"))
+        except Exception as exc:
+            logger.warning("Recording nudge failed: %s", exc)
     _proactive_seq += 1
     _proactive_insights.append({
         "id": _proactive_seq,
-        "text": insight,
+        "nudge_id": nudge_id,
+        "text": text,
+        "kind": insight.get("kind"),
+        "source": insight.get("source") or source,
+        "focus_id": insight.get("focus_id"),
+        "evidence": insight.get("evidence") or [],
         "timestamp": timestamp,
         "audio": audio_b64,
     })
-    logger.info("Proactive insight #%d: %s", _proactive_seq, insight)
+    logger.info("Proactive insight #%d (%s): %s",
+                _proactive_seq, insight.get("kind"), text)
+
+
+def handle_screen_description(description, timestamp):
+    """Backward-compatible desktop capture callback."""
+    return handle_observation_description(
+        description, timestamp, source="desktop_screen")
 
 
 async def describe_mobile_frames(source, frames):
@@ -1447,7 +1959,9 @@ async def process_mobile_activity():
             )
             mobile_stream.processed()
             if proactive is not None:
-                await asyncio.to_thread(handle_screen_description, description, timestamp)
+                await asyncio.to_thread(
+                    handle_observation_description, description, timestamp,
+                    f"mobile_{source}", {"capture_source": source})
             logger.info("Processed %d mobile %s frames into memory", len(frames), source)
         except Exception as exc:
             mobile_stream.last_error = f"activity processing failed: {exc}"
@@ -1657,7 +2171,10 @@ async def gather_tool_context(transcription):
 
 
 def build_messages(concise, memory_text, chat_history, user_content):
-    system_prompt = CONCISE_SYSTEM_PROMPT if concise else "You are a helpful assistant."
+    system_prompt = (
+        CONCISE_SYSTEM_PROMPT if concise
+        else "You are the user's personal assistant.\n\n" + INITIATIVE_PROMPT
+    )
     messages = [{"role": "system", "content": system_prompt}]
     if memory_text:
         messages.append({

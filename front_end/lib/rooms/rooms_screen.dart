@@ -437,10 +437,33 @@ class _RoomScreenState extends State<RoomScreen> {
   String? _error;
   String _mode = 'note'; // 'note' | 'chat'
   String? _date;
+  String _eventView = 'useful'; // useful | all | high | low | flagged
   final Set<String> _kinds = {'event', 'note', 'message'};
   List<dynamic> _feed = []; // chronological (oldest -> newest)
 
   bool get _isDaily => widget.kind == 'daily';
+
+  List<Map<String, dynamic>> get _visibleFeed {
+    return _feed.cast<Map<String, dynamic>>().where((item) {
+      if ((item['kind'] ?? 'event') != 'event') {
+        return _eventView == 'useful' || _eventView == 'all';
+      }
+      final priority = (item['priority'] ?? 'normal').toString();
+      final flagged = item['flagged'] == true;
+      switch (_eventView) {
+        case 'useful':
+          return !flagged && priority != 'low';
+        case 'high':
+          return !flagged && priority == 'high';
+        case 'low':
+          return !flagged && priority == 'low';
+        case 'flagged':
+          return flagged;
+        default:
+          return true;
+      }
+    }).toList();
+  }
 
   @override
   void initState() {
@@ -591,6 +614,7 @@ class _RoomScreenState extends State<RoomScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final visibleFeed = _visibleFeed;
     return Scaffold(
       backgroundColor: _ink,
       appBar: AppBar(
@@ -614,6 +638,7 @@ class _RoomScreenState extends State<RoomScreen> {
           if (_loading || _sending)
             const LinearProgressIndicator(minHeight: 2, color: _mint),
           _feedFilters(),
+          if (_kinds.contains('event')) _activityOverview(),
           Expanded(
             child: _error != null
                 ? Center(
@@ -623,8 +648,8 @@ class _RoomScreenState extends State<RoomScreen> {
                 : ListView.builder(
                     controller: _scroll,
                     padding: const EdgeInsets.all(12),
-                    itemCount: _feed.length,
-                    itemBuilder: (context, i) => _feedItem(_feed[i] as Map<String, dynamic>),
+                    itemCount: visibleFeed.length,
+                    itemBuilder: (context, i) => _feedItem(visibleFeed[i]),
                   ),
           ),
           _composer(),
@@ -692,6 +717,117 @@ class _RoomScreenState extends State<RoomScreen> {
               ],
             ],
           ),
+          if (_kinds.contains('event')) ...[
+            const SizedBox(height: 6),
+            SizedBox(
+              height: 34,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                children: [
+                  _eventViewChip('Useful', 'useful', Icons.auto_awesome),
+                  const SizedBox(width: 6),
+                  _eventViewChip('All', 'all', Icons.view_list_outlined),
+                  const SizedBox(width: 6),
+                  _eventViewChip('Important', 'high', Icons.star_outline),
+                  const SizedBox(width: 6),
+                  _eventViewChip('Low priority', 'low', Icons.low_priority),
+                  const SizedBox(width: 6),
+                  _eventViewChip('Flagged', 'flagged', Icons.flag_outlined),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  int _eventCountFor(String view) {
+    return _feed.where((raw) {
+      final item = raw as Map<String, dynamic>;
+      if ((item['kind'] ?? 'event') != 'event') return false;
+      final priority = (item['priority'] ?? 'normal').toString();
+      final flagged = item['flagged'] == true;
+      if (view == 'useful') return !flagged && priority != 'low';
+      if (view == 'high') return !flagged && priority == 'high';
+      if (view == 'low') return !flagged && priority == 'low';
+      if (view == 'flagged') return flagged;
+      return true;
+    }).length;
+  }
+
+  Widget _eventViewChip(String label, String value, IconData icon) {
+    final selected = _eventView == value;
+    return ChoiceChip(
+      selected: selected,
+      showCheckmark: false,
+      avatar: Icon(icon, size: 14, color: selected ? _ink : _muted),
+      label: Text('$label ${_eventCountFor(value)}'),
+      labelStyle:
+          TextStyle(color: selected ? _ink : _muted, fontSize: 11),
+      selectedColor: _mint,
+      backgroundColor: _panelRaised,
+      side: const BorderSide(color: _line),
+      onSelected: (_) => setState(() => _eventView = value),
+    );
+  }
+
+  Widget _activityOverview() {
+    final events = _visibleFeed
+        .where((item) => (item['kind'] ?? 'event') == 'event')
+        .toList();
+    final seconds = events.fold<double>(0, (sum, item) {
+      final start = item['ts'];
+      final end = item['span_end'];
+      return sum +
+          (start is num && end is num
+              ? (end.toDouble() - start.toDouble())
+                  .clamp(0, 86400)
+                  .toDouble()
+              : 0);
+    });
+    final applications = events
+        .map((item) => (item['application'] ?? '').toString().trim())
+        .where((name) => name.isNotEmpty)
+        .toSet()
+        .take(3)
+        .join(', ');
+    final low = _eventCountFor('low');
+    final flagged = _eventCountFor('flagged');
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
+      decoration: const BoxDecoration(
+        color: _panelRaised,
+        border: Border(bottom: BorderSide(color: _line)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.summarize_outlined, size: 18, color: _mint),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${events.length} events • ${_duration(seconds)}'
+                  '${applications.isEmpty ? '' : ' • $applications'}',
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600),
+                ),
+                if (low > 0 || flagged > 0)
+                  Text(
+                    '${low > 0 ? '$low low priority' : ''}'
+                    '${low > 0 && flagged > 0 ? ' • ' : ''}'
+                    '${flagged > 0 ? '$flagged flagged for review' : ''}',
+                    style: const TextStyle(color: _muted, fontSize: 11),
+                  ),
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -743,9 +879,11 @@ class _RoomScreenState extends State<RoomScreen> {
       if (role == 'coach') return _coachCard(text);
       return _bubble(text, role == 'user');
     }
-    return _eventRow(it, text);
+    return _eventCard(it, text);
   }
 
+  // Kept temporarily for compatibility while older layouts are phased out.
+  // ignore: unused_element
   Widget _eventRow(Map<String, dynamic> it, String text) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
@@ -785,6 +923,241 @@ class _RoomScreenState extends State<RoomScreen> {
         ],
       ),
     );
+  }
+
+  Widget _eventCard(Map<String, dynamic> it, String text) {
+    final priority = (it['priority'] ?? 'normal').toString();
+    final flagged = it['flagged'] == true;
+    final priorityColor = priority == 'high'
+        ? const Color(0xFFFFC857)
+        : priority == 'low'
+            ? _muted
+            : _mint;
+    final application = (it['application'] ?? 'Activity').toString();
+    final activity =
+        (it['activity_type'] ?? '').toString().replaceAll('_', ' ');
+    final start = it['ts'];
+    final end = it['span_end'];
+    final seconds = start is num && end is num
+        ? (end.toDouble() - start.toDouble()).clamp(0, 86400).toDouble()
+        : 0.0;
+    final time = end is num ? '${_hm(start)}–${_hm(end)}' : _hm(start);
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      padding: const EdgeInsets.fromLTRB(12, 10, 6, 11),
+      decoration: BoxDecoration(
+        color: flagged ? const Color(0xFF2A1B27) : _panel,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+            color: flagged
+                ? const Color(0xFFFF7A9B).withOpacity(.55)
+                : _line),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                flagged
+                    ? Icons.flag
+                    : priority == 'high'
+                        ? Icons.star
+                        : priority == 'low'
+                            ? Icons.low_priority
+                            : Icons.bolt,
+                size: 16,
+                color: flagged ? const Color(0xFFFF7A9B) : priorityColor,
+              ),
+              const SizedBox(width: 7),
+              Expanded(
+                child: Text(
+                  activity.isEmpty ? application : '$application • $activity',
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700),
+                ),
+              ),
+              Text(time, style: const TextStyle(color: _muted, fontSize: 11)),
+              if (it['event_id'] != null)
+                PopupMenuButton<String>(
+                  padding: EdgeInsets.zero,
+                  iconSize: 18,
+                  icon: const Icon(Icons.more_horiz, color: _muted),
+                  onSelected: (value) => _handleEventAction(it, value),
+                  itemBuilder: (_) => [
+                    const PopupMenuItem(
+                        value: 'priority_high',
+                        child: Text('Mark important')),
+                    const PopupMenuItem(
+                        value: 'priority_normal',
+                        child: Text('Normal priority')),
+                    const PopupMenuItem(
+                        value: 'priority_low',
+                        child: Text('Low priority')),
+                    PopupMenuItem(
+                        value: flagged ? 'unflag' : 'flag',
+                        child: Text(flagged
+                            ? 'Return from review'
+                            : 'Flag for review')),
+                    const PopupMenuDivider(),
+                    const PopupMenuItem(
+                        value: 'primary', child: Text('Move to room…')),
+                    const PopupMenuItem(
+                        value: 'secondary', child: Text('Add to room…')),
+                    const PopupMenuItem(
+                        value: 'remove',
+                        child: Text('Remove from this room')),
+                  ],
+                ),
+            ],
+          ),
+          const SizedBox(height: 7),
+          Text(text.isEmpty ? 'No useful description was captured.' : text,
+              style: TextStyle(
+                  color: priority == 'low' ? _muted : Colors.white70,
+                  fontSize: 13,
+                  height: 1.38)),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 6,
+            runSpacing: 5,
+            children: [
+              _eventTag(_duration(seconds), Icons.schedule, _muted),
+              _eventTag(
+                  priority == 'high'
+                      ? 'Important'
+                      : priority == 'low'
+                          ? 'Low priority'
+                          : 'Normal',
+                  priority == 'high'
+                      ? Icons.star_outline
+                      : priority == 'low'
+                          ? Icons.low_priority
+                          : Icons.bolt_outlined,
+                  priorityColor),
+              if (it['priority_source'] == 'automatic')
+                _eventTag('AI ranked', Icons.auto_awesome, _violet),
+              if (flagged)
+                _eventTag('Review later', Icons.flag_outlined,
+                    const Color(0xFFFF7A9B)),
+            ],
+          ),
+          if (flagged &&
+              (it['flag_reason'] ?? '').toString().trim().isNotEmpty) ...[
+            const SizedBox(height: 7),
+            Text('Reason: ${it['flag_reason']}',
+                style: const TextStyle(
+                    color: Color(0xFFFFA0B8), fontSize: 11.5)),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _eventTag(String label, IconData icon, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withOpacity(.10),
+        borderRadius: BorderRadius.circular(7),
+        border: Border.all(color: color.withOpacity(.28)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 12, color: color),
+          const SizedBox(width: 4),
+          Text(label, style: TextStyle(color: color, fontSize: 10.5)),
+        ],
+      ),
+    );
+  }
+
+  String _duration(double seconds) {
+    if (seconds < 60) return '${seconds.round()} sec';
+    final minutes = (seconds / 60).round();
+    if (minutes < 60) return '$minutes min';
+    final hours = minutes ~/ 60;
+    final remainder = minutes % 60;
+    return remainder == 0 ? '$hours hr' : '$hours hr $remainder min';
+  }
+
+  Future<void> _handleEventAction(
+      Map<String, dynamic> item, String action) async {
+    final eventId = item['event_id']?.toString();
+    if (eventId == null) return;
+    if (action.startsWith('priority_')) {
+      await _triageEvent(
+          eventId, priority: action.replaceFirst('priority_', ''));
+    } else if (action == 'flag') {
+      await _flagEvent(item);
+    } else if (action == 'unflag') {
+      await _triageEvent(eventId, flagged: false, flagReason: '');
+    } else {
+      await _assignEvent(eventId, action);
+    }
+  }
+
+  Future<void> _flagEvent(Map<String, dynamic> item) async {
+    final eventId = item['event_id']?.toString();
+    if (eventId == null) return;
+    final reason = TextEditingController();
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Flag event for review'),
+        content: TextField(
+          controller: reason,
+          autofocus: true,
+          minLines: 2,
+          maxLines: 4,
+          decoration: const InputDecoration(
+              hintText: 'Optional: why should this be reviewed?'),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Flag')),
+        ],
+      ),
+    );
+    if (confirm == true) {
+      await _triageEvent(
+          eventId, flagged: true, flagReason: reason.text.trim());
+    }
+    reason.dispose();
+  }
+
+  Future<void> _triageEvent(String eventId,
+      {String? priority, bool? flagged, String? flagReason}) async {
+    try {
+      final body = <String, dynamic>{
+        if (priority != null) 'priority': priority,
+        if (flagged != null) 'flagged': flagged,
+        if (flagReason != null) 'flag_reason': flagReason,
+      };
+      final response = await http
+          .patch(
+            Uri.parse('${widget.apiBase}/memory/events/$eventId'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode(body),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (response.statusCode == 200) {
+        await _load();
+      } else {
+        _snack('Could not update event: HTTP ${response.statusCode}');
+      }
+    } catch (e) {
+      _snack('Could not update event: $e');
+    }
   }
 
   Widget _noteCard(Map<String, dynamic> it, String text) {

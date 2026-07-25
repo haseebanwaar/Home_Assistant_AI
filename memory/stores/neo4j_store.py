@@ -33,6 +33,7 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT conversation_id IF NOT EXISTS FOR (c:Conversation) REQUIRE c.conversation_id IS UNIQUE",
     "CREATE CONSTRAINT assistant_message_id IF NOT EXISTS FOR (m:AssistantMessage) REQUIRE m.message_id IS UNIQUE",
     "CREATE CONSTRAINT focus_session_id IF NOT EXISTS FOR (f:FocusSession) REQUIRE f.focus_id IS UNIQUE",
+    "CREATE CONSTRAINT nudge_id IF NOT EXISTS FOR (n:Nudge) REQUIRE n.nudge_id IS UNIQUE",
 ]
 
 # Secondary indexes for span-aware and lookup queries.
@@ -41,6 +42,7 @@ INDEXES = [
     "CREATE INDEX session_activity IF NOT EXISTS FOR (s:Session) ON (s.activity_type)",
     "CREATE INDEX session_project IF NOT EXISTS FOR (s:Session) ON (s.project_id)",
     "CREATE INDEX entity_name IF NOT EXISTS FOR (n:Entity) ON (n.name)",
+    "CREATE INDEX nudge_ts IF NOT EXISTS FOR (n:Nudge) ON (n.ts)",
 ]
 
 
@@ -51,6 +53,9 @@ class Neo4jStore:
         self.password = password or os.getenv("NEO4J_PASSWORD")
         self.database = database or os.getenv("NEO4J_DATABASE", "neo4j")
         self._driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
+        # alias entity_id -> canonical entity_id; read on every knowledge write,
+        # invalidated whenever an alias is recorded or removed.
+        self._alias_cache = None
 
     # -- lifecycle ---------------------------------------------------------
     def verify(self):
@@ -137,11 +142,18 @@ class Neo4jStore:
         is Step 12). MENTIONS carry {confidence, role, co_presence}; each claim
         gets a SUPPORTS evidence edge from its event. Idempotent via MERGE.
         """
+        aliases = self.entity_aliases()
+
         def _tx(tx):
             n_ent = n_claim = 0
             for it in items:
                 eid = it["event_id"]
                 for en in it.get("entities", []):
+                    canonical = aliases.get(en.get("entity_id"))
+                    if canonical:
+                        # Apply the user's past merge instead of re-creating the
+                        # entity they already told us was a duplicate.
+                        en = {**en, "entity_id": canonical}
                     tx.run(_MENTION_CYPHER, eid=eid, **en)
                     n_ent += 1
                 for cl in it.get("claims", []):
@@ -301,13 +313,85 @@ class Neo4jStore:
             correction_id=_uuid.uuid4().hex)
         return dict(rows[0]) if rows else None
 
+    def update_event_metadata(self, event_id, priority=None, flagged=None,
+                              flag_reason=None):
+        """Apply user triage without changing or deleting the event.
+
+        Priority is a durable override of the extractor-derived importance.
+        Flagging is independent so an important event can still be set aside
+        for later review.
+        """
+        allowed = {"high", "normal", "low"}
+        if priority is not None and priority not in allowed:
+            raise ValueError("priority must be high, normal, or low")
+        set_flag_reason = flag_reason is not None
+        rows = self.run(
+            _UPDATE_EVENT_METADATA_CYPHER,
+            event_id=event_id,
+            set_priority=priority is not None,
+            priority=priority,
+            set_flagged=flagged is not None,
+            flagged=bool(flagged) if flagged is not None else False,
+            set_flag_reason=set_flag_reason,
+            flag_reason=(str(flag_reason).strip() if set_flag_reason else None),
+        )
+        return dict(rows[0]) if rows else None
+
+    # -- Entity aliases (corrections that persist) -------------------------
+    def entity_aliases(self, limit=1000):
+        """alias entity_id -> canonical entity_id, from user merges and renames.
+
+        Cached because this is read on every knowledge write; the cache is
+        cleared whenever an alias is recorded or removed.
+        """
+        if self._alias_cache is None:
+            try:
+                self._alias_cache = {
+                    row["alias_id"]: row["canonical_id"]
+                    for row in self.run(_LIST_ALIASES_CYPHER, limit=limit)}
+            except Exception as exc:
+                logger.warning("loading entity aliases failed: %s", exc)
+                return {}
+        return self._alias_cache
+
+    def list_entity_aliases(self, limit=200):
+        return [dict(row) for row in self.run(_LIST_ALIASES_CYPHER, limit=limit)]
+
+    def record_entity_alias(self, alias_id, canonical_id, name=None, source="manual"):
+        alias_id, canonical_id = self._norm(alias_id), self._norm(canonical_id)
+        if not alias_id or not canonical_id or alias_id == canonical_id:
+            return None
+        self.run(_RECORD_ALIAS_CYPHER, alias_id=alias_id,
+                 canonical_id=canonical_id, name=name or alias_id, source=source)
+        self._alias_cache = None
+        return {"alias_id": alias_id, "canonical_id": canonical_id}
+
+    def delete_entity_alias(self, alias_id):
+        rows = self.run(_DELETE_ALIAS_CYPHER, alias_id=self._norm(alias_id))
+        self._alias_cache = None
+        return bool(rows)
+
+    def canonical_name_hints(self, limit=20):
+        """[(wrong_name, canonical_name)] pairs to steer the extractor's naming."""
+        return [(row["wrong_name"], row["canonical_name"])
+                for row in self.run(_CANONICAL_NAMES_CYPHER, limit=limit)]
+
     def update_entity(self, entity_id, name=None, entity_type=None):
         import uuid as _uuid
+        entity_id = self._norm(entity_id)
         rows = self.run(
-            _UPDATE_ENTITY_CYPHER, entity_id=self._norm(entity_id),
+            _UPDATE_ENTITY_CYPHER, entity_id=entity_id,
             name=name, entity_type=entity_type,
             correction_id=_uuid.uuid4().hex)
-        return dict(rows[0]) if rows else None
+        if not rows:
+            return None
+        # A rename leaves entity_id (the normalized ORIGINAL name) untouched, so
+        # the next capture emitting the corrected name would normalize to a new
+        # id and silently fork the entity. Alias the new spelling back to it.
+        if name:
+            self.record_entity_alias(self._norm(name), entity_id,
+                                     name=name, source="rename")
+        return dict(rows[0])
 
     def merge_entities(self, source_id, target_id):
         """Merge one entity into another while preserving mention evidence."""
@@ -319,7 +403,8 @@ class Neo4jStore:
             nodes = list(tx.run(
                 "MATCH (source:Entity {entity_id: $source_id}), "
                 "(target:Entity {entity_id: $target_id}) "
-                "RETURN source.entity_id AS source, target.entity_id AS target",
+                "RETURN source.entity_id AS source, target.entity_id AS target, "
+                "source.name AS source_name",
                 source_id=source_id, target_id=target_id))
             if not nodes:
                 return None
@@ -330,13 +415,22 @@ class Neo4jStore:
                        event_id=mention["event_id"],
                        confidence=mention["confidence"], role=mention["role"],
                        co_presence=mention["co_presence"])
+            source_name = nodes[0].get("source_name") or source_id
+            # Remember the merge BEFORE deleting, so future captures that emit
+            # the old name are folded into the target instead of resurrecting it.
+            tx.run(_RECORD_ALIAS_CYPHER, alias_id=source_id,
+                   canonical_id=target_id, name=source_name, source="merge")
+            tx.run(_REPOINT_ALIASES_CYPHER, old_canonical_id=source_id,
+                   canonical_id=target_id)
             tx.run("MATCH (source:Entity {entity_id: $source_id}) DETACH DELETE source",
                    source_id=source_id)
             return {"source_id": source_id, "target_id": target_id,
-                    "moved_mentions": len(mentions)}
+                    "moved_mentions": len(mentions), "alias_recorded": True}
 
         with self._driver.session(database=self.database) as session:
-            return session.execute_write(_tx)
+            result = session.execute_write(_tx)
+        self._alias_cache = None  # a merge changed the mapping
+        return result
 
     def split_entity(self, source_id, new_entity_id, name, entity_type, event_ids):
         """Move selected event mentions from an entity into a new entity."""
@@ -354,6 +448,9 @@ class Neo4jStore:
                 return None
             tx.run(_CREATE_SPLIT_ENTITY_CYPHER, entity_id=new_entity_id,
                    name=name, entity_type=entity_type)
+            # A split is the inverse of a merge: drop any alias that would fold
+            # this name straight back into the entity it was just separated from.
+            tx.run(_DELETE_ALIAS_CYPHER, alias_id=new_entity_id)
             moved = 0
             for event_id in event_ids:
                 rows = list(tx.run(
@@ -364,7 +461,9 @@ class Neo4jStore:
                     "moved_mentions": moved}
 
         with self._driver.session(database=self.database) as session:
-            return session.execute_write(_tx)
+            result = session.execute_write(_tx)
+        self._alias_cache = None  # a split may have removed an alias
+        return result
 
     def update_claim(self, claim_id, text):
         import uuid as _uuid
@@ -507,6 +606,110 @@ class Neo4jStore:
                  events=result["metrics"].get("events") or 0,
                  active_seconds=result["metrics"].get("active_seconds") or 0)
         return result
+
+    # -- Project arc -------------------------------------------------------
+    def room_weekly(self, room_id, start, end):
+        """Per-week activity buckets for a room (weeks start Monday)."""
+        return [dict(row) for row in self.run(
+            _ROOM_WEEKLY_CYPHER, room_id=room_id, start=start, end=end)]
+
+    def room_week_highlights(self, room_id, start, end, limit=5):
+        rows = self.run(_ROOM_WEEK_HIGHLIGHTS_CYPHER, room_id=room_id,
+                        start=start, end=end, limit=int(limit))
+        if not rows:
+            return {"claims": [], "summaries": []}
+        row = dict(rows[0])
+        return {"claims": [c for c in (row.get("claims") or []) if c],
+                "summaries": [s for s in (row.get("summaries") or []) if s]}
+
+    def room_week_entities(self, room_id, start, end, limit=8):
+        return [dict(row) for row in self.run(
+            _ROOM_WEEK_ENTITIES_CYPHER, room_id=room_id, start=start,
+            end=end, limit=int(limit))]
+
+    # -- Room hygiene ------------------------------------------------------
+    def room_stats(self):
+        """Per-room activity counts, used to spot stale and thin rooms."""
+        return [dict(row) for row in self.run(_ROOM_STATS_CYPHER)]
+
+    def room_overlap(self, min_shared=3, min_overlap=0.5, limit=20):
+        """Room pairs that look like the same topic, by shared entities."""
+        return [dict(row) for row in self.run(
+            _ROOM_OVERLAP_CYPHER, min_shared=int(min_shared),
+            min_overlap=float(min_overlap), limit=max(1, min(int(limit), 100)))]
+
+    def merge_rooms(self, source_id, target_id):
+        """Move a room's events/notes/chat into another, then archive the source."""
+        import time as _time
+        if source_id == target_id:
+            raise ValueError("source and target must differ")
+        rows = self.run(_MERGE_ROOMS_CYPHER, source_id=source_id,
+                        target_id=target_id, now=_time.time())
+        if not rows:
+            return None
+        result = dict(rows[0])
+        result["source_room_id"] = source_id
+        return result
+
+    def promote_room(self, room_id, name=None, pinned=None):
+        """Turn an auto room into a user-owned topic room (hygiene leaves it alone)."""
+        import time as _time
+        rows = self.run(_PROMOTE_ROOM_CYPHER, room_id=room_id, name=name,
+                        pinned=pinned, now=_time.time())
+        return dict(rows[0]) if rows else None
+
+    def archive_rooms(self, room_ids):
+        import time as _time
+        ids = [r for r in (room_ids or []) if r]
+        if not ids:
+            return []
+        return [row["room_id"] for row in self.run(
+            _ARCHIVE_ROOMS_CYPHER, room_ids=ids, now=_time.time())]
+
+    # -- Proactive nudges --------------------------------------------------
+    def record_nudge(self, text, kind="insight", focus_id=None, evidence=None):
+        """Persist a spoken nudge so the user's reaction to it can be learned from."""
+        import json as _json
+        import time as _time
+        import uuid as _uuid
+        nudge_id = _uuid.uuid4().hex
+        self.run(_RECORD_NUDGE_CYPHER, nudge_id=nudge_id, text=text, kind=kind,
+                 focus_id=focus_id, evidence_json=_json.dumps(evidence or []),
+                 ts=_time.time())
+        return nudge_id
+
+    def set_nudge_feedback(self, nudge_id, feedback):
+        import time as _time
+        rows = self.run(_NUDGE_FEEDBACK_CYPHER, nudge_id=nudge_id,
+                        feedback=feedback, ts=_time.time())
+        return dict(rows[0]) if rows else None
+
+    def recent_nudge_feedback(self, limit=8):
+        """Nudges the user reacted to — the narrator's restraint signal."""
+        return [dict(row) for row in self.run(
+            _NUDGE_FEEDBACK_HISTORY_CYPHER, limit=max(1, min(int(limit), 50)))]
+
+    def list_nudges(self, limit=50):
+        return [dict(row) for row in self.run(
+            _LIST_NUDGES_CYPHER, limit=max(1, min(int(limit), 200)))]
+
+    def get_focus_session(self, focus_id):
+        rows = self.run(_GET_FOCUS_CYPHER, focus_id=focus_id)
+        return dict(rows[0]) if rows else None
+
+    def focus_events(self, start, end, room_id=None, limit=200):
+        """Events overlapping a focus window (the recap's raw material)."""
+        return [dict(row) for row in self.run(
+            _FOCUS_EVENTS_CYPHER, start=start, end=end, room_id=room_id,
+            limit=max(1, min(int(limit), 500)))]
+
+    def save_focus_recap(self, focus_id, recap, breakdown):
+        rows = self.run(
+            _SAVE_FOCUS_RECAP_CYPHER, focus_id=focus_id, recap=recap,
+            on_task_pct=breakdown.get("on_task_pct"),
+            on_task_minutes=breakdown.get("on_task_minutes"),
+            off_task_minutes=breakdown.get("off_task_minutes"))
+        return bool(rows)
 
     # -- Rooms (Phase 1) ---------------------------------------------------
     def _load_rooms(self):
@@ -720,8 +923,16 @@ class Neo4jStore:
 
     def room_context(self, room_id, event_limit=8, note_limit=8, entity_limit=15):
         """Grounding for room-scoped chat: recent events, notes, and top entities."""
-        events = [r["summary"] for r in self.run(
-            _ROOM_FEED_CYPHER, room_id=room_id, limit=event_limit) if r.get("summary")]
+        event_rows = self.run(
+            _ROOM_FEED_CYPHER, room_id=room_id, limit=event_limit * 4)
+        # User triage should improve the assistant too: low-priority noise and
+        # items set aside for review do not consume the small grounding window.
+        events = [
+            row["summary"] for row in event_rows
+            if row.get("summary")
+            and row.get("priority", "normal") != "low"
+            and not row.get("flagged")
+        ][:event_limit]
         notes = [r["text"] for r in self.run(
             _ROOM_NOTES_CYPHER, room_id=room_id, limit=note_limit)]
         entities = [r["name"] for r in self.run(
@@ -729,7 +940,7 @@ class Neo4jStore:
         return {"events": events, "notes": notes, "entities": entities}
 
     def room_feed_full(self, room_id, date_str=None, limit=200, offset=0,
-                       kinds=None, query=None):
+                       kinds=None, query=None, priorities=None, flagged=None):
         """Merged, time-ordered feed: events + notes + chat messages (newest first)."""
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
@@ -741,7 +952,13 @@ class Neo4jStore:
                   "assignment": e.get("assignment"), "manual": e.get("manual"),
                   "ts": e["span_start"], "text": e.get("summary"),
                   "span_end": e.get("span_end"), "activity_type": e.get("activity_type"),
-                  "application": e.get("application")} for e in events]
+                  "application": e.get("application"),
+                  "importance": e.get("importance"),
+                  "confidence": e.get("confidence"),
+                  "priority": e.get("priority") or "normal",
+                  "priority_source": e.get("priority_source") or "automatic",
+                  "flagged": bool(e.get("flagged")),
+                  "flag_reason": e.get("flag_reason")} for e in events]
         for n in self.run(_ROOM_NOTES_CYPHER, room_id=room_id, limit=fetch_limit):
             items.append({"kind": "note", "note_id": n["note_id"],
                           "ts": n["ts"], "text": n["text"]})
@@ -758,6 +975,15 @@ class Neo4jStore:
         if query:
             needle = query.casefold()
             items = [item for item in items if needle in (item.get("text") or "").casefold()]
+        if priorities:
+            allowed_priorities = set(priorities)
+            items = [item for item in items
+                     if item["kind"] != "event"
+                     or item.get("priority", "normal") in allowed_priorities]
+        if flagged is not None:
+            items = [item for item in items
+                     if item["kind"] != "event"
+                     or bool(item.get("flagged")) == bool(flagged)]
         return items[offset:offset + limit]
 
     def room_feed(self, room_id, date_str=None, limit=200):
@@ -913,6 +1139,8 @@ def _event_params(e):
         "span_seconds": e.get("span_seconds"),
         "boundary_label": e.get("boundary_label"),
         "summary": e.get("summary"),
+        "importance": e.get("importance", 0.5),
+        "confidence": e.get("confidence", 0.5),
     }
 
 
@@ -959,7 +1187,9 @@ SET e.activity_type = $activity_type,
     e.span_end = $span_end,
     e.span_seconds = $span_seconds,
     e.boundary_label = $boundary_label,
-    e.summary = $summary
+    e.summary = $summary,
+    e.importance = $importance,
+    e.confidence = $confidence
 WITH e
 MATCH (s:Session {session_id: $sid})
 MERGE (s)-[:HAS_EVENT]->(e)
@@ -1168,7 +1398,15 @@ RETURN e.event_id AS event_id, e.summary AS summary,
        e.application AS application, e.activity_type AS activity_type,
        e.project_id AS project_id, e.span_start AS span_start,
        e.span_end AS span_end, e.span_seconds AS span_seconds,
-       e.boundary_label AS boundary_label, s.session_id AS session_id
+       e.boundary_label AS boundary_label, s.session_id AS session_id,
+       coalesce(e.importance, 0.5) AS importance,
+       coalesce(e.confidence, 0.5) AS confidence,
+       coalesce(e.user_priority,
+         CASE WHEN coalesce(e.importance, 0.5) >= 0.75 THEN 'high'
+              WHEN coalesce(e.importance, 0.5) < 0.3 THEN 'low'
+              ELSE 'normal' END) AS priority,
+       CASE WHEN e.user_priority IS NULL THEN 'automatic' ELSE 'user' END AS priority_source,
+       coalesce(e.flagged, false) AS flagged, e.flag_reason AS flag_reason
 """
 
 _EVENT_DETAIL_ENTITIES_CYPHER = """
@@ -1204,6 +1442,25 @@ RETURN e.event_id AS event_id, e.summary AS summary,
        e.original_summary AS original_summary, e.corrected_at AS corrected_at
 """
 
+_UPDATE_EVENT_METADATA_CYPHER = """
+MATCH (e:Event {event_id: $event_id})
+SET e.user_priority =
+      CASE WHEN $set_priority THEN $priority ELSE e.user_priority END,
+    e.flagged =
+      CASE WHEN $set_flagged THEN $flagged ELSE coalesce(e.flagged, false) END,
+    e.flag_reason =
+      CASE WHEN $set_flag_reason THEN $flag_reason ELSE e.flag_reason END,
+    e.reviewed_at = timestamp()
+RETURN e.event_id AS event_id,
+       coalesce(e.user_priority,
+         CASE WHEN coalesce(e.importance, 0.5) >= 0.75 THEN 'high'
+              WHEN coalesce(e.importance, 0.5) < 0.3 THEN 'low'
+              ELSE 'normal' END) AS priority,
+       CASE WHEN e.user_priority IS NULL THEN 'automatic' ELSE 'user' END AS priority_source,
+       coalesce(e.flagged, false) AS flagged, e.flag_reason AS flag_reason,
+       e.reviewed_at AS reviewed_at
+"""
+
 _UPDATE_ENTITY_CYPHER = """
 MATCH (n:Entity {entity_id: $entity_id})
 CREATE (c:MemoryCorrection {
@@ -1221,6 +1478,46 @@ _ENTITY_MENTIONS_FOR_MERGE_CYPHER = """
 MATCH (e:Event)-[m:MENTIONS]->(:Entity {entity_id: $source_id})
 RETURN e.event_id AS event_id, m.confidence AS confidence,
        m.role AS role, m.co_presence AS co_presence
+"""
+
+# A merge deletes the source entity, so without this the next capture simply
+# recreates it and the user's correction is undone. The alias survives the node
+# and is applied to every later write — that is what makes curation stick.
+_RECORD_ALIAS_CYPHER = """
+MERGE (a:EntityAlias {alias_id: $alias_id})
+SET a.canonical_id = $canonical_id, a.name = $name,
+    a.source = $source, a.created_at = timestamp()
+"""
+
+# Aliases that pointed at the merged-away entity must follow it to the new
+# canonical, or a two-step merge (A->B, B->C) would strand A at a dead node.
+_REPOINT_ALIASES_CYPHER = """
+MATCH (a:EntityAlias {canonical_id: $old_canonical_id})
+SET a.canonical_id = $canonical_id
+"""
+
+_LIST_ALIASES_CYPHER = """
+MATCH (a:EntityAlias)
+WHERE a.alias_id <> a.canonical_id
+RETURN a.alias_id AS alias_id, a.canonical_id AS canonical_id,
+       a.name AS name, a.source AS source
+ORDER BY a.created_at DESC
+LIMIT $limit
+"""
+
+_CANONICAL_NAMES_CYPHER = """
+MATCH (a:EntityAlias)
+WHERE a.alias_id <> a.canonical_id
+MATCH (n:Entity {entity_id: a.canonical_id})
+RETURN DISTINCT a.name AS wrong_name, n.name AS canonical_name
+ORDER BY canonical_name
+LIMIT $limit
+"""
+
+_DELETE_ALIAS_CYPHER = """
+MATCH (a:EntityAlias {alias_id: $alias_id})
+DELETE a
+RETURN $alias_id AS alias_id
 """
 
 _MERGE_ENTITY_MENTION_CYPHER = """
@@ -1444,6 +1741,188 @@ SET f.ended_at = $ended_at, f.events = $events,
     f.active_seconds = $active_seconds
 """
 
+# -- Project arc ----------------------------------------------------------
+# Everything else here is day-scoped, so the payoff of long-term memory is
+# invisible: you can see today in detail but not how a project actually went
+# over a month. These bucket a room's activity into weeks.
+
+_ROOM_WEEKLY_CYPHER = """
+MATCH (r:Room {room_id: $room_id})-[:CONTAINS]->(e:Event)
+WHERE e.span_start >= $start AND e.span_start < $end
+WITH e, date(datetime({epochSeconds: toInteger(e.span_start)})) AS day
+WITH e, day, day - duration({days: day.dayOfWeek - 1}) AS week_start
+RETURN toString(week_start) AS week_start,
+       count(DISTINCT e) AS events,
+       round(sum(coalesce(e.span_end, 0) - coalesce(e.span_start, 0)) / 60.0) AS active_minutes,
+       count(DISTINCT date(datetime({epochSeconds: toInteger(e.span_start)}))) AS active_days,
+       collect(DISTINCT e.application)[0..5] AS applications
+ORDER BY week_start
+"""
+
+_ROOM_WEEK_HIGHLIGHTS_CYPHER = """
+MATCH (r:Room {room_id: $room_id})-[:CONTAINS]->(e:Event)
+WHERE e.span_start >= $start AND e.span_start < $end
+OPTIONAL MATCH (e)-[:SUPPORTS]->(c:Claim)
+WITH e, c
+ORDER BY c.confidence DESC
+RETURN collect(DISTINCT c.text)[0..$limit] AS claims,
+       collect(DISTINCT e.summary)[0..$limit] AS summaries
+"""
+
+_ROOM_WEEK_ENTITIES_CYPHER = """
+MATCH (r:Room {room_id: $room_id})-[:CONTAINS]->(e:Event)-[:MENTIONS]->(n:Entity)
+WHERE e.span_start >= $start AND e.span_start < $end
+RETURN n.name AS name, n.type AS type, count(DISTINCT e) AS mentions
+ORDER BY mentions DESC
+LIMIT $limit
+"""
+
+# -- Room hygiene ---------------------------------------------------------
+# Auto-created project/activity rooms accumulate forever (one per project name
+# ever seen), so the Rooms screen — the primary UX — silently fills with one-off
+# folders. These queries surface the junk instead of hiding it.
+
+_ROOM_STATS_CYPHER = """
+MATCH (r:Room)
+WHERE NOT coalesce(r.archived, false) AND r.kind <> 'daily'
+OPTIONAL MATCH (r)-[:CONTAINS]->(e:Event)
+OPTIONAL MATCH (r)-[:HAS_NOTE]->(n:RoomNote)
+OPTIONAL MATCH (r)-[:HAS_MESSAGE]->(m:RoomMessage)
+WITH r,
+     count(DISTINCT e) AS events,
+     count(DISTINCT n) AS notes,
+     count(DISTINCT m) AS messages,
+     max(e.span_end) AS last_event_at,
+     sum(coalesce(e.span_end, 0) - coalesce(e.span_start, 0)) AS active_seconds
+RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind,
+       coalesce(r.auto, true) AS auto, coalesce(r.pinned, false) AS pinned,
+       events, notes, messages, last_event_at,
+       round(coalesce(active_seconds, 0) / 60.0) AS active_minutes
+ORDER BY events DESC
+"""
+
+# Overlap is measured on entities rather than names: two rooms about the same
+# work share what was seen in them even when the folders were named differently.
+_ROOM_OVERLAP_CYPHER = """
+MATCH (a:Room)-[:CONTAINS]->(:Event)-[:MENTIONS]->(n:Entity)<-[:MENTIONS]-(:Event)<-[:CONTAINS]-(b:Room)
+WHERE a.room_id < b.room_id
+  AND NOT coalesce(a.archived, false) AND NOT coalesce(b.archived, false)
+  AND a.kind <> 'daily' AND b.kind <> 'daily'
+WITH a, b, count(DISTINCT n) AS shared
+WHERE shared >= $min_shared
+MATCH (a)-[:CONTAINS]->(:Event)-[:MENTIONS]->(na:Entity)
+WITH a, b, shared, count(DISTINCT na) AS a_total
+MATCH (b)-[:CONTAINS]->(:Event)-[:MENTIONS]->(nb:Entity)
+WITH a, b, shared, a_total, count(DISTINCT nb) AS b_total
+WITH a, b, shared, a_total, b_total,
+     toFloat(shared) / CASE WHEN a_total < b_total THEN a_total ELSE b_total END AS overlap
+WHERE overlap >= $min_overlap
+RETURN a.room_id AS room_a, a.name AS name_a, b.room_id AS room_b,
+       b.name AS name_b, shared, round(overlap * 100) AS overlap_pct
+ORDER BY overlap DESC, shared DESC
+LIMIT $limit
+"""
+
+_MERGE_ROOMS_CYPHER = """
+MATCH (source:Room {room_id: $source_id}), (target:Room {room_id: $target_id})
+OPTIONAL MATCH (source)-[c:CONTAINS]->(e:Event)
+FOREACH (_ IN CASE WHEN e IS NULL THEN [] ELSE [1] END |
+  MERGE (target)-[:CONTAINS]->(e))
+WITH source, target, count(DISTINCT e) AS moved_events
+OPTIONAL MATCH (source)-[:HAS_NOTE]->(n:RoomNote)
+FOREACH (_ IN CASE WHEN n IS NULL THEN [] ELSE [1] END |
+  MERGE (target)-[:HAS_NOTE]->(n))
+WITH source, target, moved_events, count(DISTINCT n) AS moved_notes
+OPTIONAL MATCH (source)-[:HAS_MESSAGE]->(m:RoomMessage)
+FOREACH (_ IN CASE WHEN m IS NULL THEN [] ELSE [1] END |
+  MERGE (target)-[:HAS_MESSAGE]->(m))
+WITH source, target, moved_events, moved_notes, count(DISTINCT m) AS moved_messages
+SET source.archived = true, source.merged_into = target.room_id,
+    source.updated_at = $now
+RETURN target.room_id AS room_id, moved_events, moved_notes, moved_messages
+"""
+
+# Promotion makes an auto room permanent: auto rooms are hygiene's to archive,
+# user rooms are not, so this is how the user says "keep this one".
+_PROMOTE_ROOM_CYPHER = """
+MATCH (r:Room {room_id: $room_id})
+SET r.auto = false, r.kind = 'topic', r.pinned = coalesce($pinned, r.pinned),
+    r.name = coalesce($name, r.name), r.updated_at = $now
+RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind,
+       r.auto AS auto, r.pinned AS pinned
+"""
+
+_ARCHIVE_ROOMS_CYPHER = """
+MATCH (r:Room)
+WHERE r.room_id IN $room_ids
+SET r.archived = true, r.updated_at = $now
+RETURN r.room_id AS room_id
+"""
+
+_RECORD_NUDGE_CYPHER = """
+CREATE (n:Nudge {
+  nudge_id: $nudge_id, text: $text, kind: $kind, focus_id: $focus_id,
+  evidence_json: $evidence_json, ts: $ts, feedback: null
+})
+RETURN n.nudge_id AS nudge_id
+"""
+
+_NUDGE_FEEDBACK_CYPHER = """
+MATCH (n:Nudge {nudge_id: $nudge_id})
+SET n.feedback = $feedback, n.feedback_ts = $ts
+RETURN n.nudge_id AS nudge_id, n.text AS text, n.feedback AS feedback
+"""
+
+# Only nudges the user actually reacted to are worth showing the model — an
+# ignored nudge is ambiguous (unseen? tolerated?), so it teaches nothing.
+_NUDGE_FEEDBACK_HISTORY_CYPHER = """
+MATCH (n:Nudge)
+WHERE n.feedback IS NOT NULL
+RETURN n.nudge_id AS nudge_id, n.text AS text, n.feedback AS feedback, n.ts AS ts
+ORDER BY n.ts DESC
+LIMIT $limit
+"""
+
+_LIST_NUDGES_CYPHER = """
+MATCH (n:Nudge)
+RETURN n.nudge_id AS nudge_id, n.text AS text, n.kind AS kind,
+       n.focus_id AS focus_id, n.feedback AS feedback, n.ts AS ts
+ORDER BY n.ts DESC
+LIMIT $limit
+"""
+
+_GET_FOCUS_CYPHER = """
+MATCH (f:FocusSession {focus_id: $focus_id})
+RETURN f.focus_id AS focus_id, f.goal AS goal, f.room_id AS room_id,
+       f.planned_minutes AS planned_minutes, f.started_at AS started_at,
+       f.ended_at AS ended_at, f.state AS state, f.events AS events,
+       f.active_seconds AS active_seconds, f.on_task_pct AS on_task_pct
+"""
+
+# Events attributed to a focus window by time overlap, so a recap can be built
+# for sessions that predate this feature and re-run as late events land.
+_FOCUS_EVENTS_CYPHER = """
+MATCH (e:Event)
+WHERE e.span_start < $end AND e.span_end > $start
+  AND coalesce(e.summary, '') <> ''
+OPTIONAL MATCH (r:Room)-[:CONTAINS]->(e)
+WITH e, collect(DISTINCT r.room_id) AS room_ids
+WHERE $room_id IS NULL OR $room_id IN room_ids
+RETURN e.event_id AS event_id, e.summary AS summary,
+       e.application AS application, e.activity_type AS activity_type,
+       e.project_id AS project_id,
+       e.span_start AS span_start, e.span_end AS span_end
+ORDER BY e.span_start
+LIMIT $limit
+"""
+
+_SAVE_FOCUS_RECAP_CYPHER = """
+MATCH (f:FocusSession {focus_id: $focus_id})
+SET f.recap = $recap, f.on_task_pct = $on_task_pct,
+    f.on_task_minutes = $on_task_minutes, f.off_task_minutes = $off_task_minutes
+RETURN f.focus_id AS focus_id
+"""
+
 _CONSOLIDATE_CYPHER = """
 MATCH (n:Entity)
 OPTIONAL MATCH (n)<-[m:MENTIONS]-(e:Event)
@@ -1513,7 +1992,15 @@ _ROOM_FEED_CYPHER = """
 MATCH (r:Room {room_id: $room_id})-[rel:CONTAINS]->(e:Event)
 RETURN e.event_id AS event_id, e.span_start AS span_start, e.span_end AS span_end,
        e.summary AS summary, e.activity_type AS activity_type,
-       e.application AS application, rel.assignment AS assignment, rel.manual AS manual
+       e.application AS application, rel.assignment AS assignment, rel.manual AS manual,
+       coalesce(e.importance, 0.5) AS importance,
+       coalesce(e.confidence, 0.5) AS confidence,
+       coalesce(e.user_priority,
+         CASE WHEN coalesce(e.importance, 0.5) >= 0.75 THEN 'high'
+              WHEN coalesce(e.importance, 0.5) < 0.3 THEN 'low'
+              ELSE 'normal' END) AS priority,
+       CASE WHEN e.user_priority IS NULL THEN 'automatic' ELSE 'user' END AS priority_source,
+       coalesce(e.flagged, false) AS flagged, e.flag_reason AS flag_reason
 ORDER BY e.span_start DESC
 LIMIT $limit
 """
@@ -1558,7 +2045,15 @@ MATCH (r:Room {room_id: $room_id})-[rel:CONTAINS]->(e:Event)
 WHERE e.span_start >= $start AND e.span_start < $end
 RETURN e.event_id AS event_id, e.span_start AS span_start, e.span_end AS span_end,
        e.summary AS summary, e.activity_type AS activity_type,
-       e.application AS application, rel.assignment AS assignment, rel.manual AS manual
+       e.application AS application, rel.assignment AS assignment, rel.manual AS manual,
+       coalesce(e.importance, 0.5) AS importance,
+       coalesce(e.confidence, 0.5) AS confidence,
+       coalesce(e.user_priority,
+         CASE WHEN coalesce(e.importance, 0.5) >= 0.75 THEN 'high'
+              WHEN coalesce(e.importance, 0.5) < 0.3 THEN 'low'
+              ELSE 'normal' END) AS priority,
+       CASE WHEN e.user_priority IS NULL THEN 'automatic' ELSE 'user' END AS priority_source,
+       coalesce(e.flagged, false) AS flagged, e.flag_reason AS flag_reason
 ORDER BY e.span_start DESC
 LIMIT $limit
 """

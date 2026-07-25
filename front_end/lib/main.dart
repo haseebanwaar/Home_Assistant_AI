@@ -9,10 +9,13 @@ import 'package:flutter/material.dart';
 import 'package:record/record.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'capture/frame_capture_controller.dart';
 import 'memory/timeline_screen.dart';
 import 'rooms/rooms_screen.dart';
 import 'assistant/assistant_screen.dart';
+import 'notifications/local_notification_controller.dart';
+import 'notifications/notifications_screen.dart';
 
 void main() => runApp(const HomeMindApp());
 
@@ -81,6 +84,7 @@ class MyApp extends StatefulWidget {
 }
 
 class _MyAppState extends State<MyApp> {
+  static const _defaultHomeHub = '100.89.9.84';
   static const _ink = Color(0xFF070B14);
   static const _panel = Color(0xFF111827);
   static const _panelRaised = Color(0xFF182235);
@@ -114,6 +118,17 @@ class _MyAppState extends State<MyApp> {
   // a backlog of stale insights.
   int _lastProactiveId = 0;
   bool _proactiveSynced = false;
+  bool _proactiveEnabled = true;
+  bool _proactiveVoiceEnabled = true;
+  bool _proactiveFeedEnabled = true;
+  bool _proactiveNotificationsEnabled = false;
+  bool _eventNotificationsEnabled = true;
+  bool _notificationsMuted = false;
+  bool _deliveryPreferencesLoaded = false;
+  final LocalNotificationController _notificationController =
+      LocalNotificationController();
+  int _lastNotificationSequence = 0;
+  int _unreadNotifications = 0;
 
   // Add these lines for the context selection
   final List<String> _contextOptions = ['talker', 'screen', 'camera'];
@@ -136,9 +151,12 @@ class _MyAppState extends State<MyApp> {
   @override
   void initState() {
     super.initState();
-    _ipTextController.text = '192.168.1.20'; // Set a default/last known IP
+    // The desktop's stable Tailscale address. A LAN IP or complete URL can
+    // still be entered when connecting in another environment.
+    _ipTextController.text = _defaultHomeHub;
     _setupAudioPlayerListener();
     _startService();
+    _loadDeliveryPreferences();
     _captureSub = _capture.status.listen((s) {
       if (mounted) setState(() => _captureStatus = s);
     });
@@ -146,7 +164,57 @@ class _MyAppState extends State<MyApp> {
     _statusTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       _pollBackendStatus();
       _fetchProactiveInsights();
+      _fetchNotifications();
     });
+  }
+
+  Future<void> _loadDeliveryPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _proactiveEnabled = prefs.getBool('proactive_enabled') ?? true;
+      _proactiveVoiceEnabled =
+          prefs.getBool('proactive_voice_enabled') ?? true;
+      _proactiveFeedEnabled = prefs.getBool('proactive_feed_enabled') ?? true;
+      _proactiveNotificationsEnabled =
+          prefs.getBool('proactive_notifications_enabled') ?? false;
+      _eventNotificationsEnabled =
+          prefs.getBool('event_notifications_enabled') ?? true;
+      _notificationsMuted = prefs.getBool('notifications_muted') ?? false;
+      _deliveryPreferencesLoaded = true;
+    });
+    await _syncNotificationMonitoring();
+  }
+
+  Future<void> _persistDeliveryPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    await Future.wait([
+      prefs.setBool('proactive_enabled', _proactiveEnabled),
+      prefs.setBool('proactive_voice_enabled', _proactiveVoiceEnabled),
+      prefs.setBool('proactive_feed_enabled', _proactiveFeedEnabled),
+      prefs.setBool(
+          'proactive_notifications_enabled', _proactiveNotificationsEnabled),
+      prefs.setBool('event_notifications_enabled', _eventNotificationsEnabled),
+      prefs.setBool('notifications_muted', _notificationsMuted),
+    ]);
+    await _syncNotificationMonitoring();
+  }
+
+  Future<void> _syncNotificationMonitoring() async {
+    if (!_deliveryPreferencesLoaded) return;
+    final events = !_notificationsMuted && _eventNotificationsEnabled;
+    final proactive = !_notificationsMuted &&
+        _proactiveEnabled &&
+        _proactiveNotificationsEnabled;
+    if (_apiBase.isEmpty || (!events && !proactive)) {
+      await _notificationController.stopMonitoring();
+      return;
+    }
+    await _notificationController.startMonitoring(
+      _apiBase,
+      eventNotifications: events,
+      proactiveNotifications: proactive,
+    );
   }
 
   @override
@@ -295,8 +363,7 @@ class _MyAppState extends State<MyApp> {
       await _audioPlayer.stop();
       _audioQueue.clear();
 
-      final endPoint = 'http://${_ipTextController.text}:8000/chat/audio';
-      final url = Uri.parse(endPoint);
+      final url = Uri.parse('$_apiBase/chat/audio');
 
       final Map<String, dynamic> requestBody = {
         'data': buff,
@@ -393,7 +460,21 @@ class _MyAppState extends State<MyApp> {
     }
     }
 
-  String get _apiBase => 'http://${_ipTextController.text.trim()}:8000';
+  String get _apiBase {
+    final value = _ipTextController.text.trim();
+    if (value.isEmpty) return '';
+
+    final hasScheme =
+        value.startsWith('http://') || value.startsWith('https://');
+    var uri = Uri.parse(hasScheme ? value : 'http://$value');
+
+    // Plain hostnames/IPs use the FastAPI development port. An HTTPS URL is
+    // left on its standard port so Tailscale Serve/Cloudflare also work.
+    if (!uri.hasPort && uri.scheme == 'http') {
+      uri = uri.replace(port: 8000);
+    }
+    return uri.toString().replaceFirst(RegExp(r'/$'), '');
+  }
 
   Future<void> _pollBackendStatus() async {
     if (_ipTextController.text.trim().isEmpty) return;
@@ -416,6 +497,7 @@ class _MyAppState extends State<MyApp> {
           _backendActivity = pipeline['active'] == true ? 'Backend: $stage' : stage;
         }
       });
+      await _syncNotificationMonitoring();
     } catch (_) {
       if (mounted) setState(() {
         _backendConnected = false;
@@ -478,14 +560,17 @@ class _MyAppState extends State<MyApp> {
         final id = (map['id'] as num?)?.toInt() ?? _lastProactiveId;
         if (id <= _lastProactiveId) continue;
         _lastProactiveId = id;
+        if (!_proactiveEnabled) continue;
 
         Uint8List? audio;
         final audioB64 = map['audio'];
-        if (audioB64 is String && audioB64.isNotEmpty) {
+        if ((_proactiveVoiceEnabled || _proactiveFeedEnabled) &&
+            audioB64 is String &&
+            audioB64.isNotEmpty) {
           audio = base64.decode(audioB64);
         }
 
-        if (mounted) {
+        if (mounted && _proactiveFeedEnabled) {
           setState(() {
             _chatHistory.add(ChatMessage(
               sender: MessageSender.assistant,
@@ -496,7 +581,7 @@ class _MyAppState extends State<MyApp> {
         }
 
         // Play on this device by enqueueing into the shared audio queue.
-        if (audio != null) {
+        if (_proactiveVoiceEnabled && audio != null) {
           _audioQueue.add(audio);
           if (!_isAudioPlaying) _playNextInQueue();
         }
@@ -504,6 +589,85 @@ class _MyAppState extends State<MyApp> {
     } catch (_) {
       // Transient/offline — connectivity is surfaced by the status poll.
     }
+  }
+
+  Future<void> _fetchNotifications() async {
+    if (_apiBase.isEmpty) return;
+    try {
+      final response = await http
+          .get(Uri.parse(
+              '$_apiBase/notifications?since=$_lastNotificationSequence&limit=50'))
+          .timeout(const Duration(seconds: 3));
+      if (response.statusCode != 200) return;
+      final data = json.decode(response.body) as Map<String, dynamic>;
+      final latest = (data['latest_sequence'] as num?)?.toInt() ?? 0;
+      if (mounted) {
+        setState(() {
+          _unreadNotifications =
+              (data['unread_count'] as num?)?.toInt() ?? 0;
+        });
+      }
+      // The native foreground monitor owns system notifications. Flutter only
+      // keeps the unread badge and inbox in sync.
+      _lastNotificationSequence = latest;
+    } catch (_) {
+      // The connection indicator already reports backend availability.
+    }
+  }
+
+  void _openNotifications() {
+    _openWorkspace(
+      4,
+      NotificationsScreen(
+        apiBase: _apiBase,
+        onUnreadChanged: (count) {
+          if (mounted) setState(() => _unreadNotifications = count);
+        },
+      ),
+    );
+  }
+
+  Widget _notificationButton() {
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        IconButton(
+          tooltip:
+              _notificationsMuted ? 'Notifications muted' : 'Notifications',
+          onPressed: _openNotifications,
+          style: IconButton.styleFrom(backgroundColor: _panel),
+          icon: Icon(
+            _notificationsMuted
+                ? Icons.notifications_off_outlined
+                : _unreadNotifications > 0
+                ? Icons.notifications_active_outlined
+                : Icons.notifications_none_outlined,
+            size: 20,
+          ),
+        ),
+        if (_unreadNotifications > 0)
+          Positioned(
+            right: -2,
+            top: -3,
+            child: Container(
+              constraints: const BoxConstraints(minWidth: 17, minHeight: 17),
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              decoration: const BoxDecoration(
+                color: Color(0xFFFF607C),
+                shape: BoxShape.circle,
+              ),
+              alignment: Alignment.center,
+              child: Text(
+                _unreadNotifications > 99 ? '99+' : '$_unreadNotifications',
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 8,
+                    fontWeight: FontWeight.w800),
+              ),
+            ),
+          ),
+      ],
+    );
   }
 
   Future<void> _setBackendCapture(bool start) async {
@@ -555,9 +719,8 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _startCapture() async {
-    final ip = _ipTextController.text.trim();
-    if (ip.isEmpty) {
-      _showSnack('Enter the server IP first');
+    if (_apiBase.isEmpty) {
+      _showSnack('Enter the home hub address first');
       return;
     }
     final ok = await _capture.ensurePermissions(_captureSource);
@@ -570,7 +733,7 @@ class _MyAppState extends State<MyApp> {
       await _capture.start(
         source: _captureSource,
         fps: _fps,
-        ip: ip,
+        apiBase: _apiBase,
         frontCamera: _frontCamera,
       );
       final index = _captureSource == CaptureSource.camera ? 2 : 1;
@@ -919,7 +1082,7 @@ class _MyAppState extends State<MyApp> {
         style: const TextStyle(fontSize: 13),
         decoration: InputDecoration(
           labelText: 'Home hub',
-          hintText: '192.168.1.20',
+          hintText: '100.x.y.z or https://hub.example.com',
           prefixIcon: const Icon(Icons.router_outlined, size: 19),
           suffixIcon: IconButton(
             tooltip: 'Reconnect',
@@ -1115,6 +1278,14 @@ class _MyAppState extends State<MyApp> {
               onTap: () =>
                   _openWorkspace(3, MemoryTimelineScreen(apiBase: _apiBase)),
             ),
+            _workspaceNavItem(
+              icon: Icons.notifications_none_outlined,
+              label: 'Notifications',
+              badge:
+                  _unreadNotifications > 0 ? '$_unreadNotifications' : null,
+              selected: _workspaceIndex == 4,
+              onTap: _openNotifications,
+            ),
             const Padding(
               padding: EdgeInsets.fromLTRB(21, 22, 20, 7),
               child: Text('SYSTEM',
@@ -1123,6 +1294,14 @@ class _MyAppState extends State<MyApp> {
                       fontSize: 9,
                       fontWeight: FontWeight.w700,
                       letterSpacing: 1.4)),
+            ),
+            _workspaceNavItem(
+              icon: _notificationsMuted
+                  ? Icons.notifications_off_outlined
+                  : Icons.record_voice_over_outlined,
+              label: 'Initiative & alerts',
+              badge: _notificationsMuted ? 'MUTED' : null,
+              onTap: _showInitiativeSheet,
             ),
             _workspaceNavItem(
               icon: Icons.center_focus_strong,
@@ -1202,6 +1381,8 @@ class _MyAppState extends State<MyApp> {
             ],
           ),
         ),
+        _notificationButton(),
+        const SizedBox(width: 8),
         _bodyTextarea(size),
       ],
     );
@@ -1266,6 +1447,189 @@ class _MyAppState extends State<MyApp> {
     );
   }
 
+  void _showInitiativeSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: _panel,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void update(VoidCallback change) {
+            setState(change);
+            setSheetState(() {});
+            _persistDeliveryPreferences();
+          }
+
+          Widget toggle({
+            required IconData icon,
+            required String title,
+            required String subtitle,
+            required bool value,
+            required ValueChanged<bool>? onChanged,
+          }) {
+            return SwitchListTile.adaptive(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+              secondary: Icon(icon,
+                  color: onChanged == null ? _muted.withValues(alpha: .45) : _mint),
+              title: Text(title,
+                  style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: onChanged == null ? _muted : Colors.white)),
+              subtitle: Text(subtitle,
+                  style: const TextStyle(color: _muted, fontSize: 10.5)),
+              value: value,
+              activeTrackColor: _mint,
+              onChanged: onChanged,
+            );
+          }
+
+          final proactiveControlsEnabled = _proactiveEnabled;
+          final notificationControlsEnabled = !_notificationsMuted;
+          return SafeArea(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(18, 10, 18, 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 38,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: _line,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  const Text('Initiative & alerts',
+                      style:
+                          TextStyle(fontSize: 19, fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 5),
+                  const Text(
+                    'Choose how HomeMind reaches you. These are delivery controls; '
+                    'the backend can continue observing and remembering.',
+                    style: TextStyle(color: _muted, fontSize: 11.5),
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    decoration: BoxDecoration(
+                      color: _panelRaised,
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: _line),
+                    ),
+                    child: Column(
+                      children: [
+                        toggle(
+                          icon: Icons.auto_awesome,
+                          title: 'Proactive assistant',
+                          subtitle:
+                              'Allow unprompted insights from screen, mobile, camera and memory context.',
+                          value: _proactiveEnabled,
+                          onChanged: (value) =>
+                              update(() => _proactiveEnabled = value),
+                        ),
+                        const Divider(height: 1, color: _line),
+                        toggle(
+                          icon: Icons.volume_up_outlined,
+                          title: 'Speak insights',
+                          subtitle: 'Play proactive insights aloud using TTS.',
+                          value: _proactiveVoiceEnabled,
+                          onChanged: proactiveControlsEnabled
+                              ? (value) => update(
+                                  () => _proactiveVoiceEnabled = value)
+                              : null,
+                        ),
+                        toggle(
+                          icon: Icons.chat_bubble_outline,
+                          title: 'Show in conversation',
+                          subtitle:
+                              'Add proactive insights to the Home conversation feed.',
+                          value: _proactiveFeedEnabled,
+                          onChanged: proactiveControlsEnabled
+                              ? (value) =>
+                                  update(() => _proactiveFeedEnabled = value)
+                              : null,
+                        ),
+                        toggle(
+                          icon: Icons.notification_add_outlined,
+                          title: 'Notify proactive insights',
+                          subtitle:
+                              'Deliver insights as Android system notifications, including in the background.',
+                          value: _proactiveNotificationsEnabled,
+                          onChanged:
+                              proactiveControlsEnabled && notificationControlsEnabled
+                                  ? (value) => update(() =>
+                                      _proactiveNotificationsEnabled = value)
+                                  : null,
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  const Padding(
+                    padding: EdgeInsets.only(left: 4, bottom: 7),
+                    child: Text('NOTIFICATIONS',
+                        style: TextStyle(
+                            color: _muted,
+                            fontSize: 9,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 1.3)),
+                  ),
+                  Container(
+                    decoration: BoxDecoration(
+                      color: _panelRaised,
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: _line),
+                    ),
+                    child: Column(
+                      children: [
+                        toggle(
+                          icon: Icons.notifications_active_outlined,
+                          title: 'Home event alerts',
+                          subtitle:
+                              'Notify critical and important safety, security and activity events.',
+                          value: _eventNotificationsEnabled,
+                          onChanged: notificationControlsEnabled
+                              ? (value) => update(
+                                  () => _eventNotificationsEnabled = value)
+                              : null,
+                        ),
+                        const Divider(height: 1, color: _line),
+                        toggle(
+                          icon: Icons.notifications_off_outlined,
+                          title: 'Mute all notifications',
+                          subtitle:
+                              'Stops system notifications. Voice and the in-app feed remain available.',
+                          value: _notificationsMuted,
+                          onChanged: (value) =>
+                              update(() => _notificationsMuted = value),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (!_notificationController.isSupported) ...[
+                    const SizedBox(height: 12),
+                    const Text(
+                      'System notification delivery is currently available on Android. '
+                      'Voice and the in-app feed work on other platforms.',
+                      style: TextStyle(color: _muted, fontSize: 10.5),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Widget _buildMobileHeader() {
     return Row(
       children: [
@@ -1297,6 +1661,8 @@ class _MyAppState extends State<MyApp> {
             ],
           ),
         ),
+        _notificationButton(),
+        const SizedBox(width: 5),
         IconButton(
           tooltip: 'Home hub settings',
           onPressed: _showConnectionSheet,
@@ -1831,6 +2197,16 @@ class _MyAppState extends State<MyApp> {
             break;
           case 3:
             workspace = MemoryTimelineScreen(apiBase: _apiBase);
+            break;
+          case 4:
+            workspace = NotificationsScreen(
+              apiBase: _apiBase,
+              onUnreadChanged: (count) {
+                if (mounted) {
+                  setState(() => _unreadNotifications = count);
+                }
+              },
+            );
             break;
           default:
             workspace = home;

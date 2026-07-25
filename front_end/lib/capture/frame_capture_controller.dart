@@ -82,7 +82,8 @@ class FrameCaptureController {
   }
 
   /// Full endpoint the native side POSTs each JPEG frame to.
-  static String endpointFor(String ip) => 'http://$ip:8000/capture/frame';
+  static String endpointFor(String apiBase) =>
+      '${apiBase.replaceFirst(RegExp(r'/+$'), '')}/capture/frame';
 
   /// Ensure the runtime permissions needed for [source] are granted.
   /// Returns true if capture can proceed.
@@ -102,18 +103,18 @@ class FrameCaptureController {
     }
   }
 
-  /// Start capturing from [source] at [fps], POSTing frames to [ip]'s endpoint.
+  /// Start capturing from [source] at [fps], POSTing frames to [apiBase].
   Future<void> start({
     required CaptureSource source,
     required int fps,
-    required String ip,
+    required String apiBase,
     bool frontCamera = false,
   }) async {
     if (!_supported) return;
     await _method.invokeMethod('start', {
       'source': source == CaptureSource.screen ? 'screen' : 'camera',
       'fps': fps.clamp(1, 60),
-      'url': endpointFor(ip),
+      'url': endpointFor(apiBase),
       'lens': frontCamera ? 'front' : 'back',
     });
   }

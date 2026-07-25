@@ -33,7 +33,7 @@ logger = logging.getLogger("home_assistant")
 class MemoryPipeline:
     def __init__(self, id_strategy="counter", expected_seconds=60.0,
                  neo4j_store=None, activity_logger=None, jsonl=False,
-                 log_context="screen"):
+                 log_context="screen", notification_sink=None):
         self.manager = SessionManager(id_strategy=id_strategy)
         self.expected_seconds = expected_seconds
         self.neo4j = neo4j_store
@@ -41,13 +41,39 @@ class MemoryPipeline:
         self.jsonl = jsonl  # rewrite data/debug/sessions.jsonl + events.jsonl live
         # Qdrant context label for events from this pipeline ("screen"/"camera").
         self.log_context = log_context
+        self.notification_sink = notification_sink
 
         self._prev_ctx = None
         self._prev_frame = None
+        # Naming corrections fed back into the extraction prompt. Cached with a
+        # TTL so the capture loop doesn't hit the graph on every batch.
+        self._naming_hints = []
+        self._naming_hints_at = 0.0
+        self.naming_hints_ttl = 300.0
         # Per-event accumulators (event_id -> ...).
         self._ev_entities = {}   # -> {norm: rec}
         self._ev_claims = {}     # -> {claim_id: rec}
         self._ev_text = {}       # -> {"parts": [...], "profile": str}
+        self._ev_scored = set()  # events with at least one extractor score
+
+    def naming_hints(self):
+        """[(wrong_name, canonical_name)] the user has corrected before.
+
+        Fed into the extraction prompt so a merge/rename fixes future captures
+        instead of only repairing the ones already stored.
+        """
+        import time as _time
+        if self.neo4j is None:
+            return []
+        now = _time.time()
+        if now - self._naming_hints_at >= self.naming_hints_ttl:
+            self._naming_hints_at = now
+            try:
+                self._naming_hints = self.neo4j.canonical_name_hints(limit=20)
+            except Exception as exc:
+                logger.debug("naming hints unavailable: %s", exc)
+                self._naming_hints = []
+        return self._naming_hints
 
     # -- ingest ------------------------------------------------------------
     def ingest(self, batch):
@@ -81,8 +107,28 @@ class MemoryPipeline:
             application=app_of(ctx), project_id=project,
             boundary_label=label, summary=title_of(ctx),
         )
+        # Preserve the extractor's usefulness signal on the timeline event.
+        # Multiple observations can contribute to one event, so retain the
+        # strongest importance/confidence seen during that span.
+        try:
+            importance = float(ext.get("importance", 0.5))
+            confidence = float(ext.get("confidence", 0.5))
+            if result.current_event.event_id in self._ev_scored:
+                result.current_event.importance = max(
+                    result.current_event.importance, importance)
+                result.current_event.confidence = max(
+                    result.current_event.confidence, confidence)
+            else:
+                result.current_event.importance = importance
+                result.current_event.confidence = confidence
+                self._ev_scored.add(result.current_event.event_id)
+        except (TypeError, ValueError):
+            pass
 
         self._accumulate(result.current_event.event_id, ext, ctx)
+        event_text = self.event_texts().get(result.current_event.event_id, {}).get("text")
+        if event_text:
+            result.current_event.summary = event_text[-2000:]
 
         # Live incremental upsert (no-op sinks -> offline bulk mode).
         self._upsert(result)
@@ -163,8 +209,10 @@ class MemoryPipeline:
 
         txt = self._ev_text.setdefault(event_id, {"parts": [], "profile": None})
         s = (ext.get("summary") or "").strip()
-        if s:
+        if s and (not txt["parts"] or txt["parts"][-1] != s):
             txt["parts"].append(s)
+            # Keep long-running sessions useful without growing forever.
+            txt["parts"] = txt["parts"][-6:]
         txt["profile"] = txt["profile"] or ext.get("selected_profile") or profile_name(ctx)
 
     def _entities_for(self, event_id):
@@ -238,3 +286,14 @@ class MemoryPipeline:
         except Exception as exc:
             # Never let a store failure kill the capture loop.
             logger.warning("MemoryPipeline upsert failed (continuing): %s", exc)
+        if self.notification_sink is not None:
+            try:
+                info = self.event_texts().get(event.event_id, {})
+                self.notification_sink({
+                    **event.model_dump(),
+                    "summary": info.get("text") or event.summary,
+                    "source": self.log_context,
+                    "timestamp": event.span_end,
+                })
+            except Exception as exc:
+                logger.warning("Notification classification failed (continuing): %s", exc)
