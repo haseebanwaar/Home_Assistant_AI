@@ -5,10 +5,16 @@ a show's discussion, a coding project). Captured Events are auto-routed into roo
 by a RoomMatcher; user notes and room-scoped chat land here too (later phases).
 
 Kinds:
-- "activity" — auto, one per activity_type (Reading/Watching/Browsing/...)
-- "project"  — auto, one per coding project_id
+- "screen"   — auto, the single room for everything captured from the PC screen
+- "camera"   — auto, the single room for everything the home cameras see
 - "topic"    — user-defined (e.g. Scripture) with custom keyword/app matchers
 - "daily"    — the single catch-all room every event also flows into
+- "activity" / "project" — legacy auto kinds, one per activity_type / project_id.
+  No longer created; `Neo4jStore.consolidate_source_rooms()` folds them into the
+  two source rooms. Which app or camera an event came from is a tag on the event,
+  not a room of its own.
+
+Note that "camera" also marks the `home` memory domain in the graph queries.
 """
 from __future__ import annotations
 

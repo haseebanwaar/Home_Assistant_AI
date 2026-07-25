@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
+import '../voice/dictation_controller.dart';
+
 const _ink = Color(0xFF070B14);
 const _panel = Color(0xFF111827);
 const _panelRaised = Color(0xFF182235);
@@ -30,10 +32,18 @@ IconData _kindIcon(String kind, String name, [String? configured]) {
       return Icons.menu_book;
     case 'code':
       return Icons.code;
+    case 'videocam':
+      return Icons.videocam;
+    case 'desktop_windows':
+      return Icons.desktop_windows;
   }
   switch (kind) {
     case 'daily':
       return Icons.calendar_today;
+    case 'camera':
+      return Icons.videocam;
+    case 'screen':
+      return Icons.desktop_windows;
     case 'project':
       return Icons.folder_special;
     case 'topic':
@@ -432,6 +442,11 @@ class _RoomScreenState extends State<RoomScreen> {
   final TextEditingController _input = TextEditingController();
   final TextEditingController _search = TextEditingController();
   final ScrollController _scroll = ScrollController();
+  // Speaking into the composer: the transcript lands in _input so it can be
+  // corrected, and filed as either a note or a question like anything typed.
+  final DictationController _dictation = DictationController();
+  bool _listening = false;
+  bool _transcribing = false;
   bool _loading = false;
   bool _sending = false;
   String? _error;
@@ -442,6 +457,22 @@ class _RoomScreenState extends State<RoomScreen> {
   List<dynamic> _feed = []; // chronological (oldest -> newest)
 
   bool get _isDaily => widget.kind == 'daily';
+  bool get _isCameraRoom => widget.kind == 'camera';
+
+  /// The app or camera an event came from, as it should read on the bubble.
+  ///
+  /// Legacy camera events stored their id ('camera:192-168-1-4') as the
+  /// application; newer ones store the camera's name. Strip the prefix so both
+  /// read the same, and drop the '.exe' noise from Windows process names.
+  String _sourceTag(Map<String, dynamic> event) {
+    var value = (event['application'] ?? '').toString().trim();
+    if (value.isEmpty) return '';
+    if (value.startsWith('camera:')) value = value.substring(7);
+    if (value.toLowerCase().endsWith('.exe')) {
+      value = value.substring(0, value.length - 4);
+    }
+    return value;
+  }
 
   List<Map<String, dynamic>> get _visibleFeed {
     return _feed.cast<Map<String, dynamic>>().where((item) {
@@ -476,7 +507,41 @@ class _RoomScreenState extends State<RoomScreen> {
     _input.dispose();
     _search.dispose();
     _scroll.dispose();
+    _dictation.dispose();
     super.dispose();
+  }
+
+  Future<void> _toggleDictation() async {
+    if (_transcribing) return;
+    if (!_listening) {
+      if (!await _dictation.start()) {
+        _snack('Microphone unavailable — check permissions');
+        return;
+      }
+      if (mounted) setState(() => _listening = true);
+      return;
+    }
+
+    setState(() {
+      _listening = false;
+      _transcribing = true;
+    });
+    try {
+      final text = await _dictation.stopAndTranscribe(widget.apiBase);
+      if (text.isEmpty) {
+        _snack('Nothing was heard — try again');
+        return;
+      }
+      // Append rather than replace: dictation can add to a half-typed thought.
+      final existing = _input.text.trimRight();
+      _input.text = existing.isEmpty ? text : '$existing $text';
+      _input.selection =
+          TextSelection.collapsed(offset: _input.text.length);
+    } catch (e) {
+      _snack('Could not transcribe: $e');
+    } finally {
+      if (mounted) setState(() => _transcribing = false);
+    }
   }
 
   Future<void> _load() async {
@@ -786,8 +851,9 @@ class _RoomScreenState extends State<RoomScreen> {
                   .toDouble()
               : 0);
     });
+    // Which apps/cameras this room's day is made of — same labels as the tags.
     final applications = events
-        .map((item) => (item['application'] ?? '').toString().trim())
+        .map(_sourceTag)
         .where((name) => name.isNotEmpty)
         .toSet()
         .take(3)
@@ -933,7 +999,10 @@ class _RoomScreenState extends State<RoomScreen> {
         : priority == 'low'
             ? _muted
             : _mint;
-    final application = (it['application'] ?? 'Activity').toString();
+    // Screen and Cameras each hold every source of their kind, so the app or
+    // camera an event came from is a tag on the bubble: opera, pycharm64 in
+    // Screen; ipc-a22e-g in Cameras.
+    final source = _sourceTag(it);
     final activity =
         (it['activity_type'] ?? '').toString().replaceAll('_', ' ');
     final start = it['ts'];
@@ -973,7 +1042,7 @@ class _RoomScreenState extends State<RoomScreen> {
               const SizedBox(width: 7),
               Expanded(
                 child: Text(
-                  activity.isEmpty ? application : '$application • $activity',
+                  activity.isEmpty ? 'Activity' : activity,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
                       color: Colors.white,
@@ -1026,6 +1095,11 @@ class _RoomScreenState extends State<RoomScreen> {
             spacing: 6,
             runSpacing: 5,
             children: [
+              if (source.isNotEmpty)
+                _eventTag(
+                    source,
+                    _isCameraRoom ? Icons.videocam : Icons.desktop_windows,
+                    _isCameraRoom ? const Color(0xFFF59E0B) : _violet),
               _eventTag(_duration(seconds), Icons.schedule, _muted),
               _eventTag(
                   priority == 'high'
@@ -1379,15 +1453,30 @@ class _RoomScreenState extends State<RoomScreen> {
                   maxLines: 4,
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
-                    hintText: _mode == 'note'
-                        ? 'Write a thought…'
-                        : 'Ask the agent about this room…',
+                    hintText: _listening
+                        ? 'Listening… tap the mic to stop'
+                        : _transcribing
+                            ? 'Transcribing…'
+                            : _mode == 'note'
+                                ? 'Write or speak a thought…'
+                                : 'Ask the agent about this room…',
                     hintStyle: const TextStyle(color: _muted),
                     isDense: true,
                   ),
                 ),
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: 4),
+              IconButton(
+                tooltip: _listening ? 'Stop and transcribe' : 'Dictate',
+                onPressed: _transcribing ? null : _toggleDictation,
+                icon: _transcribing
+                    ? const SizedBox(
+                        width: 18, height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: _mint))
+                    : Icon(_listening ? Icons.stop_circle : Icons.mic_none,
+                        color: _listening ? const Color(0xFFFF607C) : _muted),
+              ),
+              const SizedBox(width: 4),
               IconButton(
                 style: IconButton.styleFrom(backgroundColor: _mint),
                 icon: _sending
@@ -1395,7 +1484,7 @@ class _RoomScreenState extends State<RoomScreen> {
                         width: 18, height: 18,
                         child: CircularProgressIndicator(strokeWidth: 2, color: _ink))
                     : const Icon(Icons.send, color: _ink),
-                onPressed: _sending ? null : _send,
+                onPressed: (_sending || _listening) ? null : _send,
               ),
             ],
           ),

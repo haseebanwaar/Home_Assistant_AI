@@ -107,6 +107,8 @@ class MemoryPipeline:
             application=app_of(ctx), project_id=project,
             boundary_label=label, summary=title_of(ctx),
         )
+        result.current_event.memory_domain = (
+            "home" if self.log_context == "camera" else "personal")
         # Preserve the extractor's usefulness signal on the timeline event.
         # Multiple observations can contribute to one event, so retain the
         # strongest importance/confidence seen during that span.
@@ -268,6 +270,8 @@ class MemoryPipeline:
                 # Route the event into its room(s) (auto-first).
                 self.neo4j.assign_rooms([{
                     "event_id": event.event_id,
+                    # Decides the Screen vs Cameras room.
+                    "source": self.log_context,
                     "activity_type": event.activity_type,
                     "application": event.application,
                     "project_id": event.project_id,

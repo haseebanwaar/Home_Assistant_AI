@@ -1,16 +1,25 @@
-"""Room routing — auto-first (product vision, Phase 1).
+"""Room routing — one room per capture source.
 
-Given an event and its entity types, pick the best-matching room. Auto-creates a
-per-activity room and a per-project room on demand, so rooms appear as the user
-works. User "topic" rooms with keyword/app matchers outscore the generic auto
-rooms (most-specific-wins, same spirit as the Step-3 profile routing).
+Rooms used to be created per activity type, per coding project and per camera,
+which meant a dozen near-empty channels after a day of use: the room list became
+the noise it was supposed to organize. Instead there are two auto rooms, one per
+place observations come from:
+
+    Screen   — everything seen on the PC screen
+    Cameras  — everything seen by the home cameras
+
+Which *app* or *which camera* an event came from is not a room; it is a tag on
+the event (`application`), shown on the bubble in the feed. So Opera, PyCharm and
+a terminal all live in Screen, tagged; each camera's events live in Cameras,
+tagged with the camera's name.
+
+User-defined "topic" rooms still win over the source rooms when their
+keyword/app/project matcher fires — those are explicit intent, not clutter.
 
 Scoring weights (higher = more specific / stronger user intent):
     title keyword 4 · project 3 · app 2 · entity type 1 · activity 1
 """
 from __future__ import annotations
-
-import re
 
 from memory.models.room import Room, RoomMatcher
 
@@ -21,10 +30,33 @@ W_ENTITY = 1
 W_ACTIVITY = 1
 
 DAILY_ROOM_ID = "daily"
+CAMERA_ROOM_ID = "camera"
+SCREEN_ROOM_ID = "screen"
+
+# room_id -> (name, kind, description, color, icon). `kind` is load-bearing:
+# 'camera' marks the home memory domain everywhere in the graph queries.
+SOURCE_ROOMS = {
+    CAMERA_ROOM_ID: (
+        "Cameras", "camera",
+        "Everything the home cameras see. Each event is tagged with its camera.",
+        "#F59E0B", "videocam",
+    ),
+    SCREEN_ROOM_ID: (
+        "Screen", "screen",
+        "Everything captured from the PC screen. Each event is tagged with its app.",
+        "#8B7CF6", "desktop_windows",
+    ),
+}
 
 
-def _slug(text):
-    return re.sub(r"[^a-z0-9]+", "-", str(text or "").strip().lower()).strip("-") or "unknown"
+def source_room_id(source):
+    """Map a capture source (`log_context`) onto its room.
+
+    Anything camera-shaped ('camera', 'mobile_camera', 'camera:front-door') is
+    home; everything else is screen, which is also the safe default for older
+    events that carry no source at all.
+    """
+    return CAMERA_ROOM_ID if "camera" in str(source or "").lower() else SCREEN_ROOM_ID
 
 
 class RoomRegistry:
@@ -42,19 +74,14 @@ class RoomRegistry:
                           color="#6EE7D8", icon="calendar_today", pinned=True))
         return self.rooms[rid]
 
-    def ensure_activity_room(self, activity_type):
-        activity_type = activity_type or "other"
-        rid = f"activity:{_slug(activity_type)}"
+    def ensure_source_room(self, source):
+        """Idempotently return the Screen or Cameras room for a capture source."""
+        rid = source_room_id(source)
         if rid not in self.rooms:
-            self.add(Room(room_id=rid, name=activity_type.capitalize(), kind="activity",
-                          auto=True, matcher=RoomMatcher(activity_types=[activity_type])))
-        return self.rooms[rid]
-
-    def ensure_project_room(self, project_id):
-        rid = f"project:{_slug(project_id)}"
-        if rid not in self.rooms:
-            self.add(Room(room_id=rid, name=f"Coding: {project_id}", kind="project",
-                          auto=True, matcher=RoomMatcher(project_ids=[project_id])))
+            name, kind, description, color, icon = SOURCE_ROOMS[rid]
+            self.add(Room(room_id=rid, name=name, kind=kind, auto=True,
+                          description=description, color=color, icon=icon,
+                          pinned=True, matcher=RoomMatcher()))
         return self.rooms[rid]
 
     @staticmethod
@@ -76,17 +103,20 @@ class RoomRegistry:
         return s
 
     def route(self, event, entity_types=None):
-        """Return the best room for an event, auto-ensuring activity/project rooms."""
-        self.ensure_activity_room(event.get("activity_type"))
-        if event.get("project_id"):
-            self.ensure_project_room(event["project_id"])
+        """Return the best room for an event: a matching topic room, else source.
+
+        The source room is ensured either way, so both channels exist from the
+        first observation rather than appearing halfway through a session.
+        """
+        source_room = self.ensure_source_room(event.get("source"))
 
         best, best_score = None, 0
         for room in self.rooms.values():
-            if room.kind == "daily" or room.archived:
+            # Source rooms are the fallback, not a competitor: an empty matcher
+            # scores 0 anyway, but skip them so a stray matcher can't misroute.
+            if room.kind in ("daily", "camera", "screen") or room.archived:
                 continue
             score = self._score(room.matcher, event, entity_types)
             if score > best_score:
                 best, best_score = room, score
-        # Fallback should never trigger (activity room always scores >=1), but be safe.
-        return best or self.ensure_activity_room(event.get("activity_type"))
+        return best or source_room

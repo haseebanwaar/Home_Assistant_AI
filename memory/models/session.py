@@ -24,6 +24,10 @@ class Event(BaseModel):
     span_seconds: float = 0.0
     boundary_label: str = "append"
     summary: str = ""
+    # Personal memory is produced by the PC/screen assistant. Home memory is
+    # produced by household cameras. Keeping this on the graph event prevents
+    # the two assistants from sharing timelines, entities, and retrieval.
+    memory_domain: str = "personal"
     # The extractor's automatic signal. A user-selected priority is stored
     # separately in Neo4j so later observations cannot overwrite it.
     importance: float = Field(0.5, ge=0.0, le=1.0)

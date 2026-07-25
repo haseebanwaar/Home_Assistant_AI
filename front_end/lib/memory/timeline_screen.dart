@@ -70,6 +70,7 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
   List<dynamic> _results = [];
   List<dynamic> _entities = [];
   List<dynamic> _rooms = [];
+  String _memoryDomain = 'personal';
   DateTimeRange? _searchRange;
   String? _searchRoomId;
   final Set<String> _searchKinds = {
@@ -111,8 +112,12 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
       _timelineError = null;
     });
     try {
-      final uri = Uri.parse('${widget.apiBase}/memory/timeline')
-          .replace(queryParameters: {'date': _dateIso(_date)});
+      final uri = Uri.parse('${widget.apiBase}/memory/timeline').replace(
+        queryParameters: {
+          'date': _dateIso(_date),
+          'domain': _memoryDomain,
+        },
+      );
       final resp = await http.get(uri).timeout(const Duration(seconds: 20));
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
       final data = json.decode(resp.body) as Map<String, dynamic>;
@@ -128,7 +133,12 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
     setState(() => _entitiesLoading = true);
     try {
       final uri = Uri.parse('${widget.apiBase}/memory/entities').replace(
-          queryParameters: {'date': _dateIso(_date), 'limit': '100'});
+        queryParameters: {
+          'date': _dateIso(_date),
+          'limit': '100',
+          'domain': _memoryDomain,
+        },
+      );
       final resp = await http.get(uri).timeout(const Duration(seconds: 20));
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
       final data = json.decode(resp.body) as Map<String, dynamic>;
@@ -161,6 +171,7 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
         queryParameters: {
           'q': query,
           'limit': '100',
+          'domain': _memoryDomain,
           if (_searchKinds.length < 6) 'kinds': _searchKinds.join(','),
           if (_searchRange != null) 'from_date': _dateIso(_searchRange!.start),
           if (_searchRange != null) 'to_date': _dateIso(_searchRange!.end),
@@ -184,6 +195,18 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
     _loadEntities();
   }
 
+  void _changeMemoryDomain(String domain) {
+    if (domain == _memoryDomain) return;
+    setState(() {
+      _memoryDomain = domain;
+      _searchRoomId = null;
+      _results = [];
+    });
+    _loadTimeline();
+    _loadEntities();
+    if (_query.text.trim().isNotEmpty) _search();
+  }
+
   Future<void> _pickDay() async {
     final value = await showDatePicker(
       context: context,
@@ -203,7 +226,9 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
       backgroundColor: _ink,
       appBar: AppBar(
         backgroundColor: _panel,
-        title: const Text('Memory Explorer'),
+        title: Text(
+          _memoryDomain == 'personal' ? 'Personal memory' : 'Home memory',
+        ),
         actions: [
           IconButton(
             tooltip: 'Refresh',
@@ -215,16 +240,44 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
             },
           ),
         ],
-        bottom: TabBar(
-          controller: _tabs,
-          indicatorColor: _mint,
-          labelColor: _mint,
-          unselectedLabelColor: _muted,
-          tabs: const [
-            Tab(icon: Icon(Icons.search), text: 'Search'),
-            Tab(icon: Icon(Icons.timeline), text: 'Timeline'),
-            Tab(icon: Icon(Icons.hub_outlined), text: 'Entities'),
-          ],
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(102),
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 4, 12, 6),
+                child: SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(
+                      value: 'personal',
+                      icon: Icon(Icons.person_outline),
+                      label: Text('Personal'),
+                    ),
+                    ButtonSegment(
+                      value: 'home',
+                      icon: Icon(Icons.home_outlined),
+                      label: Text('Home'),
+                    ),
+                  ],
+                  selected: {_memoryDomain},
+                  onSelectionChanged: (value) =>
+                      _changeMemoryDomain(value.first),
+                  showSelectedIcon: false,
+                ),
+              ),
+              TabBar(
+                controller: _tabs,
+                indicatorColor: _mint,
+                labelColor: _mint,
+                unselectedLabelColor: _muted,
+                tabs: const [
+                  Tab(icon: Icon(Icons.search), text: 'Search'),
+                  Tab(icon: Icon(Icons.timeline), text: 'Timeline'),
+                  Tab(icon: Icon(Icons.hub_outlined), text: 'Entities'),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
       body: TabBarView(
@@ -318,11 +371,15 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
                       items: [
                         const DropdownMenuItem<String?>(
                             value: null, child: Text('All rooms')),
-                        ..._rooms.map((room) => DropdownMenuItem<String?>(
-                              value: room['room_id'].toString(),
-                              child: Text(room['name'].toString(),
-                                  overflow: TextOverflow.ellipsis),
-                            )),
+                        ..._rooms
+                            .where((room) => _memoryDomain == 'home'
+                                ? room['kind'] == 'camera'
+                                : room['kind'] != 'camera')
+                            .map((room) => DropdownMenuItem<String?>(
+                                  value: room['room_id'].toString(),
+                                  child: Text(room['name'].toString(),
+                                      overflow: TextOverflow.ellipsis),
+                                )),
                       ],
                       onChanged: (value) {
                         setState(() => _searchRoomId = value);
@@ -351,7 +408,9 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
               ? _empty('Search failed.\n$_searchError')
               : _results.isEmpty
                   ? _empty(_query.text.trim().isEmpty
-                      ? 'Search across everything the assistant remembers.'
+                      ? (_memoryDomain == 'personal'
+                          ? 'Search PC activity, work, and personal assistant context.'
+                          : 'Search cameras, rooms, and household observations.')
                       : 'No matching memories.')
                   : ListView.builder(
                       padding: const EdgeInsets.all(12),
@@ -507,7 +566,9 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
           child: _timelineError != null
               ? _empty('Could not load timeline.\n$_timelineError')
               : sessions.isEmpty
-                  ? _empty('No recorded activity for this day.')
+                  ? _empty(_memoryDomain == 'personal'
+                      ? 'No personal activity recorded for this day.'
+                      : 'No home observations recorded for this day.')
                   : ListView.builder(
                       padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
                       itemCount: sessions.length,
@@ -604,7 +665,9 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
           const LinearProgressIndicator(minHeight: 2, color: _mint),
         Expanded(
           child: _entities.isEmpty && !_entitiesLoading
-              ? _empty('No entities extracted for this day.')
+              ? _empty(_memoryDomain == 'personal'
+                  ? 'No personal-memory entities for this day.'
+                  : 'No home-memory entities for this day.')
               : ListView.separated(
                   padding: const EdgeInsets.all(12),
                   itemCount: _entities.length,
@@ -649,7 +712,10 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
   Future<void> _openEvent(String eventId) async {
     final changed = await Navigator.of(context).push<bool>(MaterialPageRoute(
       builder: (_) => MemoryEventScreen(
-          apiBase: widget.apiBase, eventId: eventId),
+        apiBase: widget.apiBase,
+        eventId: eventId,
+        memoryDomain: _memoryDomain,
+      ),
     ));
     if (changed == true) {
       _loadTimeline();
@@ -659,8 +725,11 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
 
   Future<void> _openEntity(String entityId) async {
     final changed = await Navigator.of(context).push<bool>(MaterialPageRoute(
-      builder: (_) =>
-          MemoryEntityScreen(apiBase: widget.apiBase, entityId: entityId),
+      builder: (_) => MemoryEntityScreen(
+        apiBase: widget.apiBase,
+        entityId: entityId,
+        memoryDomain: _memoryDomain,
+      ),
     ));
     if (changed == true) {
       _loadEntities();
@@ -704,12 +773,14 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
 
   Future<void> _forgetDay() async {
     final day = _dateIso(_date);
-    if (!await _confirm('Forget $day?',
-        'All sessions, events, claims and vector memories for this day will be permanently removed.')) {
+    final label = _memoryDomain == 'personal' ? 'personal' : 'home';
+    if (!await _confirm('Forget $label memory for $day?',
+        'Only $label events and their vector memories for this day will be permanently removed.')) {
       return;
     }
-    final resp =
-        await http.delete(Uri.parse('${widget.apiBase}/memory/days/$day'));
+    final uri = Uri.parse('${widget.apiBase}/memory/days/$day')
+        .replace(queryParameters: {'domain': _memoryDomain});
+    final resp = await http.delete(uri);
     if (resp.statusCode == 200) {
       _loadTimeline();
       _loadEntities();
@@ -722,8 +793,13 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
 class MemoryEventScreen extends StatefulWidget {
   final String apiBase;
   final String eventId;
-  const MemoryEventScreen(
-      {super.key, required this.apiBase, required this.eventId});
+  final String? memoryDomain;
+  const MemoryEventScreen({
+    super.key,
+    required this.apiBase,
+    required this.eventId,
+    this.memoryDomain,
+  });
 
   @override
   State<MemoryEventScreen> createState() => _MemoryEventScreenState();
@@ -843,8 +919,10 @@ class _MemoryEventScreenState extends State<MemoryEventScreen> {
                   context,
                   MaterialPageRoute(
                     builder: (_) => MemoryEntityScreen(
-                        apiBase: widget.apiBase,
-                        entityId: entity['entity_id'].toString()),
+                      apiBase: widget.apiBase,
+                      entityId: entity['entity_id'].toString(),
+                      memoryDomain: widget.memoryDomain,
+                    ),
                   ),
                 ),
               )),
@@ -968,8 +1046,13 @@ class _MemoryEventScreenState extends State<MemoryEventScreen> {
 class MemoryEntityScreen extends StatefulWidget {
   final String apiBase;
   final String entityId;
-  const MemoryEntityScreen(
-      {super.key, required this.apiBase, required this.entityId});
+  final String? memoryDomain;
+  const MemoryEntityScreen({
+    super.key,
+    required this.apiBase,
+    required this.entityId,
+    this.memoryDomain,
+  });
 
   @override
   State<MemoryEntityScreen> createState() => _MemoryEntityScreenState();
@@ -990,8 +1073,12 @@ class _MemoryEntityScreenState extends State<MemoryEntityScreen> {
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
-      final resp = await http.get(
-          Uri.parse('${widget.apiBase}/memory/entities/${widget.entityId}'));
+      final uri =
+          Uri.parse('${widget.apiBase}/memory/entities/${widget.entityId}')
+              .replace(queryParameters: {
+        if (widget.memoryDomain != null) 'domain': widget.memoryDomain!,
+      });
+      final resp = await http.get(uri);
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
       final data = json.decode(resp.body) as Map<String, dynamic>;
       setState(() {
@@ -1100,8 +1187,10 @@ class _MemoryEntityScreenState extends State<MemoryEntityScreen> {
                       context,
                       MaterialPageRoute(
                         builder: (_) => MemoryEntityScreen(
-                            apiBase: widget.apiBase,
-                            entityId: item['name'].toString().toLowerCase()),
+                          apiBase: widget.apiBase,
+                          entityId: item['name'].toString().toLowerCase(),
+                          memoryDomain: widget.memoryDomain,
+                        ),
                       ),
                     ),
                   ))

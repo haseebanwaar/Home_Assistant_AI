@@ -140,6 +140,8 @@ def main():
                 it["event_id"]: [e["type"] for e in it["entities"]] for it in knowledge}
             room_items = [{
                 "event_id": e.event_id, "activity_type": e.activity_type,
+                # Screen vs Cameras room; camera capture is the 'home' domain.
+                "source": "camera" if e.memory_domain == "home" else "screen",
                 "application": e.application, "project_id": e.project_id,
                 "summary": e.summary,
                 "entity_types": entity_types_by_event.get(e.event_id, []),

@@ -84,7 +84,11 @@ class MyApp extends StatefulWidget {
 }
 
 class _MyAppState extends State<MyApp> {
-  static const _defaultHomeHub = '100.89.9.84';
+  static const _homeHubPreferenceKey = 'home_hub_url';
+  static const _defaultHomeHub = String.fromEnvironment(
+    'HOME_HUB_URL',
+    defaultValue: '192.168.1.37',
+  );
   static const _ink = Color(0xFF070B14);
   static const _panel = Color(0xFF111827);
   static const _panelRaised = Color(0xFF182235);
@@ -98,6 +102,8 @@ class _MyAppState extends State<MyApp> {
   final TextEditingController _ipTextController = TextEditingController();
 
   Uint8List? _fileImage;
+  // The typed alternative to holding the mic. Same turn pipeline either way.
+  final TextEditingController _composerController = TextEditingController();
   final ImagePicker _picker = ImagePicker();
   final AudioPlayer _audioPlayer = AudioPlayer();
   final AudioRecorder _audioRecorder = AudioRecorder();
@@ -151,8 +157,6 @@ class _MyAppState extends State<MyApp> {
   @override
   void initState() {
     super.initState();
-    // The desktop's stable Tailscale address. A LAN IP or complete URL can
-    // still be entered when connecting in another environment.
     _ipTextController.text = _defaultHomeHub;
     _setupAudioPlayerListener();
     _startService();
@@ -160,12 +164,33 @@ class _MyAppState extends State<MyApp> {
     _captureSub = _capture.status.listen((s) {
       if (mounted) setState(() => _captureStatus = s);
     });
-    _pollBackendStatus();
+    _loadHomeHub();
     _statusTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       _pollBackendStatus();
       _fetchProactiveInsights();
       _fetchNotifications();
     });
+  }
+
+  Future<void> _loadHomeHub() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_homeHubPreferenceKey)?.trim();
+    if (!mounted) return;
+    if (saved != null && saved.isNotEmpty) {
+      _ipTextController.text = saved;
+    }
+    await _pollBackendStatus();
+  }
+
+  Future<void> _connectToHomeHub() async {
+    final value = _ipTextController.text.trim();
+    if (value.isEmpty) {
+      _showSnack('Enter the PC Wi-Fi address first');
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_homeHubPreferenceKey, value);
+    await _pollBackendStatus();
   }
 
   Future<void> _loadDeliveryPreferences() async {
@@ -223,6 +248,7 @@ class _MyAppState extends State<MyApp> {
     _audioPlayer.dispose();
     _playerStateSubscription?.cancel();
     _ipTextController.dispose();
+    _composerController.dispose();
     _captureSub?.cancel();
     _capture.dispose();
     _fpsController.dispose();
@@ -308,7 +334,7 @@ class _MyAppState extends State<MyApp> {
         _isRecording = false;
         _isProcessing = true;
       });
-      await _processAudio(audioData, true);
+      await _sendTurn(audio: audioData);
       setState(() {
         _isProcessing = false;
       });
@@ -354,9 +380,17 @@ class _MyAppState extends State<MyApp> {
     return (BytesBuilder()..add(header)..add(fullAudioData)).toBytes();
   }
 
-  Future<void> _processAudio(Uint8List buff, bool isEnd) async {
+  /// Send one conversation turn — spoken (`audio`) or typed (`text`).
+  ///
+  /// Both go to `/chat/audio`, which skips ASR when text is supplied, so live
+  /// frames, memory tools and spoken replies work the same either way. The
+  /// user's words come back on the `query` line, so neither path echoes locally.
+  Future<void> _sendTurn({Uint8List? audio, String? text}) async {
     try {
-      if (mounted) setState(() => _backendActivity = 'Uploading audio');
+      if (mounted) {
+        setState(() => _backendActivity =
+            text != null ? 'Sending message' : 'Uploading audio');
+      }
       // Clear the audio queue for the new response
       // and stop any ongoing playback from a previous turn.
       _isAudioPlaying = false;
@@ -366,7 +400,8 @@ class _MyAppState extends State<MyApp> {
       final url = Uri.parse('$_apiBase/chat/audio');
 
       final Map<String, dynamic> requestBody = {
-        'data': buff,
+        'data': audio,
+        'text': text,
         'image': _fileImage != null ? base64.encode(_fileImage!) : null,
         'talking': _isTalking,
         'context': _currentContext, // Add the new context value
@@ -459,6 +494,22 @@ class _MyAppState extends State<MyApp> {
       if (mounted) setState(() => _backendActivity = 'Connection failed');
     }
     }
+
+  Future<void> _sendTypedMessage() async {
+    final text = _composerController.text.trim();
+    if (text.isEmpty || _isProcessing || _isRecording) return;
+    if (_apiBase.isEmpty) {
+      _showSnack('Set the home hub address first');
+      return;
+    }
+    _composerController.clear();
+    setState(() => _isProcessing = true);
+    try {
+      await _sendTurn(text: text);
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
 
   String get _apiBase {
     final value = _ipTextController.text.trim();
@@ -1086,11 +1137,12 @@ class _MyAppState extends State<MyApp> {
           prefixIcon: const Icon(Icons.router_outlined, size: 19),
           suffixIcon: IconButton(
             tooltip: 'Reconnect',
-            onPressed: _pollBackendStatus,
+            onPressed: _connectToHomeHub,
             icon: const Icon(Icons.refresh_rounded, size: 19),
           ),
+          helperText: 'Use the PC Wi-Fi IP; localhost points to this phone',
         ),
-        onSubmitted: (_) => _pollBackendStatus(),
+        onSubmitted: (_) => _connectToHomeHub(),
       ),
     );
   }
@@ -1129,6 +1181,74 @@ class _MyAppState extends State<MyApp> {
           size: 31,
         ),
       ),
+    );
+  }
+
+  /// Typing is the equal of the mic: the same turn, minus speech recognition.
+  /// Useful when dictating is awkward, and when ASR is unavailable.
+  Widget _buildTypedComposer() {
+    return ValueListenableBuilder<TextEditingValue>(
+      valueListenable: _composerController,
+      builder: (context, value, _) {
+        final canSend =
+            value.text.trim().isNotEmpty && !_isProcessing && !_isRecording;
+        return Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _composerController,
+                enabled: !_isRecording,
+                minLines: 1,
+                maxLines: 4,
+                textInputAction: TextInputAction.send,
+                style: const TextStyle(fontSize: 13.5),
+                decoration: InputDecoration(
+                  isDense: true,
+                  filled: true,
+                  fillColor: _ink,
+                  hintText: _isRecording
+                      ? 'Listening…'
+                      : 'Type a message to HomeMind',
+                  hintStyle: const TextStyle(color: _muted, fontSize: 13),
+                  contentPadding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                    borderSide: const BorderSide(color: _line),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                    borderSide: const BorderSide(color: _line),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                    borderSide: const BorderSide(color: _mint),
+                  ),
+                ),
+                onSubmitted: (_) => _sendTypedMessage(),
+              ),
+            ),
+            const SizedBox(width: 9),
+            IconButton(
+              tooltip: 'Send message',
+              onPressed: canSend ? _sendTypedMessage : null,
+              style: IconButton.styleFrom(
+                backgroundColor: canSend ? _mint : _panel,
+                minimumSize: const Size(46, 46),
+              ),
+              icon: _isProcessing && !_isRecording
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: _mint),
+                    )
+                  : Icon(Icons.send_rounded,
+                      size: 20, color: canSend ? _ink : _muted),
+            ),
+          ],
+        );
+      },
     );
   }
 
@@ -1431,7 +1551,7 @@ class _MyAppState extends State<MyApp> {
               child: FilledButton(
                 onPressed: () {
                   Navigator.pop(sheetContext);
-                  _pollBackendStatus();
+                  _connectToHomeHub();
                 },
                 style: FilledButton.styleFrom(
                   backgroundColor: _mint,
@@ -1790,7 +1910,7 @@ class _MyAppState extends State<MyApp> {
                         style: TextStyle(
                             fontSize: 17, fontWeight: FontWeight.w700)),
                     SizedBox(height: 6),
-                    Text('Hold the microphone and start a conversation',
+                    Text('Hold the microphone, or type a message',
                         style: TextStyle(color: _muted, fontSize: 12)),
                   ],
                 ),
@@ -1812,37 +1932,43 @@ class _MyAppState extends State<MyApp> {
               color: _panelRaised,
               borderRadius: BorderRadius.vertical(bottom: Radius.circular(24)),
             ),
-            child: Row(
+            child: Column(
               children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(_isRecording ? 'Listening…' : 'Hold to speak',
-                          style: const TextStyle(
-                              fontSize: 13, fontWeight: FontWeight.w700)),
-                      Text(
-                          _isProcessing
-                              ? 'HomeMind is thinking'
-                              : 'Release when you are finished',
-                          style:
-                              const TextStyle(color: _muted, fontSize: 10)),
-                    ],
-                  ),
+                _buildTypedComposer(),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(_isRecording ? 'Listening…' : 'Hold to speak',
+                              style: const TextStyle(
+                                  fontSize: 13, fontWeight: FontWeight.w700)),
+                          Text(
+                              _isProcessing
+                                  ? 'HomeMind is thinking'
+                                  : 'Release when you are finished',
+                              style:
+                                  const TextStyle(color: _muted, fontSize: 10)),
+                        ],
+                      ),
+                    ),
+                    _buildTapToSpeakButton(),
+                    const Spacer(),
+                    IconButton.filledTonal(
+                      tooltip: 'Attach image',
+                      onPressed: _pickImageFile,
+                      icon: const Icon(Icons.add_photo_alternate_outlined),
+                    ),
+                    if (_fileImage != null)
+                      IconButton(
+                        tooltip: 'Remove image',
+                        onPressed: _unpickImageFile,
+                        icon: const Icon(Icons.close, color: _muted),
+                      ),
+                  ],
                 ),
-                _buildTapToSpeakButton(),
-                const Spacer(),
-                IconButton.filledTonal(
-                  tooltip: 'Attach image',
-                  onPressed: _pickImageFile,
-                  icon: const Icon(Icons.add_photo_alternate_outlined),
-                ),
-                if (_fileImage != null)
-                  IconButton(
-                    tooltip: 'Remove image',
-                    onPressed: _unpickImageFile,
-                    icon: const Icon(Icons.close, color: _muted),
-                  ),
               ],
             ),
           ),

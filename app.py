@@ -299,6 +299,14 @@ async def startup_event():
 
     evidence_retriever.neo4j = neo4j_store
 
+    # The two capture rooms exist from boot, so the feed has somewhere to land on
+    # the very first observation. Cameras is created by the camera manager.
+    if neo4j_store is not None:
+        try:
+            neo4j_store.ensure_source_room("screen")
+        except Exception as exc:
+            logger.warning("ensure_source_room(screen) failed: %s", exc)
+
     # Give the assistant graph-backed memory tools when the graph is available.
     if neo4j_store is not None:
         from tools.graph_tools import register_graph_tools
@@ -790,6 +798,23 @@ async def rooms_hygiene_archive(request: Request):
     return {"archived": neo4j_store.archive_rooms(room_ids)}
 
 
+@app.post("/rooms/consolidate")
+async def rooms_consolidate(purge_empty: bool = True):
+    """Fold legacy per-activity/per-project/per-camera rooms into Screen/Cameras.
+
+    A one-shot migration for graphs written before rooms were per capture source.
+    Events are relinked, manual assignments are respected, and legacy rooms that
+    hold notes or chat are archived instead of deleted.
+    """
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    try:
+        return neo4j_store.consolidate_source_rooms(purge_empty=purge_empty)
+    except Exception as exc:
+        logger.exception("room consolidation failed")
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
 @app.post("/rooms/{room_id}/merge")
 async def room_merge(room_id: str, request: Request):
     """Merge this room into another, then archive it."""
@@ -1051,12 +1076,15 @@ async def room_chat_stream(room_id: str, request: Request):
 
 
 @app.get("/memory/timeline")
-async def memory_timeline(date: str = None):
+async def memory_timeline(date: str = None, domain: str = None):
     """Sessions -> events with spans for a day. Neo4j-backed, JSONL fallback."""
+    if domain not in {None, "personal", "home"}:
+        return JSONResponse(
+            status_code=400, content={"error": "domain must be personal or home"})
     ds = date or _today_iso()
     if neo4j_store is not None:
         try:
-            rows = neo4j_store.sessions_with_events(ds)
+            rows = neo4j_store.sessions_with_events(ds, domain=domain)
             sessions = []
             for s in rows:
                 events = [e for e in (s.get("events") or []) if e]
@@ -1079,12 +1107,18 @@ async def memory_timeline(date: str = None):
 
 
 @app.get("/memory/entities")
-async def memory_entities(date: str = None, limit: int = 40):
+async def memory_entities(date: str = None, limit: int = 40,
+                          domain: str = None):
     """Top entities for a day."""
+    if domain not in {None, "personal", "home"}:
+        return JSONResponse(
+            status_code=400, content={"error": "domain must be personal or home"})
     if neo4j_store is None:
         return {"error": "graph not enabled"}
     ds = date or _today_iso()
-    return {"date": ds, "entities": neo4j_store.day_entities(ds, limit=limit)}
+    return {"date": ds, "domain": domain,
+            "entities": neo4j_store.day_entities(
+                ds, limit=limit, domain=domain)}
 
 
 @app.get("/memory/entity")
@@ -1100,8 +1134,12 @@ async def memory_entity(name: str):
 @app.get("/memory/search")
 async def memory_search(q: str, limit: int = 40, kinds: str = None,
                         from_date: str = None, to_date: str = None,
-                        room_id: str = None, semantic: bool = True):
+                        room_id: str = None, domain: str = None,
+                        semantic: bool = True):
     """Unified graph + semantic search across all user-visible memory types."""
+    if domain not in {None, "personal", "home"}:
+        return JSONResponse(
+            status_code=400, content={"error": "domain must be personal or home"})
     if not q.strip():
         return {"query": q, "results": []}
     selected = [v.strip() for v in kinds.split(",") if v.strip()] if kinds else None
@@ -1119,8 +1157,8 @@ async def memory_search(q: str, limit: int = 40, kinds: str = None,
     # (see EvidenceRetriever), so filters no longer disable vector search.
     results = evidence_retriever.retrieve(
         q, limit=limit, kinds=selected, start=start, end=end,
-        room_id=room_id, semantic=semantic)
-    return {"query": q, "results": results}
+        room_id=room_id, domain=domain, semantic=semantic)
+    return {"query": q, "domain": domain, "results": results}
 
 
 @app.get("/memory/events/{event_id}")
@@ -1191,10 +1229,13 @@ async def memory_event_forget(event_id: str):
 
 
 @app.get("/memory/entities/{entity_id}")
-async def memory_entity_detail(entity_id: str):
+async def memory_entity_detail(entity_id: str, domain: str = None):
+    if domain not in {None, "personal", "home"}:
+        return JSONResponse(
+            status_code=400, content={"error": "domain must be personal or home"})
     if neo4j_store is None:
         return JSONResponse(status_code=400, content={"error": "graph not enabled"})
-    entity = neo4j_store.entity_detail(entity_id)
+    entity = neo4j_store.entity_detail(entity_id, domain=domain)
     if entity is None:
         return JSONResponse(status_code=404, content={"error": "entity not found"})
     return {"entity": entity}
@@ -1305,14 +1346,17 @@ async def memory_session_forget(session_id: str):
 
 
 @app.delete("/memory/days/{date}")
-async def memory_day_forget(date: str):
+async def memory_day_forget(date: str, domain: str = None):
+    if domain not in {None, "personal", "home"}:
+        return JSONResponse(
+            status_code=400, content={"error": "domain must be personal or home"})
     if neo4j_store is None:
         return JSONResponse(status_code=400, content={"error": "graph not enabled"})
     try:
         datetime.date.fromisoformat(date)
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": f"invalid date: {exc}"})
-    result = neo4j_store.forget_day(date)
+    result = neo4j_store.forget_day(date, domain=domain)
     for event_id in result["event_ids"]:
         if activity_logger is not None:
             try:
@@ -1987,6 +2031,13 @@ async def live_chat(request: Request):
     context = data.get("context") or "talker"
     live = data.get("live", False)
     memory = data.get("memory", False)
+    # A typed turn: same pipeline, minus ASR. Everything downstream (live
+    # frames, memory tools, TTS) behaves exactly as it does for speech.
+    typed_text = (data.get("text") or "").strip()
+
+    if not typed_text and not wav_bytes_audio:
+        return JSONResponse(status_code=400,
+                            content={"error": "provide either 'text' or audio 'data'"})
 
     _current_context = context
 
@@ -1997,10 +2048,38 @@ async def live_chat(request: Request):
     return StreamingResponse(
         generate_response(
             wav_bytes_audio, wav_bytes_image, _chat_history,
-            concise, context, live, memory,
+            concise, context, live, memory, typed_text or None,
         ),
         media_type="application/x-ndjson",
     )
+
+
+@app.post("/transcribe")
+async def transcribe(request: Request):
+    """Speech to text only, for surfaces that compose text rather than converse.
+
+    The room composer records a clip and dictates into its input box, so the
+    user can edit before deciding whether it becomes a note or a question.
+    """
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "request body must be a JSON object"})
+
+    try:
+        audio_data = decode_audio_to_array(data.get("data"))
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    try:
+        t = time.perf_counter()
+        text = await asyncio.to_thread(nemo_transcribe, audio_data)
+        logger.info("dictation ASR %d ms: %s", int((time.perf_counter() - t) * 1000), text)
+    except Exception as exc:
+        logger.warning("dictation ASR failed: %s", exc)
+        return JSONResponse(status_code=502, content={"error": f"transcription failed: {exc}"})
+    return {"text": (text or "").strip()}
 
 
 # === SMALL PIPELINE HELPERS ===
@@ -2189,28 +2268,33 @@ def build_messages(concise, memory_text, chat_history, user_content):
 
 # === RESPONSE GENERATION ===
 async def generate_response(wav_bytes_audio, wav_bytes_image, chat_history,
-                            concise, context, live, memory):
-    """Handle incoming audio and stream text + TTS output as NDJSON."""
+                            concise, context, live, memory, typed_text=None):
+    """Handle an incoming turn (spoken or typed) and stream text + TTS as NDJSON."""
     turn_id = uuid.uuid4().hex[:8]
     t_turn = time.perf_counter()
-    logger.info("[%s] turn start (context=%s live=%s memory=%s)", turn_id, context, live, memory)
-    set_pipeline_status(True, "transcribing", turn_id)
+    logger.info("[%s] turn start (context=%s live=%s memory=%s typed=%s)",
+                turn_id, context, live, memory, bool(typed_text))
+    set_pipeline_status(True, "typing" if typed_text else "transcribing", turn_id)
 
     if DEBUG_VERBOSE:
         yield debug_line(turn_id, "start", context=context, live=live, memory=memory)
 
-    # 1. Decode + transcribe audio.
-    try:
-        t = time.perf_counter()
-        audio_data = decode_audio_to_array(wav_bytes_audio)
-        transcription = nemo_transcribe(audio_data)
-        asr_ms = int((time.perf_counter() - t) * 1000)
-        logger.info("[%s] ASR %d ms: %s", turn_id, asr_ms, transcription)
-    except Exception as exc:
-        logger.warning("[%s] ASR failed: %s", turn_id, exc)
-        set_pipeline_status(False, "asr_error", turn_id)
-        yield error_line(turn_id, "asr", str(exc))
-        return
+    # 1. Get the user's words: either straight from the request, or via ASR.
+    asr_ms = 0
+    if typed_text:
+        transcription = typed_text
+    else:
+        try:
+            t = time.perf_counter()
+            audio_data = decode_audio_to_array(wav_bytes_audio)
+            transcription = nemo_transcribe(audio_data)
+            asr_ms = int((time.perf_counter() - t) * 1000)
+            logger.info("[%s] ASR %d ms: %s", turn_id, asr_ms, transcription)
+        except Exception as exc:
+            logger.warning("[%s] ASR failed: %s", turn_id, exc)
+            set_pipeline_status(False, "asr_error", turn_id)
+            yield error_line(turn_id, "asr", str(exc))
+            return
 
     if vlm_model is None:
         set_pipeline_status(False, "model_unavailable", turn_id)

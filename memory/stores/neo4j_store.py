@@ -189,14 +189,15 @@ class Neo4jStore:
     def _norm(name):
         return re.sub(r"\s+", " ", (name or "").strip().lower())
 
-    def co_occurring_entities(self, entity_name, limit=25):
+    def co_occurring_entities(self, entity_name, limit=25, domain=None):
         """Entities seen in the SAME FRAME as `entity_name` (plan §13).
 
         Filters MENTIONS on co_presence='same_frame', so this answers true
         co-occurrence ("what appeared together"), not merely same-session.
         """
         return [dict(r) for r in self.run(
-            _CO_OCCURRENCE_CYPHER, nid=self._norm(entity_name), limit=limit)]
+            _CO_OCCURRENCE_CYPHER, nid=self._norm(entity_name), limit=limit,
+            domain=domain)]
 
     def events_for_entity(self, entity_name, limit=50):
         """Span-aware timeline of events mentioning an entity."""
@@ -223,7 +224,7 @@ class Neo4jStore:
 
     # -- Phase 2: Memory Explorer -----------------------------------------
     def memory_search(self, query, limit=40, kinds=None, start=None, end=None,
-                      room_id=None):
+                      room_id=None, domain=None):
         """Term-based keyword search across graph-backed memory types.
 
         Results share a stable shape so the API can merge them with semantic
@@ -240,7 +241,7 @@ class Neo4jStore:
         params = {
             "needle": needle, "terms": terms,
             "limit": max(1, min(int(limit), 200)),
-            "start": start, "end": end, "room_id": room_id,
+            "start": start, "end": end, "room_id": room_id, "domain": domain,
         }
         results = []
         searches = {
@@ -261,10 +262,12 @@ class Neo4jStore:
         )
         return results[:params["limit"]]
 
-    def recent_events(self, start=None, end=None, room_id=None, limit=20):
+    def recent_events(self, start=None, end=None, room_id=None, domain=None,
+                      limit=20):
         """Newest events inside a scope, ignoring keywords (scope-only questions)."""
         return [dict(row) for row in self.run(
             _RECENT_EVENTS_CYPHER, start=start, end=end, room_id=room_id,
+            domain=domain,
             limit=max(1, min(int(limit), 200)))]
 
     def events_in_room(self, event_ids, room_id):
@@ -279,18 +282,20 @@ class Neo4jStore:
         return {row["event_id"] for row in self.run(
             _EVENTS_IN_ROOM_CYPHER, ids=ids, room_id=room_id)}
 
-    def entity_detail(self, entity_id):
-        rows = self.run(_ENTITY_DETAIL_CYPHER, entity_id=self._norm(entity_id))
+    def entity_detail(self, entity_id, domain=None):
+        params = {"entity_id": self._norm(entity_id), "domain": domain}
+        rows = self.run(_ENTITY_DETAIL_CYPHER, **params)
         if not rows:
             return None
         entity = dict(rows[0])
         entity["events"] = [dict(r) for r in self.run(
-            _ENTITY_DETAIL_EVENTS_CYPHER, entity_id=self._norm(entity_id), limit=100)]
+            _ENTITY_DETAIL_EVENTS_CYPHER, **params, limit=100)]
         entity["claims"] = [dict(r) for r in self.run(
-            _ENTITY_DETAIL_CLAIMS_CYPHER, entity_id=self._norm(entity_id), limit=50)]
+            _ENTITY_DETAIL_CLAIMS_CYPHER, **params, limit=50)]
         entity["rooms"] = [dict(r) for r in self.run(
-            _ENTITY_DETAIL_ROOMS_CYPHER, entity_id=self._norm(entity_id), limit=30)]
-        entity["co_occurring"] = self.co_occurring_entities(entity_id, limit=30)
+            _ENTITY_DETAIL_ROOMS_CYPHER, **params, limit=30)]
+        entity["co_occurring"] = self.co_occurring_entities(
+            entity_id, limit=30, domain=domain)
         return entity
 
     def event_detail(self, event_id):
@@ -491,8 +496,9 @@ class Neo4jStore:
         return {"session_id": session_id, "event_ids": event_ids,
                 "deleted": bool(removed and removed[0]["deleted"])}
 
-    def forget_day(self, date_str):
-        rows = self.run(_DAY_EVENT_IDS_CYPHER, date=date_str)
+    def forget_day(self, date_str, domain=None):
+        rows = self.run(
+            _DAY_EVENT_IDS_CYPHER, date=date_str, domain=domain)
         event_ids = [row["event_id"] for row in rows]
         for event_id in event_ids:
             self.forget_event(event_id)
@@ -743,21 +749,19 @@ class Neo4jStore:
                                updated_at=r.get("updated_at")))
         return rooms
 
-    def ensure_camera_room(self, camera_id, name):
-        """Idempotently create a per-camera room that events from this camera
-        route into. Keyed on camera_id (the app token the camera worker stamps on
-        each event) so routing is deterministic even if two cameras share a model
-        name. Safe to call every startup — ON MATCH preserves user edits."""
+    def ensure_source_room(self, source):
+        """Idempotently create the Screen or Cameras room for a capture source.
+
+        One room per source, not per camera or per app — the specific camera/app
+        is a tag on each event. Safe to call every startup: ON MATCH in the merge
+        preserves any name/colour/instructions the user has since edited.
+        """
         import json as _json
-        from memory.models.room import Room, RoomMatcher
-        room = Room(
-            room_id=camera_id, name=name, kind="camera", auto=True,
-            matcher=RoomMatcher(apps=[camera_id]),
-            description=f"Live feed and events seen by the {name} camera.",
-            color="#F59E0B", icon="videocam",
-        )
+        from memory.rooms.registry import RoomRegistry
+
+        room = RoomRegistry().ensure_source_room(source)
         self.run(_MERGE_ROOM_CYPHER, **_room_params(room, _json))
-        return self.get_room(camera_id)
+        return self.get_room(room.room_id)
 
     def create_room(self, room):
         """Create a user-managed topic room. Raises ValueError on duplicate id."""
@@ -797,8 +801,10 @@ class Neo4jStore:
     def assign_rooms(self, events):
         """Route events to rooms and link them (idempotent). Auto-creates rooms.
 
-        `events`: list of {event_id, activity_type, application, project_id,
-        summary, entity_types}. Every event is also linked to the Daily room.
+        `events`: list of {event_id, source, activity_type, application,
+        project_id, summary, entity_types}. `source` picks the Screen/Cameras
+        room; a matching user topic room still wins. Every event is also linked
+        to the Daily room.
         """
         import json as _json
         from memory.rooms.registry import RoomRegistry
@@ -828,6 +834,58 @@ class Neo4jStore:
         with self._driver.session(database=self.database) as session:
             session.execute_write(_tx)
         return {"rooms": len(rooms_to_merge), "links": len(links)}
+
+    def consolidate_source_rooms(self, purge_empty=True):
+        """Fold legacy per-activity/per-project/per-camera rooms into Screen and
+        Cameras. One-shot migration for graphs written before source rooms.
+
+        Events are relinked, never deleted: a legacy camera room's events become
+        Cameras events, everything else becomes Screen events. Manual primaries
+        the user set by hand are left exactly where they are. Legacy rooms are
+        archived rather than deleted when they still hold notes or chat, so
+        nothing the user wrote can vanish in a migration.
+        """
+        from memory.rooms.registry import CAMERA_ROOM_ID, SCREEN_ROOM_ID
+
+        for source in ("camera", "screen"):
+            self.ensure_source_room(source)
+
+        legacy = self.run(_LEGACY_AUTO_ROOMS_CYPHER,
+                          keep=[CAMERA_ROOM_ID, SCREEN_ROOM_ID])
+        moved, archived, deleted = 0, 0, 0
+        for row in legacy:
+            room_id = row["room_id"]
+            target = CAMERA_ROOM_ID if row["kind"] == "camera" else SCREEN_ROOM_ID
+            result = self.run(_RELINK_ROOM_EVENTS_CYPHER,
+                              room_id=room_id, target_room_id=target)
+            moved += (result[0]["moved"] if result else 0)
+            if row["notes"] or row["messages"]:
+                self.run("MATCH (r:Room {room_id: $room_id}) SET r.archived = true",
+                         room_id=room_id)
+                archived += 1
+            elif purge_empty:
+                self.run(_DELETE_ROOM_CYPHER, room_id=room_id)
+                deleted += 1
+            else:
+                self.run("MATCH (r:Room {room_id: $room_id}) SET r.archived = true",
+                         room_id=room_id)
+                archived += 1
+
+        # Events that only ever reached the Daily room (logged before rooms
+        # existed, or when a routing write failed) would stay invisible in both
+        # channels, so adopt them too.
+        adopted = self.run(_ADOPT_UNROUTED_EVENTS_CYPHER,
+                           camera_room=CAMERA_ROOM_ID, screen_room=SCREEN_ROOM_ID)
+        # The room an event used to sit in is a weaker signal than the event
+        # itself: a camera event that historically landed in 'activity:other'
+        # would arrive in Screen. Fix any such disagreement, but only where the
+        # event states its domain outright.
+        normalized = self.run(_NORMALIZE_SOURCE_LINKS_CYPHER,
+                              camera_room=CAMERA_ROOM_ID, screen_room=SCREEN_ROOM_ID)
+        return {"rooms_processed": len(legacy), "events_moved": moved,
+                "events_adopted": (adopted[0]["adopted"] if adopted else 0),
+                "events_corrected": (normalized[0]["normalized"] if normalized else 0),
+                "rooms_archived": archived, "rooms_deleted": deleted}
 
     def list_rooms(self, include_archived=False):
         return [dict(r) for r in self.run(
@@ -875,16 +933,22 @@ class Neo4jStore:
     def reroute_events(self, room_id=None):
         """Re-evaluate automatic routing for historical events.
 
-        Manual primary assignments are deliberately preserved.
+        Manual primary assignments are deliberately preserved. Historical events
+        predate the `source` field, so their capture source is recovered from
+        `memory_domain` — 'home' is what camera capture writes.
         """
         query = (
             "MATCH (e:Event) "
             "OPTIONAL MATCH (e)-[:MENTIONS]->(n:Entity) "
             "RETURN e.event_id AS event_id, e.activity_type AS activity_type, "
             "e.application AS application, e.project_id AS project_id, "
-            "e.summary AS summary, collect(DISTINCT n.type) AS entity_types"
+            "e.summary AS summary, e.memory_domain AS memory_domain, "
+            "collect(DISTINCT n.type) AS entity_types"
         )
         events = [dict(r) for r in self.run(query)]
+        for event in events:
+            event["source"] = (
+                "camera" if event.get("memory_domain") == "home" else "screen")
         result = self.assign_rooms(events)
         return {**result, "events": len(events), "trigger_room_id": room_id}
 
@@ -995,12 +1059,14 @@ class Neo4jStore:
         return [dict(r) for r in self.run(_ROOM_FEED_CYPHER, **params)]
 
     # -- Step 13: daily rollup ---------------------------------------------
-    def sessions_with_events(self, date_str):
+    def sessions_with_events(self, date_str, domain=None):
         """Day's sessions, each with its events (ordered)."""
-        return [dict(r) for r in self.run(_SESSIONS_WITH_EVENTS_CYPHER, date=date_str)]
+        return [dict(r) for r in self.run(
+            _SESSIONS_WITH_EVENTS_CYPHER, date=date_str, domain=domain)]
 
-    def day_entities(self, date_str, limit=30):
-        return [dict(r) for r in self.run(_DAY_ENTITIES_CYPHER, date=date_str, limit=limit)]
+    def day_entities(self, date_str, limit=30, domain=None):
+        return [dict(r) for r in self.run(
+            _DAY_ENTITIES_CYPHER, date=date_str, limit=limit, domain=domain)]
 
     def day_claims(self, date_str, limit=20):
         return [dict(r) for r in self.run(_DAY_CLAIMS_CYPHER, date=date_str, limit=limit)]
@@ -1139,6 +1205,7 @@ def _event_params(e):
         "span_seconds": e.get("span_seconds"),
         "boundary_label": e.get("boundary_label"),
         "summary": e.get("summary"),
+        "memory_domain": e.get("memory_domain", "personal"),
         "importance": e.get("importance", 0.5),
         "confidence": e.get("confidence", 0.5),
     }
@@ -1188,6 +1255,7 @@ SET e.activity_type = $activity_type,
     e.span_seconds = $span_seconds,
     e.boundary_label = $boundary_label,
     e.summary = $summary,
+    e.memory_domain = $memory_domain,
     e.importance = $importance,
     e.confidence = $confidence
 WITH e
@@ -1215,6 +1283,12 @@ _CO_OCCURRENCE_CYPHER = """
 MATCH (n:Entity {entity_id: $nid})<-[:MENTIONS {co_presence: 'same_frame'}]-(e:Event)
       -[:MENTIONS {co_presence: 'same_frame'}]->(other:Entity)
 WHERE other.entity_id <> n.entity_id
+  AND ($domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain)
 RETURN other.name AS name, other.type AS type,
        count(DISTINCT e) AS shared_frames
 ORDER BY shared_frames DESC, name
@@ -1248,6 +1322,12 @@ WITH e, collect(DISTINCT {room_id: r.room_id, name: r.name}) AS rooms
 WHERE ($start IS NULL OR e.span_start >= $start)
   AND ($end IS NULL OR e.span_start < $end)
   AND ($room_id IS NULL OR any(room IN rooms WHERE room.room_id = $room_id))
+  AND ($domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain)
 WITH e, rooms, toLower(coalesce(e.summary, '')) AS hay
 WITH e, rooms, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
 WHERE hits > 0
@@ -1264,6 +1344,8 @@ MATCH (r:Room)-[:HAS_NOTE]->(n:RoomNote)
 WHERE ($start IS NULL OR n.ts >= $start)
   AND ($end IS NULL OR n.ts < $end)
   AND ($room_id IS NULL OR r.room_id = $room_id)
+  AND ($domain IS NULL OR
+       CASE WHEN r.kind = 'camera' THEN 'home' ELSE 'personal' END = $domain)
 WITH r, n, toLower(coalesce(n.text, '')) AS hay
 WITH r, n, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
 WHERE hits > 0
@@ -1279,6 +1361,8 @@ MATCH (r:Room)-[:HAS_MESSAGE]->(m:RoomMessage)
 WHERE ($start IS NULL OR m.ts >= $start)
   AND ($end IS NULL OR m.ts < $end)
   AND ($room_id IS NULL OR r.room_id = $room_id)
+  AND ($domain IS NULL OR
+       CASE WHEN r.kind = 'camera' THEN 'home' ELSE 'personal' END = $domain)
 WITH r, m, toLower(coalesce(m.text, '')) AS hay
 WITH r, m, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
 WHERE hits > 0
@@ -1292,7 +1376,19 @@ LIMIT $limit
 """
 
 _SEARCH_ENTITIES_CYPHER = """
-MATCH (n:Entity)
+MATCH (n:Entity)<-[:MENTIONS]-(e:Event)
+WHERE ($start IS NULL OR e.span_start >= $start)
+  AND ($end IS NULL OR e.span_start < $end)
+  AND ($room_id IS NULL OR EXISTS {
+        MATCH (:Room {room_id: $room_id})-[:CONTAINS]->(e)
+      })
+  AND ($domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain)
+WITH DISTINCT n
 WITH n, toLower(coalesce(n.name, '')) AS hay
 WITH n, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
 WHERE hits > 0
@@ -1311,6 +1407,12 @@ WITH c, e, collect(DISTINCT {room_id: r.room_id, name: r.name}) AS rooms
 WHERE ($start IS NULL OR e.span_start >= $start)
   AND ($end IS NULL OR e.span_start < $end)
   AND ($room_id IS NULL OR any(room IN rooms WHERE room.room_id = $room_id))
+  AND ($domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain)
 WITH c, e, rooms, toLower(coalesce(c.text, '')) AS hay
 WITH c, e, rooms, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
 WHERE hits > 0
@@ -1323,6 +1425,8 @@ LIMIT $limit
 
 _SEARCH_ROOMS_CYPHER = """
 MATCH (r:Room)
+WHERE ($domain IS NULL OR
+       CASE WHEN r.kind = 'camera' THEN 'home' ELSE 'personal' END = $domain)
 WITH r, toLower(coalesce(r.name, '') + ' ' + coalesce(r.description, '')) AS hay
 WITH r, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
 WHERE hits > 0
@@ -1343,6 +1447,12 @@ WITH e, collect(DISTINCT {room_id: r.room_id, name: r.name}) AS rooms
 WHERE ($start IS NULL OR e.span_start >= $start)
   AND ($end IS NULL OR e.span_start < $end)
   AND ($room_id IS NULL OR any(room IN rooms WHERE room.room_id = $room_id))
+  AND ($domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain)
   AND coalesce(e.summary, '') <> ''
 RETURN 'event' AS kind, e.event_id AS id,
        coalesce(e.application, e.activity_type, 'Activity') AS title,
@@ -1360,6 +1470,13 @@ RETURN e.event_id AS event_id
 _ENTITY_DETAIL_CYPHER = """
 MATCH (n:Entity {entity_id: $entity_id})
 OPTIONAL MATCH (n)<-[:MENTIONS]-(e:Event)
+WITH n, e
+WHERE $domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain
 RETURN n.entity_id AS entity_id, n.name AS name, n.type AS type,
        n.memory_status AS memory_status, n.max_confidence AS max_confidence,
        count(DISTINCT e) AS mentions, min(e.span_start) AS first_seen,
@@ -1368,6 +1485,12 @@ RETURN n.entity_id AS entity_id, n.name AS name, n.type AS type,
 
 _ENTITY_DETAIL_EVENTS_CYPHER = """
 MATCH (n:Entity {entity_id: $entity_id})<-[m:MENTIONS]-(e:Event)
+WHERE $domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain
 RETURN e.event_id AS event_id, e.summary AS summary,
        e.application AS application, e.activity_type AS activity_type,
        e.span_start AS span_start, e.span_end AS span_end,
@@ -1378,6 +1501,12 @@ LIMIT $limit
 
 _ENTITY_DETAIL_CLAIMS_CYPHER = """
 MATCH (n:Entity {entity_id: $entity_id})<-[:MENTIONS]-(e:Event)-[:SUPPORTS]->(c:Claim)
+WHERE $domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain
 RETURN DISTINCT c.claim_id AS claim_id, c.text AS text,
        c.confidence AS confidence, max(e.span_start) AS last_seen
 ORDER BY last_seen DESC
@@ -1386,6 +1515,12 @@ LIMIT $limit
 
 _ENTITY_DETAIL_ROOMS_CYPHER = """
 MATCH (n:Entity {entity_id: $entity_id})<-[:MENTIONS]-(e:Event)<-[:CONTAINS]-(r:Room)
+WHERE $domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain
 RETURN r.room_id AS room_id, r.name AS name, count(DISTINCT e) AS events
 ORDER BY events DESC
 LIMIT $limit
@@ -1590,15 +1725,25 @@ RETURN existed AS deleted
 
 _DAY_EVENT_IDS_CYPHER = """
 MATCH (d:Day {date: $date})-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(e:Event)
+WHERE $domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain
 RETURN DISTINCT e.event_id AS event_id
 """
 
 _DELETE_EMPTY_DAY_CYPHER = """
 OPTIONAL MATCH (d:Day {date: $date})
 OPTIONAL MATCH (d)-[:HAS_SESSION]->(s:Session)
-WITH d, collect(s) AS sessions
-FOREACH (s IN sessions | DETACH DELETE s)
-FOREACH (_ IN CASE WHEN d IS NULL THEN [] ELSE [1] END | DETACH DELETE d)
+WITH d, [s IN collect(s) WHERE NOT (s)-[:HAS_EVENT]->()] AS empty_sessions
+FOREACH (s IN empty_sessions | DETACH DELETE s)
+WITH d
+OPTIONAL MATCH (d)-[:HAS_SESSION]->(remaining:Session)
+WITH d, count(remaining) AS remaining_count
+FOREACH (_ IN CASE WHEN d IS NOT NULL AND remaining_count = 0
+                   THEN [1] ELSE [] END | DETACH DELETE d)
 RETURN true AS deleted
 """
 
@@ -2093,6 +2238,77 @@ FOREACH (_ IN CASE WHEN existed THEN [1] ELSE [] END | DETACH DELETE r)
 RETURN existed AS deleted
 """
 
+_LEGACY_AUTO_ROOMS_CYPHER = """
+MATCH (r:Room)
+WHERE coalesce(r.auto, false)
+  AND NOT r.room_id IN $keep
+  AND r.kind IN ['activity', 'project', 'camera']
+OPTIONAL MATCH (r)-[:HAS_NOTE]->(n:RoomNote)
+OPTIONAL MATCH (r)-[:HAS_MESSAGE]->(m:RoomMessage)
+RETURN r.room_id AS room_id, r.kind AS kind,
+       count(DISTINCT n) AS notes, count(DISTINCT m) AS messages
+"""
+
+# Auto links move to the source room; anything the user pinned by hand stays.
+_RELINK_ROOM_EVENTS_CYPHER = """
+MATCH (old:Room {room_id: $room_id})-[rel:CONTAINS]->(e:Event)
+WHERE NOT coalesce(rel.manual, false)
+WITH old, rel, e, coalesce(rel.assignment, 'primary') AS assignment
+MATCH (target:Room {room_id: $target_room_id})
+MERGE (target)-[link:CONTAINS]->(e)
+  ON CREATE SET link.assignment = assignment, link.manual = false,
+                link.updated_at = timestamp()
+DELETE rel
+RETURN count(DISTINCT e) AS moved
+"""
+
+# An event with no Screen/Cameras link joins one, chosen by memory domain and, for
+# older events that have none, by the legacy 'camera:<id>' application token. It
+# becomes the primary only when nothing else already is.
+_ADOPT_UNROUTED_EVENTS_CYPHER = """
+MATCH (e:Event)
+WHERE NOT EXISTS {
+    MATCH (r:Room)-[:CONTAINS]->(e) WHERE r.kind IN ['camera', 'screen']
+}
+WITH e,
+     CASE WHEN coalesce(e.memory_domain, '') = 'home'
+            OR toLower(coalesce(e.application, '')) STARTS WITH 'camera:'
+          THEN $camera_room ELSE $screen_room END AS target_id,
+     EXISTS {
+        MATCH (:Room)-[rel:CONTAINS]->(e)
+        WHERE coalesce(rel.assignment, 'primary') = 'primary'
+     } AS has_primary
+MATCH (target:Room {room_id: target_id})
+MERGE (target)-[link:CONTAINS]->(e)
+  ON CREATE SET link.assignment =
+                    CASE WHEN has_primary THEN 'secondary' ELSE 'primary' END,
+                link.manual = false, link.updated_at = timestamp()
+RETURN count(DISTINCT e) AS adopted
+"""
+
+# Move an auto Screen/Cameras link to the other room when the event's own domain
+# (or its legacy 'camera:<id>' app token) says it belongs there. Events that state
+# neither are left alone rather than guessed at.
+_NORMALIZE_SOURCE_LINKS_CYPHER = """
+MATCH (r:Room)-[rel:CONTAINS]->(e:Event)
+WHERE r.kind IN ['camera', 'screen'] AND NOT coalesce(rel.manual, false)
+WITH e, r, rel, coalesce(e.memory_domain, '') AS domain,
+     toLower(coalesce(e.application, '')) AS app
+WITH e, r, rel, coalesce(rel.assignment, 'primary') AS assignment,
+     CASE
+       WHEN domain = 'home' OR app STARTS WITH 'camera:' THEN $camera_room
+       WHEN domain = 'personal' THEN $screen_room
+       ELSE null
+     END AS target_id
+WHERE target_id IS NOT NULL AND r.room_id <> target_id
+MATCH (target:Room {room_id: target_id})
+MERGE (target)-[link:CONTAINS]->(e)
+  ON CREATE SET link.assignment = assignment, link.manual = false,
+                link.updated_at = timestamp()
+DELETE rel
+RETURN count(DISTINCT e) AS normalized
+"""
+
 _HAS_MANUAL_PRIMARY_CYPHER = """
 MATCH (:Room)-[rel:CONTAINS]->(e:Event {event_id: $event_id})
 WHERE rel.assignment = 'primary' AND coalesce(rel.manual, false)
@@ -2126,7 +2342,13 @@ RETURN true AS deleted
 
 _SESSIONS_WITH_EVENTS_CYPHER = """
 MATCH (d:Day {date: $date})-[:HAS_SESSION]->(s:Session)
-OPTIONAL MATCH (s)-[:HAS_EVENT]->(e:Event)
+MATCH (s)-[:HAS_EVENT]->(e:Event)
+WHERE $domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain
 WITH s, e ORDER BY e.span_start
 RETURN s.session_id AS session_id, s.activity_type AS activity,
        s.application AS application, s.project_id AS project_id,
@@ -2135,13 +2357,20 @@ RETURN s.session_id AS session_id, s.activity_type AS activity,
        collect(CASE WHEN e IS NULL THEN NULL ELSE {
          event_id: e.event_id, span_start: e.span_start, span_end: e.span_end,
          span_seconds: e.span_seconds, summary: e.summary,
-         activity: e.activity_type, boundary: e.boundary_label
+         activity: e.activity_type, boundary: e.boundary_label,
+         memory_domain: coalesce(e.memory_domain, $domain)
        } END) AS events
 ORDER BY s.start
 """
 
 _DAY_ENTITIES_CYPHER = """
-MATCH (d:Day {date: $date})-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(:Event)-[m:MENTIONS]->(n:Entity)
+MATCH (d:Day {date: $date})-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(e:Event)-[m:MENTIONS]->(n:Entity)
+WHERE $domain IS NULL OR coalesce(
+        e.memory_domain,
+        CASE WHEN EXISTS {
+          MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e)
+        } THEN 'home' ELSE 'personal' END
+      ) = $domain
 RETURN n.entity_id AS entity_id, n.name AS name, n.type AS type, count(m) AS mentions
 ORDER BY mentions DESC, name
 LIMIT $limit
