@@ -60,6 +60,43 @@ IconData _kindIcon(String kind, String name, [String? configured]) {
   }
 }
 
+/// (start, end) epoch seconds for a relative time window chip.
+///
+/// Ends are left open: "today" means since midnight and still running, not a
+/// closed box, so an event logged a second from now is still in scope. Null
+/// bounds mean all of time.
+(double?, double?) timeWindowBounds(String? window, {DateTime? now}) {
+  final current = now ?? DateTime.now();
+  late DateTime from;
+  switch (window) {
+    case 'hour':
+      from = current.subtract(const Duration(hours: 1));
+      break;
+    case 'today':
+      from = DateTime(current.year, current.month, current.day);
+      break;
+    case 'week':
+      // The week starts Monday (DateTime.weekday: Monday == 1).
+      final monday = current.subtract(Duration(days: current.weekday - 1));
+      from = DateTime(monday.year, monday.month, monday.day);
+      break;
+    case 'month':
+      from = DateTime(current.year, current.month);
+      break;
+    default:
+      return (null, null);
+  }
+  return (from.millisecondsSinceEpoch / 1000.0, null);
+}
+
+/// (start, end) epoch seconds covering one calendar day, e.g. '2026-07-25'.
+(double?, double?) dayBounds(String date) {
+  final day = DateTime.parse(date);
+  final start = DateTime(day.year, day.month, day.day);
+  return (start.millisecondsSinceEpoch / 1000.0,
+      start.add(const Duration(days: 1)).millisecondsSinceEpoch / 1000.0);
+}
+
 String _hm(dynamic ts) {
   if (ts is! num) return '';
   final dt = DateTime.fromMillisecondsSinceEpoch((ts * 1000).round());
@@ -218,7 +255,7 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     try {
       final uri = isNew
           ? Uri.parse('${widget.apiBase}/rooms')
-          : Uri.parse('${widget.apiBase}/rooms/${room!['room_id']}');
+          : Uri.parse('${widget.apiBase}/rooms/${room['room_id']}');
       final resp = isNew
           ? await http.post(uri,
               headers: {'Content-Type': 'application/json'},
@@ -456,16 +493,29 @@ class _RoomScreenState extends State<RoomScreen> {
   final Set<String> _kinds = {'event', 'note', 'message'};
   List<dynamic> _feed = []; // chronological (oldest -> newest)
 
+  // -- scope: what the feed shows and what a question is answered from --------
+  // Raw `application` values (as stored) for every source in this room, plus the
+  // subset the user has selected. Empty selection means "everything".
+  List<Map<String, dynamic>> _sources = [];
+  final Set<String> _selectedSources = {};
+  // Named relative window: hour | today | week | month. Null means all of time,
+  // unless _date (a specific day) is set.
+  String? _window;
+  // Answer from the current camera/screen frame buffers as well as from memory.
+  bool _live = false;
+
   bool get _isDaily => widget.kind == 'daily';
   bool get _isCameraRoom => widget.kind == 'camera';
+  bool get _isSourceRoom =>
+      widget.kind == 'camera' || widget.kind == 'screen';
 
   /// The app or camera an event came from, as it should read on the bubble.
   ///
   /// Legacy camera events stored their id ('camera:192-168-1-4') as the
   /// application; newer ones store the camera's name. Strip the prefix so both
   /// read the same, and drop the '.exe' noise from Windows process names.
-  String _sourceTag(Map<String, dynamic> event) {
-    var value = (event['application'] ?? '').toString().trim();
+  String _prettySource(String raw) {
+    var value = raw.trim();
     if (value.isEmpty) return '';
     if (value.startsWith('camera:')) value = value.substring(7);
     if (value.toLowerCase().endsWith('.exe')) {
@@ -473,6 +523,31 @@ class _RoomScreenState extends State<RoomScreen> {
     }
     return value;
   }
+
+  /// Display name for a raw `application` value, preferring the label the
+  /// backend resolved (a camera id becomes its configured name).
+  String _labelFor(String raw) {
+    for (final source in _sources) {
+      if (source['application'].toString() == raw) {
+        final label = (source['label'] ?? '').toString().trim();
+        if (label.isNotEmpty) return label;
+        break;
+      }
+    }
+    return _prettySource(raw);
+  }
+
+  String _sourceTag(Map<String, dynamic> event) =>
+      _labelFor((event['application'] ?? '').toString().trim());
+
+  /// The active time window as (start, end) epoch seconds, or nulls for all time.
+  ///
+  /// A picked date wins over a relative chip: it is the more specific request.
+  (double?, double?) get _timeBounds =>
+      _date != null ? dayBounds(_date!) : timeWindowBounds(_window);
+
+  bool get _hasScope =>
+      _selectedSources.isNotEmpty || _window != null || _date != null;
 
   List<Map<String, dynamic>> get _visibleFeed {
     return _feed.cast<Map<String, dynamic>>().where((item) {
@@ -500,6 +575,7 @@ class _RoomScreenState extends State<RoomScreen> {
   void initState() {
     super.initState();
     _load();
+    if (_isSourceRoom) _loadSources();
   }
 
   @override
@@ -509,6 +585,31 @@ class _RoomScreenState extends State<RoomScreen> {
     _scroll.dispose();
     _dictation.dispose();
     super.dispose();
+  }
+
+  /// The room's source chips. Fetched rather than derived from the loaded page,
+  /// so a source stays selectable after a filter has hidden all of its events.
+  Future<void> _loadSources() async {
+    try {
+      final resp = await http
+          .get(Uri.parse('${widget.apiBase}/rooms/${widget.roomId}/sources'))
+          .timeout(const Duration(seconds: 10));
+      if (resp.statusCode != 200) return;
+      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final sources = ((data['sources'] as List?) ?? [])
+          .cast<Map<String, dynamic>>()
+          .where((s) => (s['application'] ?? '').toString().trim().isNotEmpty)
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        _sources = sources;
+        // Drop selections for sources that have since disappeared.
+        _selectedSources.retainWhere((raw) =>
+            sources.any((s) => s['application'].toString() == raw));
+      });
+    } catch (_) {
+      // Chips are an affordance, not the content — a failure here is not fatal.
+    }
   }
 
   Future<void> _toggleDictation() async {
@@ -550,9 +651,16 @@ class _RoomScreenState extends State<RoomScreen> {
       _error = null;
     });
     try {
+      // The same scope the chat turn sends, so the feed is a preview of the
+      // context a question would be answered from.
+      final (start, end) = _timeBounds;
       final params = <String, String>{
         'limit': '300',
         if (_date != null) 'date': _date!,
+        if (_date == null && start != null) 'start': start.toString(),
+        if (_date == null && end != null) 'end': end.toString(),
+        if (_selectedSources.isNotEmpty)
+          'applications': _selectedSources.join(','),
         if (_search.text.trim().isNotEmpty) 'q': _search.text.trim(),
         if (_kinds.length < 3) 'kinds': _kinds.join(','),
       };
@@ -618,14 +726,28 @@ class _RoomScreenState extends State<RoomScreen> {
     _jumpToBottom();
     try {
       final path = isChat ? 'chat' : 'note';
-      final key = isChat ? 'message' : 'text';
+      // A question is answered from the same slice the feed is showing: the
+      // selected sources, the active time window, and — with Live on — the
+      // current frame buffers. A note is just a note.
+      final (start, end) = _timeBounds;
+      final body = isChat
+          ? {
+              'message': text,
+              if (_selectedSources.isNotEmpty)
+                'applications': _selectedSources.toList(),
+              if (start != null) 'start': start,
+              if (end != null) 'end': end,
+              if (_live) 'live': true,
+            }
+          : {'text': text};
       final resp = await http
           .post(
             Uri.parse('${widget.apiBase}/rooms/${widget.roomId}/$path'),
             headers: {'Content-Type': 'application/json'},
-            body: json.encode({key: text}),
+            body: json.encode(body),
           )
-          .timeout(const Duration(seconds: 60));
+          // Live turns upload frames and wait on a vision pass, so allow longer.
+          .timeout(Duration(seconds: isChat && _live ? 180 : 60));
       if (resp.statusCode == 200) {
         await _load(); // reconciles the optimistic item with the server truth
       } else {
@@ -782,6 +904,12 @@ class _RoomScreenState extends State<RoomScreen> {
               ],
             ],
           ),
+          const SizedBox(height: 6),
+          _timeWindowChips(),
+          if (_isSourceRoom && _sources.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            _sourceChips(),
+          ],
           if (_kinds.contains('event')) ...[
             const SizedBox(height: 6),
             SizedBox(
@@ -819,6 +947,119 @@ class _RoomScreenState extends State<RoomScreen> {
       if (view == 'flagged') return flagged;
       return true;
     }).length;
+  }
+
+  /// Relative time windows. Selecting one re-scopes both the feed and the
+  /// context a question is answered from; a specific picked date overrides them.
+  Widget _timeWindowChips() {
+    Widget chip(String label, String value) {
+      final selected = _window == value && _date == null;
+      return Padding(
+        padding: const EdgeInsets.only(right: 6),
+        child: ChoiceChip(
+          selected: selected,
+          showCheckmark: false,
+          label: Text(label),
+          labelStyle:
+              TextStyle(color: selected ? _ink : _muted, fontSize: 11),
+          selectedColor: _mint,
+          backgroundColor: _panelRaised,
+          side: const BorderSide(color: _line),
+          onSelected: (_) {
+            setState(() {
+              _window = selected ? null : value;
+              // A relative window and a fixed day are two answers to the same
+              // question, so choosing one clears the other.
+              if (!selected) _date = null;
+            });
+            _load();
+          },
+        ),
+      );
+    }
+
+    return SizedBox(
+      height: 34,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(right: 8, top: 8),
+            child: Icon(Icons.schedule, size: 15, color: _muted),
+          ),
+          chip('Last hour', 'hour'),
+          chip('Today', 'today'),
+          chip('This week', 'week'),
+          chip('This month', 'month'),
+        ],
+      ),
+    );
+  }
+
+  /// One chip per app (Screen) or camera (Cameras) in this room.
+  ///
+  /// With none selected the whole room is in scope. Selecting some narrows both
+  /// the feed and what a question is answered from — ask about one camera and the
+  /// other three are not consulted.
+  Widget _sourceChips() {
+    return SizedBox(
+      height: 34,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(right: 8, top: 8),
+            child: Icon(_isCameraRoom ? Icons.videocam : Icons.desktop_windows,
+                size: 15, color: _muted),
+          ),
+          for (final source in _sources)
+            () {
+              final raw = source['application'].toString();
+              final selected = _selectedSources.contains(raw);
+              final events = (source['events'] as num?)?.toInt() ?? 0;
+              return Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: FilterChip(
+                  selected: selected,
+                  showCheckmark: false,
+                  label: Text('${_labelFor(raw)} $events'),
+                  labelStyle:
+                      TextStyle(color: selected ? _ink : _muted, fontSize: 11),
+                  selectedColor:
+                      _isCameraRoom ? const Color(0xFFF59E0B) : _violet,
+                  backgroundColor: _panelRaised,
+                  side: const BorderSide(color: _line),
+                  onSelected: (on) {
+                    setState(() {
+                      if (on) {
+                        _selectedSources.add(raw);
+                      } else {
+                        _selectedSources.remove(raw);
+                      }
+                    });
+                    _load();
+                  },
+                ),
+              );
+            }(),
+          if (_selectedSources.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(right: 6),
+              child: ActionChip(
+                avatar: const Icon(Icons.clear, size: 14, color: _muted),
+                label: const Text('All'),
+                labelStyle: const TextStyle(color: _muted, fontSize: 11),
+                backgroundColor: _panelRaised,
+                side: const BorderSide(color: _line),
+                onPressed: () {
+                  setState(_selectedSources.clear);
+                  _load();
+                },
+              ),
+            ),
+        ],
+      ),
+    );
   }
 
   Widget _eventViewChip(String label, String value, IconData icon) {
@@ -930,8 +1171,11 @@ class _RoomScreenState extends State<RoomScreen> {
       lastDate: DateTime.now().add(const Duration(days: 1)),
     );
     if (selected == null) return;
-    setState(() => _date =
-        '${selected.year.toString().padLeft(4, '0')}-${selected.month.toString().padLeft(2, '0')}-${selected.day.toString().padLeft(2, '0')}');
+    setState(() {
+      _date =
+          '${selected.year.toString().padLeft(4, '0')}-${selected.month.toString().padLeft(2, '0')}-${selected.day.toString().padLeft(2, '0')}';
+      _window = null; // a specific day replaces any relative window
+    });
     _load();
   }
 
@@ -1441,8 +1685,16 @@ class _RoomScreenState extends State<RoomScreen> {
               _modeChip('Note', 'note', Icons.push_pin),
               const SizedBox(width: 8),
               _modeChip('Ask agent', 'chat', Icons.chat_bubble_outline),
+              if (_mode == 'chat' && _isSourceRoom) ...[
+                const SizedBox(width: 8),
+                _liveChip(),
+              ],
             ],
           ),
+          if (_mode == 'chat') ...[
+            const SizedBox(height: 6),
+            _scopeSummary(),
+          ],
           const SizedBox(height: 8),
           Row(
             children: [
@@ -1490,6 +1742,68 @@ class _RoomScreenState extends State<RoomScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  /// Answer from the live frame buffers as well as from memory.
+  ///
+  /// With this on, the backend snapshots what the selected cameras (or the
+  /// screen) are showing right now and sends those frames to the model alongside
+  /// the room's history — so "what is happening" gets a present-tense answer.
+  Widget _liveChip() {
+    return FilterChip(
+      selected: _live,
+      showCheckmark: false,
+      avatar: Icon(_live ? Icons.sensors : Icons.sensors_off,
+          size: 15, color: _live ? _ink : _muted),
+      label: const Text('Live'),
+      labelStyle: TextStyle(color: _live ? _ink : _muted, fontSize: 12),
+      selectedColor: const Color(0xFFFFC857),
+      backgroundColor: _panelRaised,
+      side: const BorderSide(color: _line),
+      tooltip: _isCameraRoom
+          ? 'Also look at what the cameras are seeing right now'
+          : 'Also look at what is on the screen right now',
+      onSelected: (value) => setState(() => _live = value),
+    );
+  }
+
+  /// One line telling the user exactly what the next question will be answered
+  /// from — filters are worthless if you cannot see which ones are on.
+  Widget _scopeSummary() {
+    final parts = <String>[];
+    if (_selectedSources.isNotEmpty) {
+      parts.add(_selectedSources.map(_labelFor).join(', '));
+    } else if (_isSourceRoom) {
+      parts.add(_isCameraRoom ? 'all cameras' : 'all apps');
+    }
+    if (_date != null) {
+      parts.add(_date!);
+    } else {
+      parts.add(switch (_window) {
+        'hour' => 'last hour',
+        'today' => 'today',
+        'week' => 'this week',
+        'month' => 'this month',
+        _ => 'all time',
+      });
+    }
+    if (_live) parts.add('live frames');
+
+    return Row(
+      children: [
+        Icon(_live ? Icons.sensors : Icons.filter_alt_outlined,
+            size: 13, color: _live ? const Color(0xFFFFC857) : _muted),
+        const SizedBox(width: 5),
+        Expanded(
+          child: Text(
+            'Answering from: ${parts.join(' · ')}',
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+                color: _hasScope || _live ? _mint : _muted, fontSize: 10.5),
+          ),
+        ),
+      ],
     );
   }
 

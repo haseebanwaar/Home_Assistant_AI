@@ -985,27 +985,73 @@ class Neo4jStore:
         rows = [dict(r) for r in self.run(_ROOM_MESSAGES_CYPHER, room_id=room_id, limit=limit)]
         return list(reversed(rows))
 
-    def room_context(self, room_id, event_limit=8, note_limit=8, entity_limit=15):
-        """Grounding for room-scoped chat: recent events, notes, and top entities."""
+    def room_applications(self, room_id, start=None, end=None):
+        """The apps/cameras that have events in this room — the feed's source chips.
+
+        Ordered by how much of the room each one accounts for, so the busiest
+        source is the first chip.
+        """
+        return [dict(r) for r in self.run(
+            _ROOM_APPLICATIONS_CYPHER, room_id=room_id,
+            start=start, end=end, limit=40)]
+
+    def room_event_ids(self, room_id, start=None, end=None, applications=None,
+                       limit=2000):
+        """Every event id in scope — the whole slice, not just the prompt window.
+
+        Question-driven retrieval is held to this set, so a filter cannot be
+        defeated by an older-but-relevant event, nor accidentally drop one just
+        because it fell outside the handful of lines the prompt quotes.
+        """
+        apps = ([a.strip().lower() for a in applications if a and a.strip()]
+                if applications else None)
+        return [r["event_id"] for r in self.run(
+            _ROOM_EVENT_IDS_CYPHER, room_id=room_id, start=start, end=end,
+            applications=apps or None, limit=limit) if r.get("event_id")]
+
+    def room_context(self, room_id, event_limit=8, note_limit=8, entity_limit=15,
+                     start=None, end=None, applications=None):
+        """Grounding for room-scoped chat: recent events, notes, and top entities.
+
+        `start`/`end` (epoch seconds) and `applications` narrow the context to
+        exactly what the user has filtered the feed down to — asking about one
+        camera should not pull in what the other three saw. Each event line
+        carries its source so the model can attribute what it is told.
+        """
+        apps = ([a.strip().lower() for a in applications if a and a.strip()]
+                if applications else None)
         event_rows = self.run(
-            _ROOM_FEED_CYPHER, room_id=room_id, limit=event_limit * 4)
+            _ROOM_CONTEXT_EVENTS_CYPHER, room_id=room_id, limit=event_limit * 4,
+            start=start, end=end, applications=apps or None)
         # User triage should improve the assistant too: low-priority noise and
         # items set aside for review do not consume the small grounding window.
-        events = [
-            row["summary"] for row in event_rows
+        kept = [
+            row for row in event_rows
             if row.get("summary")
             and row.get("priority", "normal") != "low"
             and not row.get("flagged")
         ][:event_limit]
+        events = [
+            f"[{row['application']}] {row['summary']}" if row.get("application")
+            else row["summary"]
+            for row in kept
+        ]
         notes = [r["text"] for r in self.run(
-            _ROOM_NOTES_CYPHER, room_id=room_id, limit=note_limit)]
+            _ROOM_CONTEXT_NOTES_CYPHER, room_id=room_id, limit=note_limit,
+            start=start, end=end)]
         entities = [r["name"] for r in self.run(
-            _ROOM_ENTITIES_CYPHER, room_id=room_id, limit=entity_limit)]
+            _ROOM_CONTEXT_ENTITIES_CYPHER, room_id=room_id, limit=entity_limit,
+            start=start, end=end, applications=apps or None)]
         return {"events": events, "notes": notes, "entities": entities}
 
     def room_feed_full(self, room_id, date_str=None, limit=200, offset=0,
-                       kinds=None, query=None, priorities=None, flagged=None):
-        """Merged, time-ordered feed: events + notes + chat messages (newest first)."""
+                       kinds=None, query=None, priorities=None, flagged=None,
+                       start=None, end=None, applications=None):
+        """Merged, time-ordered feed: events + notes + chat messages (newest first).
+
+        `start`/`end` and `applications` are the same scope the chat context uses,
+        so what the user sees in the feed is what the assistant is given.
+        """
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
         fetch_limit = min(2000, limit + offset)
@@ -1029,9 +1075,21 @@ class Neo4jStore:
         for m in self.run(_ROOM_MESSAGES_CYPHER, room_id=room_id, limit=fetch_limit):
             items.append({"kind": "message", "ts": m["ts"], "text": m["text"], "role": m["role"]})
         if date_str:
-            start = datetime.datetime.fromisoformat(date_str).timestamp()
-            end = start + 86400
-            items = [item for item in items if start <= (item.get("ts") or 0) < end]
+            day_start = datetime.datetime.fromisoformat(date_str).timestamp()
+            day_end = day_start + 86400
+            items = [item for item in items
+                     if day_start <= (item.get("ts") or 0) < day_end]
+        if start is not None:
+            items = [item for item in items if (item.get("ts") or 0) >= start]
+        if end is not None:
+            items = [item for item in items if (item.get("ts") or 0) < end]
+        if applications:
+            # Notes and chat have no source of their own — they belong to the room
+            # as a whole, so a source filter only narrows the activity.
+            allowed_apps = {a.strip().lower() for a in applications if a and a.strip()}
+            items = [item for item in items
+                     if item["kind"] != "event"
+                     or (item.get("application") or "").lower() in allowed_apps]
         items.sort(key=lambda x: x.get("ts") or 0, reverse=True)
         if kinds:
             allowed = set(kinds)
@@ -2175,6 +2233,67 @@ _ROOM_MESSAGES_CYPHER = """
 MATCH (r:Room {room_id: $room_id})-[:HAS_MESSAGE]->(m:RoomMessage)
 RETURN m.message_id AS message_id, m.role AS role, m.text AS text, m.ts AS ts
 ORDER BY m.ts DESC
+LIMIT $limit
+"""
+
+# The chat-context queries below all take the same optional scope: a time window
+# and a set of lowercased application values (a null means "no filter").
+_ROOM_SCOPE_WHERE = """
+WHERE ($start IS NULL OR coalesce(e.span_start, 0) >= $start)
+  AND ($end IS NULL OR coalesce(e.span_start, 0) < $end)
+  AND ($applications IS NULL
+       OR toLower(coalesce(e.application, '')) IN $applications)
+"""
+
+_ROOM_CONTEXT_EVENTS_CYPHER = """
+MATCH (r:Room {room_id: $room_id})-[:CONTAINS]->(e:Event)
+""" + _ROOM_SCOPE_WHERE + """
+RETURN e.event_id AS event_id, e.span_start AS span_start, e.span_end AS span_end,
+       e.summary AS summary, e.application AS application,
+       e.activity_type AS activity_type,
+       coalesce(e.user_priority,
+         CASE WHEN coalesce(e.importance, 0.5) >= 0.75 THEN 'high'
+              WHEN coalesce(e.importance, 0.5) < 0.3 THEN 'low'
+              ELSE 'normal' END) AS priority,
+       coalesce(e.flagged, false) AS flagged
+ORDER BY e.span_start DESC
+LIMIT $limit
+"""
+
+_ROOM_EVENT_IDS_CYPHER = """
+MATCH (r:Room {room_id: $room_id})-[:CONTAINS]->(e:Event)
+""" + _ROOM_SCOPE_WHERE + """
+RETURN e.event_id AS event_id
+ORDER BY e.span_start DESC
+LIMIT $limit
+"""
+
+_ROOM_CONTEXT_ENTITIES_CYPHER = """
+MATCH (r:Room {room_id: $room_id})-[:CONTAINS]->(e:Event)
+""" + _ROOM_SCOPE_WHERE + """
+MATCH (e)-[:MENTIONS]->(n:Entity)
+RETURN n.name AS name, count(*) AS c
+ORDER BY c DESC, name
+LIMIT $limit
+"""
+
+_ROOM_CONTEXT_NOTES_CYPHER = """
+MATCH (r:Room {room_id: $room_id})-[:HAS_NOTE]->(n:RoomNote)
+WHERE ($start IS NULL OR coalesce(n.ts, 0) >= $start)
+  AND ($end IS NULL OR coalesce(n.ts, 0) < $end)
+RETURN n.note_id AS note_id, n.text AS text, n.ts AS ts
+ORDER BY n.ts DESC
+LIMIT $limit
+"""
+
+_ROOM_APPLICATIONS_CYPHER = """
+MATCH (r:Room {room_id: $room_id})-[:CONTAINS]->(e:Event)
+WHERE coalesce(e.application, '') <> ''
+  AND ($start IS NULL OR coalesce(e.span_start, 0) >= $start)
+  AND ($end IS NULL OR coalesce(e.span_start, 0) < $end)
+RETURN e.application AS application, count(*) AS events,
+       max(e.span_end) AS last_active
+ORDER BY events DESC, application
 LIMIT $limit
 """
 

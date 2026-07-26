@@ -730,18 +730,28 @@ async def room_reroute(room_id: str):
 @app.get("/rooms/{room_id}/feed")
 async def room_feed(room_id: str, date: str = None, limit: int = 200,
                     offset: int = 0, kinds: str = None, q: str = None,
-                    priorities: str = None, flagged: bool = None):
-    """A room's merged feed — events + user notes + chat, newest first."""
+                    priorities: str = None, flagged: bool = None,
+                    start: float = None, end: float = None,
+                    applications: str = None):
+    """A room's merged feed — events + user notes + chat, newest first.
+
+    `start`/`end` (epoch seconds) and a comma-separated `applications` list are the
+    same scope room chat accepts, so the feed shows exactly what the assistant
+    would be given for the current filters.
+    """
     if neo4j_store is None:
         return {"error": "graph not enabled (start with MEMORY_NEO4J=1)"}
     selected_kinds = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
     selected_priorities = ([p.strip() for p in priorities.split(",") if p.strip()]
                            if priorities else None)
+    selected_apps = ([a.strip() for a in applications.split(",") if a.strip()]
+                     if applications else None)
     return {"room_id": room_id, "date": date, "offset": offset, "limit": limit,
             "feed": neo4j_store.room_feed_full(
                 room_id, date_str=date, limit=limit, offset=offset,
                 kinds=selected_kinds, query=q,
-                priorities=selected_priorities, flagged=flagged)}
+                priorities=selected_priorities, flagged=flagged,
+                start=start, end=end, applications=selected_apps)}
 
 
 @app.post("/rooms/daily/report")
@@ -997,18 +1007,161 @@ async def event_remove_room(event_id: str, room_id: str):
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
-def _room_chat_turn(room_id, message):
-    """Build the room-chat prompt + citations. Shared by both room chat endpoints."""
+async def _read_room_turn(request):
+    """(turn, error_response) for a room chat request.
+
+    Beyond the message, a turn carries the filters the user has applied to the
+    feed — selected sources, a time window — plus whether to answer from the live
+    frame buffers as well as from memory.
+    """
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return None, JSONResponse(status_code=400,
+                                  content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict):
+        return None, JSONResponse(status_code=400,
+                                  content={"error": "request body must be a JSON object"})
+    message = (data.get("message") or "").strip()
+    if not message:
+        return None, JSONResponse(status_code=400,
+                                  content={"error": "message is required"})
+
+    applications = data.get("applications")
+    if not isinstance(applications, list):
+        applications = None
+    else:
+        applications = [str(a).strip() for a in applications if str(a).strip()]
+
+    def _ts(value):
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "message": message,
+        "applications": applications or None,
+        "start": _ts(data.get("start")),
+        "end": _ts(data.get("end")),
+        "live": bool(data.get("live")),
+    }, None
+
+
+def _camera_workers_for(applications):
+    """Camera workers matching the selected source tags (all of them if none).
+
+    A tag is the camera's display name for events written by the current code and
+    its `camera:<id>` token for older ones, so both are accepted.
+    """
+    if camera_manager is None:
+        return []
+    workers = [w for w in camera_manager.workers.values()
+               if w.status().get("connected")]
+    if not applications:
+        return workers
+    wanted = {a.strip().lower() for a in applications}
+    selected = []
+    for worker in workers:
+        tags = {(worker.name or "").lower(), worker.camera_id.lower(),
+                f"camera:{worker.camera_id}".lower()}
+        if tags & wanted:
+            selected.append(worker)
+    return selected
+
+
+def _room_live_frames(room, applications):
+    """Snapshot the current frame buffers behind this room.
+
+    "Live" answers the question against what the cameras/screen are seeing right
+    now, on top of what memory already holds. Reading a buffer is a copy, not a
+    drain: the capture pipeline still gets its full window, so asking a live
+    question never costs an activity event.
+
+    Returns (frames, labels, warnings).
+    """
+    kind = room.get("kind")
+    frames, labels, warnings = [], [], []
+
+    if kind == "camera":
+        workers = _camera_workers_for(applications)
+        if not workers:
+            warnings.append("no matching camera is connected")
+            return frames, labels, warnings
+        # Share the frame budget so four cameras don't crowd each other out.
+        per_source = max(2, MAX_FRAMES // len(workers))
+        for worker in workers:
+            buffered = worker.stream.frames()[-per_source:]
+            if not buffered:
+                warnings.append(f"{worker.name}: buffer is empty")
+                continue
+            frames.extend(buffered)
+            labels.append(f"{worker.name} ({len(buffered)} frames)")
+        return frames, labels, warnings
+
+    # Screen room: the phone's mirrored screen if it is streaming, else the PC's.
+    mobile_frames = mobile_stream.frames("screen")
+    if mobile_frames:
+        frames = mobile_frames[-MAX_FRAMES:]
+        labels.append(f"mobile screen ({len(frames)} frames)")
+        return frames, labels, warnings
+    if screen_stream is None or not screen_stream.status()["healthy"]:
+        warnings.append("screen capture is not running")
+        return frames, labels, warnings
+    frames = screen_stream.frames()[-MAX_FRAMES:]
+    if frames:
+        labels.append(f"PC screen ({len(frames)} frames)")
+    else:
+        warnings.append("screen buffer is empty")
+    return frames, labels, warnings
+
+
+def _scope_description(applications, start, end, live_labels):
+    """Human-readable statement of what the model is (and isn't) being shown."""
+    parts = []
+    if applications:
+        parts.append("only these sources: " + ", ".join(applications))
+    if start is not None or end is not None:
+        def stamp(value):
+            return (time.strftime("%Y-%m-%d %H:%M", time.localtime(value))
+                    if value is not None else "…")
+        parts.append(f"only activity between {stamp(start)} and {stamp(end)}")
+    if live_labels:
+        parts.append("live frames from " + ", ".join(live_labels))
+    return parts
+
+
+def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
+                    live=False):
+    """Build the room-chat prompt + citations. Shared by both room chat endpoints.
+
+    The user's filters are honoured, not merely displayed: with two apps selected
+    in Screen, the context holds those two apps' activity and nothing else, and
+    the same for a single camera in Cameras. The room's own chat history is always
+    included — that thread is the conversation, not part of what is being filtered.
+    """
     room = neo4j_store.get_room(room_id) or {"name": room_id}
     neo4j_store.add_message(room_id, "user", message)
-    ctx = neo4j_store.room_context(room_id)
-    history = neo4j_store.room_messages(room_id, limit=10)
+    ctx = neo4j_store.room_context(
+        room_id, start=start, end=end, applications=applications)
+    history = neo4j_store.room_messages(room_id, limit=12)
+
+    live_frames, live_labels, live_warnings = [], [], []
+    if live:
+        live_frames, live_labels, live_warnings = _room_live_frames(room, applications)
 
     # Retrieve on the actual question, scoped to this room, instead of pasting
     # whatever happened to be recent. Falls back to the room's newest events when
     # the question carries no content terms ("what have I been up to in here?").
+    # Over-fetch, because the source filter is applied after ranking.
     relevant = evidence_retriever.retrieve(
-        message, limit=8, kinds=["event", "note", "claim"], room_id=room_id)
+        message, limit=32 if applications else 8,
+        kinds=["event", "note", "claim"], room_id=room_id, start=start, end=end)
+    if applications:
+        in_scope = set(neo4j_store.room_event_ids(
+            room_id, start=start, end=end, applications=applications))
+        relevant = [item for item in relevant
+                    if item.get("kind") != "event" or item.get("id") in in_scope][:8]
     citations = [{
         "number": index + 1, "kind": item.get("kind"), "id": item.get("id"),
         "title": item.get("title"), "text": item.get("text"), "ts": item.get("ts"),
@@ -1025,13 +1178,75 @@ def _room_chat_turn(room_id, message):
         f"User's notes here:\n- " + "\n- ".join(ctx["notes"][:8] or ["(none)"]) + "\n\n"
         f"Key things seen here: {', '.join(ctx['entities'][:15]) or '(none)'}"
     )
+    # Activity lines are prefixed with their source, so say what that prefix is.
+    if room.get("kind") in ("camera", "screen"):
+        grounding += ("\n\nEach activity line begins with the "
+                      + ("camera" if room.get("kind") == "camera" else "application")
+                      + " that saw it, in square brackets.")
+    scope = _scope_description(applications, start, end, live_labels)
+    if scope:
+        grounding += ("\n\nThe user has narrowed this conversation to " +
+                      "; ".join(scope) +
+                      ". Answer within that scope and say so if it is too narrow "
+                      "to answer, rather than drawing on anything outside it.")
+    if live_frames:
+        grounding += ("\n\nThe attached images are what those sources are showing "
+                      "right now. Prefer them over remembered activity for "
+                      "anything about the present moment.")
+    for warning in live_warnings:
+        grounding += f"\n\nLive view unavailable — {warning}."
     if room.get("instructions"):
         grounding += f"\n\nRoom-specific user instructions:\n{room['instructions']}"
+
     messages = [{"role": "system", "content": grounding}]
     for m in history[:-1]:  # prior turns (exclude the just-added user message)
         messages.append({"role": m["role"], "content": m["text"]})
-    messages.append({"role": "user", "content": message})
-    return messages, citations
+
+    if live_frames:
+        content = [{"type": "text", "text": message}]
+        for image in live_frames:
+            try:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{encode_image_base64(image)}"},
+                })
+            except Exception as exc:
+                logger.warning("room live frame encode failed: %s", exc)
+        messages.append({"role": "user", "content": content})
+    else:
+        messages.append({"role": "user", "content": message})
+
+    meta = {"live_sources": live_labels, "live_frames": len(live_frames),
+            "warnings": live_warnings, "applications": applications or [],
+            "start": start, "end": end}
+    logger.info("room chat %s: apps=%s window=(%s,%s) live=%d frames",
+                room_id, applications, start, end, len(live_frames))
+    return messages, citations, meta
+
+
+@app.get("/rooms/{room_id}/sources")
+async def room_sources(room_id: str, start: float = None, end: float = None):
+    """The apps/cameras with events in this room — one filter chip each.
+
+    Older camera events were tagged with the camera's id, so each source also
+    carries a `label`: the configured camera name where one is known, which reads
+    better on a chip than '192-168-1-17'. Filtering still uses `application`.
+    """
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    names = {}
+    if camera_manager is not None:
+        for worker in camera_manager.workers.values():
+            if worker.name:
+                names[worker.camera_id.lower()] = worker.name
+                names[f"camera:{worker.camera_id}".lower()] = worker.name
+
+    sources = neo4j_store.room_applications(room_id, start=start, end=end)
+    for source in sources:
+        application = (source.get("application") or "")
+        source["label"] = names.get(application.lower())
+    return {"room_id": room_id, "sources": sources}
 
 
 @app.post("/rooms/{room_id}/chat")
@@ -1039,11 +1254,13 @@ async def room_chat(room_id: str, request: Request):
     """Chat with the assistant scoped to a room (grounded in its events/notes)."""
     if neo4j_store is None:
         return JSONResponse(status_code=400, content={"error": "graph not enabled"})
-    message, error = await _read_message(request)
+    turn, error = await _read_room_turn(request)
     if error is not None:
         return error
 
-    messages, citations = _room_chat_turn(room_id, message)
+    messages, citations, meta = _room_chat_turn(
+        room_id, turn["message"], applications=turn["applications"],
+        start=turn["start"], end=turn["end"], live=turn["live"])
     try:
         resp = await client.chat.completions.create(
             model=vlm_model, messages=messages, max_tokens=500)
@@ -1053,7 +1270,7 @@ async def room_chat(room_id: str, request: Request):
         return JSONResponse(status_code=502, content={"error": f"chat failed: {exc}"})
 
     neo4j_store.add_message(room_id, "assistant", reply)
-    return {"room_id": room_id, "reply": reply, "citations": citations}
+    return {"room_id": room_id, "reply": reply, "citations": citations, **meta}
 
 
 @app.post("/rooms/{room_id}/chat/stream")
@@ -1061,17 +1278,19 @@ async def room_chat_stream(room_id: str, request: Request):
     """Room chat, streamed: citations first, then tokens."""
     if neo4j_store is None:
         return JSONResponse(status_code=400, content={"error": "graph not enabled"})
-    message, error = await _read_message(request)
+    turn, error = await _read_room_turn(request)
     if error is not None:
         return error
 
-    messages, citations = _room_chat_turn(room_id, message)
+    messages, citations, meta = _room_chat_turn(
+        room_id, turn["message"], applications=turn["applications"],
+        start=turn["start"], end=turn["end"], live=turn["live"])
 
     def persist(reply):
         return neo4j_store.add_message(room_id, "assistant", reply)
 
     return StreamingResponse(
-        _stream_reply(messages, citations, persist, max_tokens=500),
+        _stream_reply(messages, citations, persist, max_tokens=500, meta=meta),
         media_type="application/x-ndjson")
 
 
@@ -1508,14 +1727,18 @@ async def assistant_conversation_message(conversation_id: str, request: Request)
     return {"reply": reply, "citations": citations, "message": saved}
 
 
-async def _stream_reply(messages, citations, on_complete, max_tokens=700):
+async def _stream_reply(messages, citations, on_complete, max_tokens=700, meta=None):
     """NDJSON token stream, citations first.
 
     Evidence is known before generation starts, so sending it immediately lets
     the UI render sources while the answer is still being written — the whole
     perceived-latency win. Matches the existing /talk NDJSON convention.
+
+    `meta` (optional) reports how the answer was scoped — selected sources, time
+    window, live frames — so the UI can show what the reply was based on.
     """
-    yield json.dumps({"type": "citations", "citations": citations}) + "\n"
+    yield json.dumps({"type": "citations", "citations": citations,
+                      **(meta or {})}) + "\n"
     parts = []
     try:
         stream = await client.chat.completions.create(
