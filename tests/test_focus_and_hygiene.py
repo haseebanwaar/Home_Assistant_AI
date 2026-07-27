@@ -178,7 +178,10 @@ def test_proactive_decision_preserves_observation_source():
         "A van stopped outside.", source="camera:Driveway"))
 
     assert result["source"] == "camera:Driveway"
-    assert result["kind"] == "camera:Driveway"
+    # `kind` is the sort of nudge, `source` is where it came from. Echoing the
+    # source into kind gave every camera its own kind ('camera:Driveway') and
+    # logged nudges under a device name instead of a category.
+    assert result["kind"] == "insight"
 
 
 # -- corrections teaching the extractor ------------------------------------

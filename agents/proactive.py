@@ -120,7 +120,11 @@ class ProactiveNarrator:
             self._recent_texts.append(text)
             return {
                 "text": text,
-                "kind": "focus_drift" if focus else str(source or "insight"),
+                # `kind` is the sort of nudge this is, not where it came from —
+                # that is what `source` below carries. Echoing the source here
+                # logged nudges as kind 'camera:IPC-A22E-G' and split what should
+                # be one bucket into one per capture device.
+                "kind": "focus_drift" if focus else "insight",
                 "source": str(source or "unknown"),
                 "focus_id": (focus or {}).get("focus_id"),
                 "evidence": [

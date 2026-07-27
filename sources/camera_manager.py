@@ -139,6 +139,9 @@ class CameraManager:
     def status_all(self):
         return [w.status() for w in self.workers.values()]
 
+    def health_all(self):
+        return [w.health() for w in self.workers.values()]
+
     def cleanup_all(self):
         for w in self.workers.values():
             try:

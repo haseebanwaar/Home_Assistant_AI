@@ -93,6 +93,38 @@ class RoomRegistryTests(unittest.TestCase):
 
         self.assertEqual(routed.room_id, "screen")
 
+    def test_legacy_auto_room_cannot_steal_camera_events(self):
+        """A graph written before source rooms still holds 'activity:watching',
+        whose matcher is exactly what the camera prompt emits. It used to outscore
+        the Cameras fallback and swallow every camera event."""
+        legacy = Room(
+            room_id="activity:watching",
+            name="Watching",
+            kind="activity",
+            auto=True,
+            matcher=RoomMatcher(activity_types=["watching"]),
+        )
+        registry = RoomRegistry([legacy])
+
+        routed = registry.route({"source": "camera", "activity_type": "watching"})
+
+        self.assertEqual(routed.room_id, "camera")
+
+    def test_user_topic_room_still_outranks_the_source_room(self):
+        """The auto-room guard must not cost users their own routing."""
+        topic = Room(
+            room_id="topic:watchlist",
+            name="Watchlist",
+            kind="topic",
+            auto=False,
+            matcher=RoomMatcher(activity_types=["watching"]),
+        )
+        registry = RoomRegistry([topic])
+
+        routed = registry.route({"source": "camera", "activity_type": "watching"})
+
+        self.assertEqual(routed.room_id, "topic:watchlist")
+
     def test_source_rooms_are_pinned_so_hygiene_leaves_them_alone(self):
         registry = RoomRegistry()
 

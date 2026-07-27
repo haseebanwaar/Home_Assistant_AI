@@ -496,6 +496,20 @@ async def cameras_list():
     return {"cameras": camera_manager.status_all() if camera_manager else []}
 
 
+@app.get("/cameras/health")
+async def cameras_health():
+    """Windows the VLM analysed but that were not worth remembering.
+
+    A camera whose stream has degraded goes quiet in Cameras rather than loud,
+    so the absence of events is not by itself a signal. This is where that shows
+    up: a climbing 'picture distorted' rate means the decode is failing, and
+    flat_frame_pct says so independently of anything the VLM wrote.
+
+    Registered BEFORE /cameras/{camera_id}/... so the path isn't swallowed.
+    """
+    return {"cameras": camera_manager.health_all() if camera_manager else []}
+
+
 @app.post("/cameras/{camera_id:path}/control")
 async def camera_control(camera_id: str, request: Request):
     """Pause or resume a single camera worker."""
@@ -1200,7 +1214,12 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
 
     messages = [{"role": "system", "content": grounding}]
     for m in history[:-1]:  # prior turns (exclude the just-added user message)
-        messages.append({"role": m["role"], "content": m["text"]})
+        # A room's thread holds more than user/assistant turns — 'coach' reports
+        # and now 'insight' nudges live there too. Those are roles in OUR feed,
+        # not roles the chat API accepts, so everything that is not the user is
+        # replayed as the assistant speaking.
+        role = "user" if m["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": m["text"]})
 
     if live_frames:
         content = [{"type": "text", "text": message}]
@@ -2162,6 +2181,18 @@ def handle_observation_description(description, timestamp, source="screen", cont
                 evidence=insight.get("evidence"))
         except Exception as exc:
             logger.warning("Recording nudge failed: %s", exc)
+        # Also drop it into the feed of the room it came from. Until now an
+        # insight only ever reached the voice/`GET /proactive` surface, so a
+        # remark about what a camera just saw was invisible in Cameras — the one
+        # place the user goes to read that camera's story.
+        # ensure_source_room first: add_message MERGEs a missing room as an
+        # auto=false 'topic', which for room_id 'camera' would be a broken room
+        # that then competes in routing.
+        try:
+            room = neo4j_store.ensure_source_room(source)
+            neo4j_store.add_message(room["room_id"], "insight", text, ts=timestamp)
+        except Exception as exc:
+            logger.warning("Posting insight to its room failed: %s", exc)
     _proactive_seq += 1
     _proactive_insights.append({
         "id": _proactive_seq,

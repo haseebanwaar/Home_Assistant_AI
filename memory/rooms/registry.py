@@ -21,6 +21,8 @@ Scoring weights (higher = more specific / stronger user intent):
 """
 from __future__ import annotations
 
+import re
+
 from memory.models.room import Room, RoomMatcher
 
 W_KEYWORD = 4
@@ -47,6 +49,11 @@ SOURCE_ROOMS = {
         "#8B7CF6", "desktop_windows",
     ),
 }
+
+
+def _slug(text):
+    """Room-id fragment for a user-supplied name ("My Reading" -> "my-reading")."""
+    return re.sub(r"[^a-z0-9]+", "-", str(text or "").strip().lower()).strip("-") or "room"
 
 
 def source_room_id(source):
@@ -112,9 +119,13 @@ class RoomRegistry:
 
         best, best_score = None, 0
         for room in self.rooms.values():
-            # Source rooms are the fallback, not a competitor: an empty matcher
-            # scores 0 anyway, but skip them so a stray matcher can't misroute.
-            if room.kind in ("daily", "camera", "screen") or room.archived:
+            # Only user intent outranks the source room. Every auto room is
+            # skipped, not just today's three kinds: legacy 'activity'/'project'
+            # rooms left in a graph from before source rooms existed still carry
+            # live matchers, and `activity_types: ['watching']` — what the camera
+            # prompt hardcodes — silently captured every camera event away from
+            # Cameras. An auto room must never be able to win this contest.
+            if room.auto or room.kind in ("daily", "camera", "screen") or room.archived:
                 continue
             score = self._score(room.matcher, event, entity_types)
             if score > best_score:

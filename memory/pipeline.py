@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 
 from memory.boundaries.boundary_detector import (
     compute_visual_change,
@@ -28,6 +29,49 @@ from memory.context import app_of, normalize_name, profile_name, project_of, tit
 from memory.sessions.session_manager import SessionManager
 
 logger = logging.getLogger("home_assistant")
+
+MAX_EVENT_SUMMARY = 2000
+# Calibrated on data/debug/extractions.jsonl (1044 real summaries): consecutive
+# pairs sit at p50=0.42, p90=0.65, p95=0.73, so 0.75 is above the noise floor for
+# genuinely different observations while still collapsing a rewording of an
+# unchanged scene. Raising it to 0.85 lets the reworded duplicates back through.
+_NEAR_DUPLICATE_RATIO = 0.75
+
+
+def _words(text):
+    return set(re.findall(r"[a-z0-9']+", text.lower()))
+
+
+def _near_duplicate(a, b):
+    """True when two summaries say the same thing in slightly different words.
+
+    Cheap token-overlap (Jaccard) rather than a proper similarity metric: this
+    runs on every observation, and the case it has to catch — the VLM redescribing
+    an unchanged scene — differs by a handful of words at most.
+    """
+    if a == b:
+        return True
+    wa, wb = _words(a), _words(b)
+    if not wa or not wb:
+        return False
+    return len(wa & wb) / len(wa | wb) >= _NEAR_DUPLICATE_RATIO
+
+
+def clamp_summary(text, limit=MAX_EVENT_SUMMARY):
+    """Trim a summary to `limit` chars from the END, on a word boundary.
+
+    Trimming from the front (`text[-limit:]`) kept the newest words but left the
+    stored summary starting mid-word — "sing the Hugging Face website…" — which
+    is what gets embedded, retrieved, cited and spoken. A summary has to read
+    from its first character, so the tail is what goes.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    space = cut.rfind(" ")
+    if space > limit // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:-") + "…"
 
 
 class MemoryPipeline:
@@ -130,7 +174,7 @@ class MemoryPipeline:
         self._accumulate(result.current_event.event_id, ext, ctx)
         event_text = self.event_texts().get(result.current_event.event_id, {}).get("text")
         if event_text:
-            result.current_event.summary = event_text[-2000:]
+            result.current_event.summary = clamp_summary(event_text)
 
         # Live incremental upsert (no-op sinks -> offline bulk mode).
         self._upsert(result)
@@ -211,7 +255,10 @@ class MemoryPipeline:
 
         txt = self._ev_text.setdefault(event_id, {"parts": [], "profile": None})
         s = (ext.get("summary") or "").strip()
-        if s and (not txt["parts"] or txt["parts"][-1] != s):
+        # Compare against every part, not just the last one: a static scene makes
+        # the VLM re-describe it in slightly different words each window, and an
+        # exact-match-on-previous check let all six near-duplicates through.
+        if s and not any(_near_duplicate(s, prev) for prev in txt["parts"]):
             txt["parts"].append(s)
             # Keep long-running sessions useful without growing forever.
             txt["parts"] = txt["parts"][-6:]

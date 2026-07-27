@@ -21,6 +21,7 @@ import logging
 import os
 import tempfile
 import time
+from collections import defaultdict, deque
 from threading import Event, Thread
 
 import cv2
@@ -28,6 +29,7 @@ import numpy as np
 
 from sources.rtsp import RealtimeCameraStream
 from sources.motion_gate import MotionGate
+from sources.camera_validation import HEALTH, classify
 from memory.models.extraction import ENTITY_TYPE_SUGGESTIONS
 from memory.extraction.validator import run_extraction
 from memory.pipeline import MemoryPipeline
@@ -120,6 +122,13 @@ class CameraCaptureWorker:
         self.last_processed_at = None
         self.last_summary = None
         self.last_error = None
+        # Extractions that were not worth remembering. Kept (bounded) rather than
+        # dropped on the floor: a camera whose feed has degraded shows up here as
+        # a rising 'picture distorted' rate long before anyone notices the room
+        # has gone quiet.
+        self.health_records = deque(maxlen=50)
+        self.discarded = 0
+        self.discarded_by_reason = defaultdict(int)
 
         # Motion gate: only spend a VLM call when the scene actually changed.
         # Adaptive background subtraction absorbs wind/foliage; see MotionGate.
@@ -136,6 +145,7 @@ class CameraCaptureWorker:
         # Max tokens for the VLM extraction. The screen path uses 2500; cameras
         # need room for the summary plus a full entity/claim list.
         self._max_tokens = int(os.getenv("CAMERA_MAX_TOKENS", "5000"))
+        self._min_confidence = float(os.getenv("CAMERA_MIN_CONFIDENCE", "0.35"))
 
         self._thread = Thread(target=self._run, name=f"camera:{camera_id}", daemon=True)
         self._thread.start()
@@ -182,6 +192,7 @@ class CameraCaptureWorker:
         # periodic heartbeat so a static view is still remembered occasionally.
         moved, motion = self.gate.evaluate(frames)
         self.last_motion = motion
+        heartbeat = False
         if not moved:
             self._idle_windows += 1
             heartbeat = (self.heartbeat_windows > 0
@@ -201,6 +212,23 @@ class CameraCaptureWorker:
         logger.info("Camera %s extraction (%s, %d chars, %d entities, %d claims): %s",
                     self.camera_id, status, len(full_summary),
                     len(result.entities), len(result.claims), full_summary)
+
+        # Motion opened the gate; this decides whether the result is worth
+        # remembering. A decode glitch moves most of the frame and so passes the
+        # gate exactly like a person would — only the description reveals there
+        # was nothing there. See sources.camera_validation.
+        verdict, reason = classify(
+            full_summary, entities=[e.name for e in result.entities],
+            claims=[c.text for c in result.claims],
+            confidence=result.confidence, heartbeat=heartbeat,
+            min_confidence=self._min_confidence)
+        if verdict == HEALTH:
+            self._record_health(reason, full_summary, timestamp)
+            logger.info("Camera %s: extraction not stored (%s).",
+                        self.camera_id, reason)
+            self.frames_processed += len(frames)
+            self.last_processed_at = timestamp
+            return
 
         # `application` becomes the event's source tag in the Cameras room, so it
         # carries the camera's display name ("IPC-A22E-G") rather than its id —
@@ -249,6 +277,29 @@ class CameraCaptureWorker:
 
         return await run_extraction(generate)
 
+    def _record_health(self, reason, summary, timestamp):
+        self.discarded += 1
+        self.discarded_by_reason[reason] += 1
+        self.health_records.append({
+            "timestamp": timestamp, "reason": reason,
+            "summary": (summary or "")[:300],
+        })
+
+    def health(self):
+        """Why this camera's windows were not stored, newest first."""
+        attempted = self.events_logged + self.discarded
+        return {
+            "camera_id": self.camera_id,
+            "name": self.name,
+            "stored": self.events_logged,
+            "discarded": self.discarded,
+            "discard_pct": (round(100.0 * self.discarded / attempted, 1)
+                            if attempted else None),
+            "by_reason": dict(self.discarded_by_reason),
+            "flat_frame_pct": self.stream.status().get("flat_frame_pct"),
+            "recent": list(self.health_records)[::-1],
+        }
+
     # -- status / teardown -------------------------------------------------
     def status(self):
         st = self.stream.status()
@@ -260,7 +311,14 @@ class CameraCaptureWorker:
             "healthy": bool(st.get("healthy")) and not self._paused,
             "paused": self._paused,
             "buffered_frames": st.get("frames", 0),
+            "last_frame_at": st.get("last_frame_at"),
+            "reconnects": st.get("reconnects", 0),
+            "flat_frame_pct": st.get("flat_frame_pct"),
+            "last_frame_std": st.get("last_frame_std"),
             "events_logged": self.events_logged,
+            "discarded": self.discarded,
+            "last_discard_reason": (self.health_records[-1]["reason"]
+                                    if self.health_records else None),
             "last_processed_at": self.last_processed_at,
             "last_summary": self.last_summary,
             "last_motion": self.last_motion,
