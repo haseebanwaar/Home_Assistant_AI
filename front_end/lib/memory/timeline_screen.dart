@@ -64,12 +64,14 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
   bool _timelineLoading = false;
   bool _searching = false;
   bool _entitiesLoading = false;
+  bool _profileLoading = false;
   String? _timelineError;
   String? _searchError;
   List<dynamic> _sessions = [];
   List<dynamic> _results = [];
   List<dynamic> _entities = [];
   List<dynamic> _rooms = [];
+  Map<String, dynamic> _profile = {};
   String _memoryDomain = 'personal';
   DateTimeRange? _searchRange;
   String? _searchRoomId;
@@ -85,10 +87,11 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
   @override
   void initState() {
     super.initState();
-    _tabs = TabController(length: 3, vsync: this);
+    _tabs = TabController(length: 4, vsync: this);
     _loadTimeline();
     _loadEntities();
     _loadRooms();
+    _loadProfile();
   }
 
   @override
@@ -101,8 +104,9 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
 
   void _snack(String message) {
     if (mounted) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(message)));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
     }
   }
 
@@ -113,10 +117,7 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
     });
     try {
       final uri = Uri.parse('${widget.apiBase}/memory/timeline').replace(
-        queryParameters: {
-          'date': _dateIso(_date),
-          'domain': _memoryDomain,
-        },
+        queryParameters: {'date': _dateIso(_date), 'domain': _memoryDomain},
       );
       final resp = await http.get(uri).timeout(const Duration(seconds: 20));
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
@@ -157,6 +158,25 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
       final data = json.decode(resp.body) as Map<String, dynamic>;
       if (mounted) setState(() => _rooms = (data['rooms'] as List?) ?? []);
     } catch (_) {}
+  }
+
+  Future<void> _loadProfile() async {
+    setState(() => _profileLoading = true);
+    try {
+      final resp = await http
+          .get(Uri.parse('${widget.apiBase}/memory/personal-profile'))
+          .timeout(const Duration(seconds: 20));
+      if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
+      if (mounted) {
+        setState(
+          () => _profile = json.decode(resp.body) as Map<String, dynamic>,
+        );
+      }
+    } catch (e) {
+      _snack('Could not load personal profile: $e');
+    } finally {
+      if (mounted) setState(() => _profileLoading = false);
+    }
   }
 
   Future<void> _search() async {
@@ -236,6 +256,7 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
             onPressed: () {
               _loadTimeline();
               _loadEntities();
+              _loadProfile();
               if (_query.text.trim().isNotEmpty) _search();
             },
           ),
@@ -260,8 +281,8 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
                     ),
                   ],
                   selected: {_memoryDomain},
-                  onSelectionChanged: (value) =>
-                      _changeMemoryDomain(value.first),
+                  onSelectionChanged:
+                      (value) => _changeMemoryDomain(value.first),
                   showSelectedIcon: false,
                 ),
               ),
@@ -274,6 +295,7 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
                   Tab(icon: Icon(Icons.search), text: 'Search'),
                   Tab(icon: Icon(Icons.timeline), text: 'Timeline'),
                   Tab(icon: Icon(Icons.hub_outlined), text: 'Entities'),
+                  Tab(icon: Icon(Icons.person_search_outlined), text: 'Me'),
                 ],
               ),
             ],
@@ -282,7 +304,7 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
       ),
       body: TabBarView(
         controller: _tabs,
-        children: [_searchTab(), _timelineTab(), _entitiesTab()],
+        children: [_searchTab(), _timelineTab(), _entitiesTab(), _profileTab()],
       ),
     );
   }
@@ -316,8 +338,14 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
                 child: ListView(
                   scrollDirection: Axis.horizontal,
                   children: [
-                    for (final kind
-                        in ['event', 'note', 'message', 'entity', 'claim', 'room'])
+                    for (final kind in [
+                      'event',
+                      'note',
+                      'message',
+                      'entity',
+                      'claim',
+                      'room',
+                    ])
                       Padding(
                         padding: const EdgeInsets.only(right: 6),
                         child: FilterChip(
@@ -336,8 +364,9 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
                           selectedColor: _mint,
                           backgroundColor: _panelRaised,
                           labelStyle: TextStyle(
-                              color: _searchKinds.contains(kind) ? _ink : _muted,
-                              fontSize: 11),
+                            color: _searchKinds.contains(kind) ? _ink : _muted,
+                            fontSize: 11,
+                          ),
                           showCheckmark: false,
                           side: const BorderSide(color: _line),
                         ),
@@ -366,20 +395,31 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
                       initialValue: _searchRoomId,
                       isExpanded: true,
                       decoration: const InputDecoration(
-                          isDense: true, labelText: 'Room'),
+                        isDense: true,
+                        labelText: 'Room',
+                      ),
                       dropdownColor: _panelRaised,
                       items: [
                         const DropdownMenuItem<String?>(
-                            value: null, child: Text('All rooms')),
+                          value: null,
+                          child: Text('All rooms'),
+                        ),
                         ..._rooms
-                            .where((room) => _memoryDomain == 'home'
-                                ? room['kind'] == 'camera'
-                                : room['kind'] != 'camera')
-                            .map((room) => DropdownMenuItem<String?>(
-                                  value: room['room_id'].toString(),
-                                  child: Text(room['name'].toString(),
-                                      overflow: TextOverflow.ellipsis),
-                                )),
+                            .where(
+                              (room) =>
+                                  _memoryDomain == 'home'
+                                      ? room['kind'] == 'camera'
+                                      : room['kind'] != 'camera',
+                            )
+                            .map(
+                              (room) => DropdownMenuItem<String?>(
+                                value: room['room_id'].toString(),
+                                child: Text(
+                                  room['name'].toString(),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ),
                       ],
                       onChanged: (value) {
                         setState(() => _searchRoomId = value);
@@ -404,20 +444,25 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
         if (_searching)
           const LinearProgressIndicator(minHeight: 2, color: _mint),
         Expanded(
-          child: _searchError != null
-              ? _empty('Search failed.\n$_searchError')
-              : _results.isEmpty
-                  ? _empty(_query.text.trim().isEmpty
-                      ? (_memoryDomain == 'personal'
-                          ? 'Search PC activity, work, and personal assistant context.'
-                          : 'Search cameras, rooms, and household observations.')
-                      : 'No matching memories.')
+          child:
+              _searchError != null
+                  ? _empty('Search failed.\n$_searchError')
+                  : _results.isEmpty
+                  ? _empty(
+                    _query.text.trim().isEmpty
+                        ? (_memoryDomain == 'personal'
+                            ? 'Search PC activity, work, and personal assistant context.'
+                            : 'Search cameras, rooms, and household observations.')
+                        : 'No matching memories.',
+                  )
                   : ListView.builder(
-                      padding: const EdgeInsets.all(12),
-                      itemCount: _results.length,
-                      itemBuilder: (_, index) => _searchResult(
-                          _results[index] as Map<String, dynamic>),
-                    ),
+                    padding: const EdgeInsets.all(12),
+                    itemCount: _results.length,
+                    itemBuilder:
+                        (_, index) => _searchResult(
+                          _results[index] as Map<String, dynamic>,
+                        ),
+                  ),
         ),
       ],
     );
@@ -458,22 +503,31 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
                     Row(
                       children: [
                         Expanded(
-                          child: Text((item['title'] ?? kind).toString(),
-                              style: const TextStyle(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.w700)),
+                          child: Text(
+                            (item['title'] ?? kind).toString(),
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
                         ),
-                        Text(kind,
-                            style:
-                                const TextStyle(color: _muted, fontSize: 10)),
+                        Text(
+                          kind,
+                          style: const TextStyle(color: _muted, fontSize: 10),
+                        ),
                       ],
                     ),
                     const SizedBox(height: 4),
-                    Text((item['text'] ?? '').toString(),
-                        maxLines: 4,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                            color: Colors.white70, fontSize: 13, height: 1.3)),
+                    Text(
+                      (item['text'] ?? '').toString(),
+                      maxLines: 4,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 13,
+                        height: 1.3,
+                      ),
+                    ),
                     if (item['ts'] != null || rooms.isNotEmpty) ...[
                       const SizedBox(height: 7),
                       Text(
@@ -511,40 +565,48 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
         context: context,
         backgroundColor: _panel,
         showDragHandle: true,
-        builder: (_) => Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text((item['title'] ?? kind).toString(),
-                  style: const TextStyle(
+        builder:
+            (_) => Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    (item['title'] ?? kind).toString(),
+                    style: const TextStyle(
                       color: Colors.white,
                       fontSize: 18,
-                      fontWeight: FontWeight.w700)),
-              const SizedBox(height: 12),
-              Text((item['text'] ?? '').toString(),
-                  style: const TextStyle(color: Colors.white70, height: 1.4)),
-            ],
-          ),
-        ),
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    (item['text'] ?? '').toString(),
+                    style: const TextStyle(color: Colors.white70, height: 1.4),
+                  ),
+                ],
+              ),
+            ),
       );
     }
   }
 
   Widget _timelineTab() {
     final needle = _timelineFilter.text.trim().toLowerCase();
-    final sessions = _sessions.where((raw) {
-      if (needle.isEmpty) return true;
-      final session = raw as Map<String, dynamic>;
-      return [
-        session['application'],
-        session['activity_type'],
-        session['project_id'],
-        ...((session['events'] as List?) ?? [])
-            .map((event) => event['summary']),
-      ].join(' ').toLowerCase().contains(needle);
-    }).toList();
+    final sessions =
+        _sessions.where((raw) {
+          if (needle.isEmpty) return true;
+          final session = raw as Map<String, dynamic>;
+          return [
+            session['application'],
+            session['activity_type'],
+            session['project_id'],
+            ...((session['events'] as List?) ?? []).map(
+              (event) => event['summary'],
+            ),
+          ].join(' ').toLowerCase().contains(needle);
+        }).toList();
     return Column(
       children: [
         _dateBar(),
@@ -555,26 +617,32 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
             onChanged: (_) => setState(() {}),
             style: const TextStyle(color: Colors.white, fontSize: 13),
             decoration: const InputDecoration(
-                isDense: true,
-                prefixIcon: Icon(Icons.filter_list),
-                hintText: 'Filter this day'),
+              isDense: true,
+              prefixIcon: Icon(Icons.filter_list),
+              hintText: 'Filter this day',
+            ),
           ),
         ),
         if (_timelineLoading)
           const LinearProgressIndicator(minHeight: 2, color: _mint),
         Expanded(
-          child: _timelineError != null
-              ? _empty('Could not load timeline.\n$_timelineError')
-              : sessions.isEmpty
-                  ? _empty(_memoryDomain == 'personal'
-                      ? 'No personal activity recorded for this day.'
-                      : 'No home observations recorded for this day.')
+          child:
+              _timelineError != null
+                  ? _empty('Could not load timeline.\n$_timelineError')
+                  : sessions.isEmpty
+                  ? _empty(
+                    _memoryDomain == 'personal'
+                        ? 'No personal activity recorded for this day.'
+                        : 'No home observations recorded for this day.',
+                  )
                   : ListView.builder(
-                      padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
-                      itemCount: sessions.length,
-                      itemBuilder: (_, index) => _sessionCard(
-                          sessions[index] as Map<String, dynamic>),
-                    ),
+                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
+                    itemCount: sessions.length,
+                    itemBuilder:
+                        (_, index) => _sessionCard(
+                          sessions[index] as Map<String, dynamic>,
+                        ),
+                  ),
         ),
       ],
     );
@@ -587,28 +655,38 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
       child: Row(
         children: [
           IconButton(
-              icon: const Icon(Icons.chevron_left, color: _muted),
-              onPressed: () => _changeDay(-1)),
+            icon: const Icon(Icons.chevron_left, color: _muted),
+            onPressed: () => _changeDay(-1),
+          ),
           Expanded(
             child: InkWell(
               onTap: _pickDay,
-              child: Text(_dateIso(_date),
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                      color: Colors.white, fontWeight: FontWeight.w700)),
+              child: Text(
+                _dateIso(_date),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
             ),
           ),
           IconButton(
-              icon: const Icon(Icons.chevron_right, color: _muted),
-              onPressed: () => _changeDay(1)),
+            icon: const Icon(Icons.chevron_right, color: _muted),
+            onPressed: () => _changeDay(1),
+          ),
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert, color: _muted),
             onSelected: (value) {
               if (value == 'forget') _forgetDay();
             },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'forget', child: Text('Forget this day')),
-            ],
+            itemBuilder:
+                (_) => const [
+                  PopupMenuItem(
+                    value: 'forget',
+                    child: Text('Forget this day'),
+                  ),
+                ],
           ),
         ],
       ),
@@ -628,28 +706,38 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
         iconColor: _mint,
         collapsedIconColor: _muted,
         leading: const Icon(Icons.desktop_windows, color: _mint),
-        title: Text(app,
-            style: const TextStyle(
-                color: Colors.white, fontWeight: FontWeight.w700)),
-        subtitle: Text('$activity · $mins min',
-            style: const TextStyle(color: _muted, fontSize: 12)),
+        title: Text(
+          app,
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        subtitle: Text(
+          '$activity · $mins min',
+          style: const TextStyle(color: _muted, fontSize: 12),
+        ),
         trailing: PopupMenuButton<String>(
           icon: const Icon(Icons.more_vert, color: _muted),
-          onSelected: (_) =>
-              _forgetSession(session['session_id']?.toString() ?? ''),
-          itemBuilder: (_) => const [
-            PopupMenuItem(value: 'forget', child: Text('Forget session')),
-          ],
+          onSelected:
+              (_) => _forgetSession(session['session_id']?.toString() ?? ''),
+          itemBuilder:
+              (_) => const [
+                PopupMenuItem(value: 'forget', child: Text('Forget session')),
+              ],
         ),
         children: [
           for (final event in events)
             ListTile(
               dense: true,
-              title: Text((event['summary'] ?? '(no summary)').toString(),
-                  style: const TextStyle(color: Colors.white70, fontSize: 13)),
+              title: Text(
+                (event['summary'] ?? '(no summary)').toString(),
+                style: const TextStyle(color: Colors.white70, fontSize: 13),
+              ),
               subtitle: Text(
-                  '${_hm(event['span_start'])}–${_hm(event['span_end'])}',
-                  style: const TextStyle(color: _mint, fontSize: 11)),
+                '${_hm(event['span_start'])}–${_hm(event['span_end'])}',
+                style: const TextStyle(color: _mint, fontSize: 11),
+              ),
               onTap: () => _openEvent(event['event_id'].toString()),
             ),
         ],
@@ -664,59 +752,212 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
         if (_entitiesLoading)
           const LinearProgressIndicator(minHeight: 2, color: _mint),
         Expanded(
-          child: _entities.isEmpty && !_entitiesLoading
-              ? _empty(_memoryDomain == 'personal'
-                  ? 'No personal-memory entities for this day.'
-                  : 'No home-memory entities for this day.')
-              : ListView.separated(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: _entities.length,
-                  separatorBuilder: (_, __) => const Divider(color: _line),
-                  itemBuilder: (_, index) {
-                    final entity =
-                        _entities[index] as Map<String, dynamic>;
-                    return ListTile(
-                      leading: const CircleAvatar(
+          child:
+              _entities.isEmpty && !_entitiesLoading
+                  ? _empty(
+                    _memoryDomain == 'personal'
+                        ? 'No personal-memory entities for this day.'
+                        : 'No home-memory entities for this day.',
+                  )
+                  : ListView.separated(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: _entities.length,
+                    separatorBuilder: (_, __) => const Divider(color: _line),
+                    itemBuilder: (_, index) {
+                      final entity = _entities[index] as Map<String, dynamic>;
+                      return ListTile(
+                        leading: const CircleAvatar(
                           backgroundColor: _panelRaised,
-                          child: Icon(Icons.hub_outlined, color: _violet)),
-                      title: Text(entity['name'].toString(),
+                          child: Icon(Icons.hub_outlined, color: _violet),
+                        ),
+                        title: Text(
+                          entity['name'].toString(),
                           style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.w700)),
-                      subtitle: Text(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        subtitle: Text(
                           '${entity['type'] ?? 'entity'} · ${entity['mentions'] ?? 0} mentions',
-                          style: const TextStyle(color: _muted)),
-                      trailing:
-                          const Icon(Icons.chevron_right, color: _muted),
-                      onTap: () => _openEntity(
-                          (entity['entity_id'] ?? entity['name'])
-                              .toString()
-                              .toLowerCase()),
-                    );
-                  },
-                ),
+                          style: const TextStyle(color: _muted),
+                        ),
+                        trailing: const Icon(
+                          Icons.chevron_right,
+                          color: _muted,
+                        ),
+                        onTap:
+                            () => _openEntity(
+                              (entity['entity_id'] ?? entity['name'])
+                                  .toString()
+                                  .toLowerCase(),
+                            ),
+                      );
+                    },
+                  ),
         ),
       ],
     );
   }
 
-  Widget _empty(String text) => Center(
-        child: Padding(
-          padding: const EdgeInsets.all(28),
-          child: Text(text,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: _muted, height: 1.4)),
-        ),
+  Widget _profileTab() {
+    if (_memoryDomain != 'personal') {
+      return _empty(
+        'The personal profile is learned only from your PC activity and conversations.',
       );
+    }
+    final facts = (_profile['facts'] as List?) ?? [];
+    final routine =
+        (_profile['routines'] as Map?)?.cast<String, dynamic>() ?? {};
+    final projects = (routine['projects'] as List?) ?? [];
+    final activities = (routine['activities'] as List?) ?? [];
+    return RefreshIndicator(
+      onRefresh: _loadProfile,
+      color: _mint,
+      child: ListView(
+        padding: const EdgeInsets.all(12),
+        children: [
+          if (_profileLoading)
+            const LinearProgressIndicator(minHeight: 2, color: _mint),
+          Card(
+            color: _panel,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Your PC rhythm',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 17,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    (routine['events'] ?? 0) == 0
+                        ? 'Still learning from your activity.'
+                        : '${routine['days_observed']} observed days · '
+                            'usually first seen ${routine['typical_first_use']} · '
+                            'last seen ${routine['typical_last_use']}',
+                    style: const TextStyle(color: _muted, height: 1.4),
+                  ),
+                  if (projects.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      'Projects · ${projects.take(6).map((p) => p['name']).join(', ')}',
+                      style: const TextStyle(color: _mint),
+                    ),
+                  ],
+                  if (activities.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      'Activities · ${activities.take(6).map((p) => p['name']).join(', ')}',
+                      style: const TextStyle(color: _violet),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(4, 18, 4, 8),
+            child: Text(
+              'What I know about you',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 17,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          if (facts.isEmpty && !_profileLoading)
+            const Padding(
+              padding: EdgeInsets.all(20),
+              child: Text(
+                'No durable personal facts yet. Talk naturally and keep screen memory running; this fills in over time.',
+                style: TextStyle(color: _muted, height: 1.4),
+              ),
+            ),
+          for (final raw in facts)
+            Builder(
+              builder: (_) {
+                final fact = (raw as Map).cast<String, dynamic>();
+                final confidence =
+                    (fact['confidence'] as num?)?.toDouble() ?? 0;
+                return Card(
+                  color: _panel,
+                  child: ListTile(
+                    leading: CircleAvatar(
+                      backgroundColor: _panelRaised,
+                      child: Text(
+                        '${(confidence * 100).round()}',
+                        style: const TextStyle(color: _mint, fontSize: 11),
+                      ),
+                    ),
+                    title: Text(
+                      '${fact['name']}: ${fact['value']}',
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                    subtitle: Text(
+                      '${fact['category']} · ${fact['source']} · '
+                      '${fact['evidence_count']} evidence',
+                      style: const TextStyle(color: _muted),
+                    ),
+                    trailing: IconButton(
+                      tooltip: 'Forget',
+                      icon: const Icon(Icons.delete_outline, color: _muted),
+                      onPressed:
+                          () => _forgetPersonalFact(fact['fact_id'].toString()),
+                    ),
+                  ),
+                );
+              },
+            ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _forgetPersonalFact(String factId) async {
+    if (!await _confirm(
+      'Forget this personal fact?',
+      'The assistant will stop using this belief. New evidence may teach it again later.',
+    )) {
+      return;
+    }
+    final resp = await http.delete(
+      Uri.parse('${widget.apiBase}/memory/personal-profile/$factId'),
+    );
+    if (resp.statusCode == 200) {
+      _loadProfile();
+    } else {
+      _snack('Could not forget personal fact: HTTP ${resp.statusCode}');
+    }
+  }
+
+  Widget _empty(String text) => Center(
+    child: Padding(
+      padding: const EdgeInsets.all(28),
+      child: Text(
+        text,
+        textAlign: TextAlign.center,
+        style: const TextStyle(color: _muted, height: 1.4),
+      ),
+    ),
+  );
 
   Future<void> _openEvent(String eventId) async {
-    final changed = await Navigator.of(context).push<bool>(MaterialPageRoute(
-      builder: (_) => MemoryEventScreen(
-        apiBase: widget.apiBase,
-        eventId: eventId,
-        memoryDomain: _memoryDomain,
+    final changed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder:
+            (_) => MemoryEventScreen(
+              apiBase: widget.apiBase,
+              eventId: eventId,
+              memoryDomain: _memoryDomain,
+            ),
       ),
-    ));
+    );
     if (changed == true) {
       _loadTimeline();
       if (_query.text.trim().isNotEmpty) _search();
@@ -724,13 +965,16 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
   }
 
   Future<void> _openEntity(String entityId) async {
-    final changed = await Navigator.of(context).push<bool>(MaterialPageRoute(
-      builder: (_) => MemoryEntityScreen(
-        apiBase: widget.apiBase,
-        entityId: entityId,
-        memoryDomain: _memoryDomain,
+    final changed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder:
+            (_) => MemoryEntityScreen(
+              apiBase: widget.apiBase,
+              entityId: entityId,
+              memoryDomain: _memoryDomain,
+            ),
       ),
-    ));
+    );
     if (changed == true) {
       _loadEntities();
       if (_query.text.trim().isNotEmpty) _search();
@@ -740,30 +984,36 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
   Future<bool> _confirm(String title, String body) async {
     return await showDialog<bool>(
           context: context,
-          builder: (_) => AlertDialog(
-            title: Text(title),
-            content: Text(body),
-            actions: [
-              TextButton(
-                  onPressed: () => Navigator.pop(context, false),
-                  child: const Text('Cancel')),
-              FilledButton(
-                  onPressed: () => Navigator.pop(context, true),
-                  child: const Text('Forget')),
-            ],
-          ),
+          builder:
+              (_) => AlertDialog(
+                title: Text(title),
+                content: Text(body),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('Cancel'),
+                  ),
+                  FilledButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('Forget'),
+                  ),
+                ],
+              ),
         ) ??
         false;
   }
 
   Future<void> _forgetSession(String sessionId) async {
     if (sessionId.isEmpty ||
-        !await _confirm('Forget this session?',
-            'All of its events and vector memories will be permanently removed.')) {
+        !await _confirm(
+          'Forget this session?',
+          'All of its events and vector memories will be permanently removed.',
+        )) {
       return;
     }
-    final resp = await http
-        .delete(Uri.parse('${widget.apiBase}/memory/sessions/$sessionId'));
+    final resp = await http.delete(
+      Uri.parse('${widget.apiBase}/memory/sessions/$sessionId'),
+    );
     if (resp.statusCode == 200) {
       _loadTimeline();
     } else {
@@ -774,12 +1024,15 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
   Future<void> _forgetDay() async {
     final day = _dateIso(_date);
     final label = _memoryDomain == 'personal' ? 'personal' : 'home';
-    if (!await _confirm('Forget $label memory for $day?',
-        'Only $label events and their vector memories for this day will be permanently removed.')) {
+    if (!await _confirm(
+      'Forget $label memory for $day?',
+      'Only $label events and their vector memories for this day will be permanently removed.',
+    )) {
       return;
     }
-    final uri = Uri.parse('${widget.apiBase}/memory/days/$day')
-        .replace(queryParameters: {'domain': _memoryDomain});
+    final uri = Uri.parse(
+      '${widget.apiBase}/memory/days/$day',
+    ).replace(queryParameters: {'domain': _memoryDomain});
     final resp = await http.delete(uri);
     if (resp.statusCode == 200) {
       _loadTimeline();
@@ -821,7 +1074,8 @@ class _MemoryEventScreenState extends State<MemoryEventScreen> {
     setState(() => _loading = true);
     try {
       final resp = await http.get(
-          Uri.parse('${widget.apiBase}/memory/events/${widget.eventId}'));
+        Uri.parse('${widget.apiBase}/memory/events/${widget.eventId}'),
+      );
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
       final data = json.decode(resp.body) as Map<String, dynamic>;
       setState(() {
@@ -849,21 +1103,24 @@ class _MemoryEventScreenState extends State<MemoryEventScreen> {
           title: const Text('Memory event'),
           actions: [
             IconButton(
-                tooltip: 'Edit summary',
-                icon: const Icon(Icons.edit, color: _mint),
-                onPressed: _event == null ? null : _edit),
+              tooltip: 'Edit summary',
+              icon: const Icon(Icons.edit, color: _mint),
+              onPressed: _event == null ? null : _edit,
+            ),
             IconButton(
-                tooltip: 'Forget event',
-                icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
-                onPressed: _event == null ? null : _forget),
+              tooltip: 'Forget event',
+              icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+              onPressed: _event == null ? null : _forget,
+            ),
           ],
         ),
-        body: _loading
-            ? const Center(child: CircularProgressIndicator(color: _mint))
-            : _error != null
+        body:
+            _loading
+                ? const Center(child: CircularProgressIndicator(color: _mint))
+                : _error != null
                 ? Center(
-                    child: Text(_error!,
-                        style: const TextStyle(color: _muted)))
+                  child: Text(_error!, style: const TextStyle(color: _muted)),
+                )
                 : _body(),
       ),
     );
@@ -877,89 +1134,123 @@ class _MemoryEventScreenState extends State<MemoryEventScreen> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        Text((event['summary'] ?? '(no summary)').toString(),
-            style: const TextStyle(
-                color: Colors.white, fontSize: 18, height: 1.4)),
+        Text(
+          (event['summary'] ?? '(no summary)').toString(),
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 18,
+            height: 1.4,
+          ),
+        ),
         const SizedBox(height: 10),
         Text(
-            '${_dayTime(event['span_start'])}–${_hm(event['span_end'])} · '
-            '${event['application'] ?? event['activity_type'] ?? ''}',
-            style: const TextStyle(color: _muted)),
+          '${_dayTime(event['span_start'])}–${_hm(event['span_end'])} · '
+          '${event['application'] ?? event['activity_type'] ?? ''}',
+          style: const TextStyle(color: _muted),
+        ),
         if (event['original_summary'] != null) ...[
           const SizedBox(height: 12),
           _section('Original extraction'),
-          Text(event['original_summary'].toString(),
-              style: const TextStyle(color: _muted, fontStyle: FontStyle.italic)),
+          Text(
+            event['original_summary'].toString(),
+            style: const TextStyle(color: _muted, fontStyle: FontStyle.italic),
+          ),
         ],
         _section('Rooms'),
         Wrap(
           spacing: 7,
           runSpacing: 7,
-          children: rooms
-              .map((room) => Chip(
-                    label: Text(room['name'].toString()),
-                    avatar: Icon(
-                        room['manual'] == true ? Icons.lock : Icons.auto_awesome,
-                        size: 15),
-                  ))
-              .toList(),
+          children:
+              rooms
+                  .map(
+                    (room) => Chip(
+                      label: Text(room['name'].toString()),
+                      avatar: Icon(
+                        room['manual'] == true
+                            ? Icons.lock
+                            : Icons.auto_awesome,
+                        size: 15,
+                      ),
+                    ),
+                  )
+                  .toList(),
         ),
         _section('Entities'),
         if (entities.isEmpty)
           const Text('None', style: TextStyle(color: _muted))
         else
-          ...entities.map((entity) => ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.hub_outlined, color: _violet),
-                title: Text(entity['name'].toString(),
-                    style: const TextStyle(color: Colors.white)),
-                subtitle: Text(entity['type'].toString(),
-                    style: const TextStyle(color: _muted)),
-                onTap: () => Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => MemoryEntityScreen(
-                      apiBase: widget.apiBase,
-                      entityId: entity['entity_id'].toString(),
-                      memoryDomain: widget.memoryDomain,
+          ...entities.map(
+            (entity) => ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.hub_outlined, color: _violet),
+              title: Text(
+                entity['name'].toString(),
+                style: const TextStyle(color: Colors.white),
+              ),
+              subtitle: Text(
+                entity['type'].toString(),
+                style: const TextStyle(color: _muted),
+              ),
+              onTap:
+                  () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder:
+                          (_) => MemoryEntityScreen(
+                            apiBase: widget.apiBase,
+                            entityId: entity['entity_id'].toString(),
+                            memoryDomain: widget.memoryDomain,
+                          ),
                     ),
                   ),
-                ),
-              )),
+            ),
+          ),
         _section('Claims'),
         if (claims.isEmpty)
           const Text('None', style: TextStyle(color: _muted))
         else
-          ...claims.map((claim) => ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading:
-                    const Icon(Icons.fact_check_outlined, color: _mint),
-                title: Text(claim['text'].toString(),
-                    style: const TextStyle(color: Colors.white70)),
-                trailing: PopupMenuButton<String>(
-                  onSelected: (value) => value == 'edit'
-                      ? _editClaim(claim as Map<String, dynamic>)
-                      : _deleteClaim(claim as Map<String, dynamic>),
-                  itemBuilder: (_) => const [
-                    PopupMenuItem(value: 'edit', child: Text('Correct')),
-                    PopupMenuItem(value: 'delete', child: Text('Forget')),
-                  ],
-                ),
-              )),
+          ...claims.map(
+            (claim) => ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.fact_check_outlined, color: _mint),
+              title: Text(
+                claim['text'].toString(),
+                style: const TextStyle(color: Colors.white70),
+              ),
+              trailing: PopupMenuButton<String>(
+                onSelected:
+                    (value) =>
+                        value == 'edit'
+                            ? _editClaim(claim as Map<String, dynamic>)
+                            : _deleteClaim(claim as Map<String, dynamic>),
+                itemBuilder:
+                    (_) => const [
+                      PopupMenuItem(value: 'edit', child: Text('Correct')),
+                      PopupMenuItem(value: 'delete', child: Text('Forget')),
+                    ],
+              ),
+            ),
+          ),
       ],
     );
   }
 
   Widget _section(String title) => Padding(
-        padding: const EdgeInsets.only(top: 24, bottom: 8),
-        child: Text(title,
-            style: const TextStyle(
-                color: _mint, fontWeight: FontWeight.w700, fontSize: 13)),
-      );
+    padding: const EdgeInsets.only(top: 24, bottom: 8),
+    child: Text(
+      title,
+      style: const TextStyle(
+        color: _mint,
+        fontWeight: FontWeight.w700,
+        fontSize: 13,
+      ),
+    ),
+  );
 
   Future<void> _edit() async {
-    final controller =
-        TextEditingController(text: (_event!['summary'] ?? '').toString());
+    final controller = TextEditingController(
+      text: (_event!['summary'] ?? '').toString(),
+    );
     if (!await _textDialog('Correct event summary', controller)) return;
     final resp = await http.patch(
       Uri.parse('${widget.apiBase}/memory/events/${widget.eventId}'),
@@ -988,7 +1279,8 @@ class _MemoryEventScreenState extends State<MemoryEventScreen> {
 
   Future<void> _deleteClaim(Map<String, dynamic> claim) async {
     final resp = await http.delete(
-        Uri.parse('${widget.apiBase}/memory/claims/${claim['claim_id']}'));
+      Uri.parse('${widget.apiBase}/memory/claims/${claim['claim_id']}'),
+    );
     if (resp.statusCode == 200) {
       _changed = true;
       _load();
@@ -996,23 +1288,34 @@ class _MemoryEventScreenState extends State<MemoryEventScreen> {
   }
 
   Future<bool> _textDialog(
-      String title, TextEditingController controller) async {
+    String title,
+    TextEditingController controller,
+  ) async {
     return await showDialog<bool>(
           context: context,
-          builder: (_) => AlertDialog(
-            title: Text(title),
-            content:
-                TextField(controller: controller, minLines: 3, maxLines: 8),
-            actions: [
-              TextButton(
-                  onPressed: () => Navigator.pop(context, false),
-                  child: const Text('Cancel')),
-              FilledButton(
-                  onPressed: () =>
-                      Navigator.pop(context, controller.text.trim().isNotEmpty),
-                  child: const Text('Save correction')),
-            ],
-          ),
+          builder:
+              (_) => AlertDialog(
+                title: Text(title),
+                content: TextField(
+                  controller: controller,
+                  minLines: 3,
+                  maxLines: 8,
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('Cancel'),
+                  ),
+                  FilledButton(
+                    onPressed:
+                        () => Navigator.pop(
+                          context,
+                          controller.text.trim().isNotEmpty,
+                        ),
+                    child: const Text('Save correction'),
+                  ),
+                ],
+              ),
         ) ??
         false;
   }
@@ -1020,23 +1323,28 @@ class _MemoryEventScreenState extends State<MemoryEventScreen> {
   Future<void> _forget() async {
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Forget this event?'),
-        content: const Text(
-            'The graph event, its private claims and vector embedding will be removed.'),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Forget')),
-        ],
-      ),
+      builder:
+          (_) => AlertDialog(
+            title: const Text('Forget this event?'),
+            content: const Text(
+              'The graph event, its private claims and vector embedding will be removed.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Forget'),
+              ),
+            ],
+          ),
     );
     if (confirmed != true) return;
     final resp = await http.delete(
-        Uri.parse('${widget.apiBase}/memory/events/${widget.eventId}'));
+      Uri.parse('${widget.apiBase}/memory/events/${widget.eventId}'),
+    );
     if (resp.statusCode == 200 && mounted) {
       Navigator.pop(context, true);
     }
@@ -1073,11 +1381,13 @@ class _MemoryEntityScreenState extends State<MemoryEntityScreen> {
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
-      final uri =
-          Uri.parse('${widget.apiBase}/memory/entities/${widget.entityId}')
-              .replace(queryParameters: {
-        if (widget.memoryDomain != null) 'domain': widget.memoryDomain!,
-      });
+      final uri = Uri.parse(
+        '${widget.apiBase}/memory/entities/${widget.entityId}',
+      ).replace(
+        queryParameters: {
+          if (widget.memoryDomain != null) 'domain': widget.memoryDomain!,
+        },
+      );
       final resp = await http.get(uri);
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
       final data = json.decode(resp.body) as Map<String, dynamic>;
@@ -1106,31 +1416,38 @@ class _MemoryEntityScreenState extends State<MemoryEntityScreen> {
           title: Text(_entity?['name']?.toString() ?? 'Entity'),
           actions: [
             IconButton(
-                icon: const Icon(Icons.edit, color: _mint),
-                onPressed: _entity == null ? null : _edit),
+              icon: const Icon(Icons.edit, color: _mint),
+              onPressed: _entity == null ? null : _edit,
+            ),
             PopupMenuButton<String>(
               enabled: _entity != null,
               icon: const Icon(Icons.call_split, color: _violet),
-              onSelected: (value) =>
-                  value == 'merge' ? _merge() : _split(),
-              itemBuilder: (_) => const [
-                PopupMenuItem(
-                    value: 'merge', child: Text('Merge into another entity')),
-                PopupMenuItem(
-                    value: 'split', child: Text('Split selected events')),
-              ],
+              onSelected: (value) => value == 'merge' ? _merge() : _split(),
+              itemBuilder:
+                  (_) => const [
+                    PopupMenuItem(
+                      value: 'merge',
+                      child: Text('Merge into another entity'),
+                    ),
+                    PopupMenuItem(
+                      value: 'split',
+                      child: Text('Split selected events'),
+                    ),
+                  ],
             ),
             IconButton(
-                icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
-                onPressed: _entity == null ? null : _forget),
+              icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+              onPressed: _entity == null ? null : _forget,
+            ),
           ],
         ),
-        body: _loading
-            ? const Center(child: CircularProgressIndicator(color: _mint))
-            : _error != null
+        body:
+            _loading
+                ? const Center(child: CircularProgressIndicator(color: _mint))
+                : _error != null
                 ? Center(
-                    child: Text(_error!,
-                        style: const TextStyle(color: _muted)))
+                  child: Text(_error!, style: const TextStyle(color: _muted)),
+                )
                 : _body(),
       ),
     );
@@ -1147,22 +1464,27 @@ class _MemoryEntityScreenState extends State<MemoryEntityScreen> {
         Row(
           children: [
             const CircleAvatar(
-                radius: 28,
-                backgroundColor: _panelRaised,
-                child: Icon(Icons.hub_outlined, color: _violet, size: 28)),
+              radius: 28,
+              backgroundColor: _panelRaised,
+              child: Icon(Icons.hub_outlined, color: _violet, size: 28),
+            ),
             const SizedBox(width: 14),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(entity['name'].toString(),
-                      style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 22,
-                          fontWeight: FontWeight.w700)),
                   Text(
-                      '${entity['type'] ?? 'entity'} · ${entity['mentions'] ?? 0} events · ${entity['memory_status'] ?? 'unknown'}',
-                      style: const TextStyle(color: _muted)),
+                    entity['name'].toString(),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 22,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  Text(
+                    '${entity['type'] ?? 'entity'} · ${entity['mentions'] ?? 0} events · ${entity['memory_status'] ?? 'unknown'}',
+                    style: const TextStyle(color: _muted),
+                  ),
                 ],
               ),
             ),
@@ -1171,84 +1493,113 @@ class _MemoryEntityScreenState extends State<MemoryEntityScreen> {
         _heading('Rooms'),
         Wrap(
           spacing: 7,
-          children: rooms
-              .map((room) => Chip(
-                  label: Text('${room['name']} (${room['events']})')))
-              .toList(),
+          children:
+              rooms
+                  .map(
+                    (room) => Chip(
+                      label: Text('${room['name']} (${room['events']})'),
+                    ),
+                  )
+                  .toList(),
         ),
         _heading('Related entities'),
         Wrap(
           spacing: 7,
           runSpacing: 7,
-          children: related
-              .map((item) => ActionChip(
-                    label: Text(item['name'].toString()),
-                    onPressed: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => MemoryEntityScreen(
-                          apiBase: widget.apiBase,
-                          entityId: item['name'].toString().toLowerCase(),
-                          memoryDomain: widget.memoryDomain,
-                        ),
-                      ),
+          children:
+              related
+                  .map(
+                    (item) => ActionChip(
+                      label: Text(item['name'].toString()),
+                      onPressed:
+                          () => Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder:
+                                  (_) => MemoryEntityScreen(
+                                    apiBase: widget.apiBase,
+                                    entityId:
+                                        item['name'].toString().toLowerCase(),
+                                    memoryDomain: widget.memoryDomain,
+                                  ),
+                            ),
+                          ),
                     ),
-                  ))
-              .toList(),
+                  )
+                  .toList(),
         ),
         _heading('Event history'),
-        ...events.map((event) => Card(
-              color: _panelRaised,
-              child: ListTile(
-                title: Text((event['summary'] ?? '(no summary)').toString(),
-                    style: const TextStyle(color: Colors.white70)),
-                subtitle: Text(_dayTime(event['span_start']),
-                    style: const TextStyle(color: _mint, fontSize: 11)),
-                onTap: () => Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => MemoryEventScreen(
-                        apiBase: widget.apiBase,
-                        eventId: event['event_id'].toString()),
-                  ),
-                ),
+        ...events.map(
+          (event) => Card(
+            color: _panelRaised,
+            child: ListTile(
+              title: Text(
+                (event['summary'] ?? '(no summary)').toString(),
+                style: const TextStyle(color: Colors.white70),
               ),
-            )),
+              subtitle: Text(
+                _dayTime(event['span_start']),
+                style: const TextStyle(color: _mint, fontSize: 11),
+              ),
+              onTap:
+                  () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder:
+                          (_) => MemoryEventScreen(
+                            apiBase: widget.apiBase,
+                            eventId: event['event_id'].toString(),
+                          ),
+                    ),
+                  ),
+            ),
+          ),
+        ),
       ],
     );
   }
 
   Widget _heading(String text) => Padding(
-        padding: const EdgeInsets.only(top: 24, bottom: 8),
-        child: Text(text,
-            style: const TextStyle(
-                color: _mint, fontWeight: FontWeight.w700)),
-      );
+    padding: const EdgeInsets.only(top: 24, bottom: 8),
+    child: Text(
+      text,
+      style: const TextStyle(color: _mint, fontWeight: FontWeight.w700),
+    ),
+  );
 
   Future<void> _edit() async {
     final name = TextEditingController(text: _entity!['name'].toString());
     final type = TextEditingController(text: _entity!['type'].toString());
     final save = await showDialog<bool>(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Correct entity'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(controller: name, decoration: const InputDecoration(labelText: 'Name')),
-            const SizedBox(height: 10),
-            TextField(controller: type, decoration: const InputDecoration(labelText: 'Type')),
-          ],
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Save correction')),
-        ],
-      ),
+      builder:
+          (_) => AlertDialog(
+            title: const Text('Correct entity'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: name,
+                  decoration: const InputDecoration(labelText: 'Name'),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: type,
+                  decoration: const InputDecoration(labelText: 'Type'),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Save correction'),
+              ),
+            ],
+          ),
     );
     if (save != true || name.text.trim().isEmpty || type.text.trim().isEmpty) {
       return;
@@ -1267,23 +1618,28 @@ class _MemoryEntityScreenState extends State<MemoryEntityScreen> {
   Future<void> _forget() async {
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (_) => AlertDialog(
-        title: Text('Forget ${_entity!['name']}?'),
-        content: const Text(
-            'The entity and its links will be removed. Source events remain.'),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Forget')),
-        ],
-      ),
+      builder:
+          (_) => AlertDialog(
+            title: Text('Forget ${_entity!['name']}?'),
+            content: const Text(
+              'The entity and its links will be removed. Source events remain.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Forget'),
+              ),
+            ],
+          ),
     );
     if (confirmed != true) return;
     final resp = await http.delete(
-        Uri.parse('${widget.apiBase}/memory/entities/${widget.entityId}'));
+      Uri.parse('${widget.apiBase}/memory/entities/${widget.entityId}'),
+    );
     if (resp.statusCode == 200 && mounted) Navigator.pop(context, true);
   }
 
@@ -1291,29 +1647,32 @@ class _MemoryEntityScreenState extends State<MemoryEntityScreen> {
     final target = TextEditingController();
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Merge into entity'),
-        content: TextField(
-          controller: target,
-          decoration: const InputDecoration(
-              labelText: 'Target entity ID',
-              helperText: 'Shown in search results or entity URLs'),
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () =>
-                  Navigator.pop(context, target.text.trim().isNotEmpty),
-              child: const Text('Merge')),
-        ],
-      ),
+      builder:
+          (_) => AlertDialog(
+            title: const Text('Merge into entity'),
+            content: TextField(
+              controller: target,
+              decoration: const InputDecoration(
+                labelText: 'Target entity ID',
+                helperText: 'Shown in search results or entity URLs',
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed:
+                    () => Navigator.pop(context, target.text.trim().isNotEmpty),
+                child: const Text('Merge'),
+              ),
+            ],
+          ),
     );
     if (confirmed != true) return;
     final resp = await http.post(
-      Uri.parse(
-          '${widget.apiBase}/memory/entities/${widget.entityId}/merge'),
+      Uri.parse('${widget.apiBase}/memory/entities/${widget.entityId}/merge'),
       headers: {'Content-Type': 'application/json'},
       body: json.encode({'target_id': target.text.trim()}),
     );
@@ -1323,77 +1682,91 @@ class _MemoryEntityScreenState extends State<MemoryEntityScreen> {
   }
 
   Future<void> _split() async {
-    final events = ((_entity!['events'] as List?) ?? [])
-        .cast<Map<String, dynamic>>();
+    final events =
+        ((_entity!['events'] as List?) ?? []).cast<Map<String, dynamic>>();
     if (events.isEmpty) return;
     final selected = <String>{};
     final name = TextEditingController();
     final type = TextEditingController(text: _entity!['type'].toString());
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (_) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('Split entity'),
-          content: SizedBox(
-            width: 520,
-            child: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  TextField(
-                      controller: name,
-                      decoration:
-                          const InputDecoration(labelText: 'New entity name')),
-                  const SizedBox(height: 8),
-                  TextField(
-                      controller: type,
-                      decoration:
-                          const InputDecoration(labelText: 'Entity type')),
-                  const SizedBox(height: 12),
-                  const Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text('Move these event mentions:',
-                        style: TextStyle(fontWeight: FontWeight.w700)),
-                  ),
-                  for (final event in events)
-                    CheckboxListTile(
-                      dense: true,
-                      value: selected.contains(event['event_id'].toString()),
-                      title: Text(
-                        (event['summary'] ?? '(no summary)').toString(),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
+      builder:
+          (_) => StatefulBuilder(
+            builder:
+                (context, setDialogState) => AlertDialog(
+                  title: const Text('Split entity'),
+                  content: SizedBox(
+                    width: 520,
+                    child: SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          TextField(
+                            controller: name,
+                            decoration: const InputDecoration(
+                              labelText: 'New entity name',
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          TextField(
+                            controller: type,
+                            decoration: const InputDecoration(
+                              labelText: 'Entity type',
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          const Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              'Move these event mentions:',
+                              style: TextStyle(fontWeight: FontWeight.w700),
+                            ),
+                          ),
+                          for (final event in events)
+                            CheckboxListTile(
+                              dense: true,
+                              value: selected.contains(
+                                event['event_id'].toString(),
+                              ),
+                              title: Text(
+                                (event['summary'] ?? '(no summary)').toString(),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              onChanged:
+                                  (checked) => setDialogState(() {
+                                    final id = event['event_id'].toString();
+                                    checked == true
+                                        ? selected.add(id)
+                                        : selected.remove(id);
+                                  }),
+                            ),
+                        ],
                       ),
-                      onChanged: (checked) => setDialogState(() {
-                        final id = event['event_id'].toString();
-                        checked == true
-                            ? selected.add(id)
-                            : selected.remove(id);
-                      }),
                     ),
-                ],
-              ),
-            ),
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context, false),
+                      child: const Text('Cancel'),
+                    ),
+                    FilledButton(
+                      onPressed:
+                          () => Navigator.pop(
+                            context,
+                            name.text.trim().isNotEmpty &&
+                                type.text.trim().isNotEmpty &&
+                                selected.isNotEmpty,
+                          ),
+                      child: const Text('Split'),
+                    ),
+                  ],
+                ),
           ),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Cancel')),
-            FilledButton(
-                onPressed: () => Navigator.pop(
-                    context,
-                    name.text.trim().isNotEmpty &&
-                        type.text.trim().isNotEmpty &&
-                        selected.isNotEmpty),
-                child: const Text('Split')),
-          ],
-        ),
-      ),
     );
     if (confirmed != true) return;
     final resp = await http.post(
-      Uri.parse(
-          '${widget.apiBase}/memory/entities/${widget.entityId}/split'),
+      Uri.parse('${widget.apiBase}/memory/entities/${widget.entityId}/split'),
       headers: {'Content-Type': 'application/json'},
       body: json.encode({
         'name': name.text.trim(),

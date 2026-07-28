@@ -63,6 +63,7 @@ Schema (all fields required):
   "entities": [{{"name": specific name, "type": a lowercase noun (prefer one of [{", ".join(entity_types)}], but use a more specific type if none fit), "confidence": 0.0-1.0}}],
   "claims": [{{"text": a factual statement you can support from the screen, "confidence": 0.0-1.0}}],
   "tasks": [{{"text": an actionable task the user is doing/intends, "status": one of [{_opts(TaskStatus)}]}}],
+  "personal_memory": [{{"category": an open-ended category, "name": the aspect of the user, "value": the observed fact or tendency, "confidence": 0.0-1.0}}],
   "boundary_signal": one of [{_opts(BoundarySignal)}]
 }}
 
@@ -71,6 +72,11 @@ Rules:
 people — never vague tokens like "code", "screen", or "window".
 - Every entity MUST have name, type, and confidence.
 - If nothing of a kind is present, use an empty list [].
+- personal_memory has NO category whitelist. Record any durable detail that may
+  help understand this user later: projects, interests, work/study, goals,
+  preferences, routines, skills, personality tendencies, relationships, or
+  something not named here. Only include what this clip actually supports.
+  Phrase uncertain patterns as tendencies and lower confidence; never diagnose.
 - boundary_signal = "boundary" only if the activity clearly changed context \
 (different app/task); "new_event" for a distinct new action within the same context; \
 otherwise "continuation".

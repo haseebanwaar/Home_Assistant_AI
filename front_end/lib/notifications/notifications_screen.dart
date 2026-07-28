@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
+import '../clips/clip_viewer.dart';
+
 const _ink = Color(0xFF070B14);
 const _panel = Color(0xFF111827);
 const _panelRaised = Color(0xFF182235);
@@ -31,6 +33,10 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
   String _filter = 'all';
   String? _error;
   List<Map<String, dynamic>> _items = [];
+  // Ids of the alerts whose footage is expanded. Clips stay collapsed until
+  // asked for: an inbox that autoplays every alert is unusable, and each open
+  // player holds a decoder.
+  final Set<String> _openClips = {};
 
   @override
   void initState() {
@@ -192,7 +198,38 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     );
   }
 
+  static double? _seconds(dynamic value) =>
+      value is num ? value.toDouble() : null;
+
+  /// Show/hide the footage this alert was raised from. Absent when the clip has
+  /// passed its retention window — the server reports `can_ask` false and no
+  /// clip id, so the card offers nothing that would fail on tap.
+  Widget _clipToggle(Map<String, dynamic> item, String clipId, Color color) {
+    final open = _openClips.contains(clipId);
+    return InkWell(
+      onTap: () => setState(() =>
+          open ? _openClips.remove(clipId) : _openClips.add(clipId)),
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(open ? Icons.expand_less : Icons.play_circle_outline,
+                color: color, size: 15),
+            const SizedBox(width: 4),
+            Text(open ? 'Hide clip' : 'Watch clip',
+                style: TextStyle(
+                    color: color, fontSize: 10.5, fontWeight: FontWeight.w700)),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _notificationCard(Map<String, dynamic> item) {
+    final clip = item['clip'] as Map<String, dynamic>?;
+    final clipId = item['can_ask'] == true ? item['clip_id']?.toString() : null;
     final isCritical = item['severity'] == 'critical';
     final color = isCritical ? _critical : _important;
     final read = item['read'] == true;
@@ -258,11 +295,30 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                       style: const TextStyle(
                           color: Colors.white70, fontSize: 12, height: 1.35)),
                   const SizedBox(height: 7),
-                  Text(
-                    '${(item['category'] ?? 'activity').toString()}'
-                    ' • ${(item['source'] ?? 'screen').toString()}',
-                    style: TextStyle(color: color, fontSize: 10.5),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          '${(item['category'] ?? 'activity').toString()}'
+                          ' • ${(item['source'] ?? 'screen').toString()}',
+                          style: TextStyle(color: color, fontSize: 10.5),
+                        ),
+                      ),
+                      if (clipId != null) _clipToggle(item, clipId, color),
+                    ],
                   ),
+                  if (clipId != null && _openClips.contains(clipId))
+                    Padding(
+                      padding: const EdgeInsets.only(top: 10),
+                      child: ClipViewer(
+                        key: ValueKey(clipId),
+                        apiBase: widget.apiBase,
+                        clipId: clipId,
+                        coversSeconds: _seconds(clip?['covers_seconds']),
+                        playsSeconds: _seconds(clip?['plays_seconds']),
+                        autoplay: true,
+                      ),
+                    ),
                 ],
               ),
             ),

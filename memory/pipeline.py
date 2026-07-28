@@ -77,7 +77,8 @@ def clamp_summary(text, limit=MAX_EVENT_SUMMARY):
 class MemoryPipeline:
     def __init__(self, id_strategy="counter", expected_seconds=60.0,
                  neo4j_store=None, activity_logger=None, jsonl=False,
-                 log_context="screen", notification_sink=None):
+                 log_context="screen", notification_sink=None,
+                 personal_memory=None):
         self.manager = SessionManager(id_strategy=id_strategy)
         self.expected_seconds = expected_seconds
         self.neo4j = neo4j_store
@@ -86,6 +87,7 @@ class MemoryPipeline:
         # Qdrant context label for events from this pipeline ("screen"/"camera").
         self.log_context = log_context
         self.notification_sink = notification_sink
+        self.personal_memory = personal_memory
 
         self._prev_ctx = None
         self._prev_frame = None
@@ -97,7 +99,9 @@ class MemoryPipeline:
         # Per-event accumulators (event_id -> ...).
         self._ev_entities = {}   # -> {norm: rec}
         self._ev_claims = {}     # -> {claim_id: rec}
+        self._ev_personal = {}   # -> open-ended personal-memory candidates
         self._ev_text = {}       # -> {"parts": [...], "profile": str}
+        self._ev_clip = {}       # -> newest evidence clip id for the event
         self._ev_scored = set()  # events with at least one extractor score
 
     def naming_hints(self):
@@ -127,6 +131,9 @@ class MemoryPipeline:
         ext = batch.get("extraction") or {}
         ts = batch["timestamp"]
         frame = batch.get("repr_frame")
+        # Evidence clip for this window (sources.clips). Carried to the
+        # notification sink so an alert can be watched, not just read.
+        clip_id = batch.get("clip_id")
 
         # Boundary vs previous batch.
         if self._prev_ctx is None:
@@ -170,6 +177,11 @@ class MemoryPipeline:
                 self._ev_scored.add(result.current_event.event_id)
         except (TypeError, ValueError):
             pass
+
+        if clip_id:
+            # Newest wins: an event spanning several windows is best illustrated
+            # by the footage that made it notable, which is the latest one.
+            self._ev_clip[result.current_event.event_id] = clip_id
 
         self._accumulate(result.current_event.event_id, ext, ctx)
         event_text = self.event_texts().get(result.current_event.event_id, {}).get("text")
@@ -253,6 +265,22 @@ class MemoryPipeline:
                 claims[cid] = {"claim_id": cid, "text": text,
                                "confidence": float(cl.get("confidence", 0.5))}
 
+        personal = self._ev_personal.setdefault(event_id, {})
+        for item in ext.get("personal_memory") or []:
+            category = str(item.get("category") or "other").strip()
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "").strip()
+            if not name or not value:
+                continue
+            mem_key = (category.casefold(), name.casefold(), value.casefold())
+            current = personal.get(mem_key)
+            confidence = float(item.get("confidence", 0.5))
+            if current is None or confidence > current["confidence"]:
+                personal[mem_key] = {
+                    "category": category, "name": name, "value": value,
+                    "confidence": confidence,
+                }
+
         txt = self._ev_text.setdefault(event_id, {"parts": [], "profile": None})
         s = (ext.get("summary") or "").strip()
         # Compare against every part, not just the last one: a static scene makes
@@ -292,9 +320,13 @@ class MemoryPipeline:
         return {eid: {"text": " ".join(v["parts"]), "profile": v["profile"]}
                 for eid, v in self._ev_text.items()}
 
+    def personal_items(self, event_id):
+        return list(self._ev_personal.get(event_id, {}).values())
+
     # -- store upserts (live) ---------------------------------------------
     def _upsert(self, result):
-        if self.neo4j is None and self.activity_logger is None:
+        if (self.neo4j is None and self.activity_logger is None
+                and self.personal_memory is None):
             return  # offline bulk mode: caller writes at the end
         # A closed event is now final; upsert it fully.
         if result.closed_event is not None:
@@ -306,6 +338,11 @@ class MemoryPipeline:
 
     def _upsert_event(self, session, event):
         try:
+            if self.personal_memory is not None and self.log_context == "screen":
+                self.personal_memory.observe_event(
+                    event.model_dump(),
+                    self.personal_items(event.event_id),
+                )
             if self.neo4j is not None:
                 self.neo4j.write_timeline([session], [event])
                 entities = self._entities_for(event.event_id)
@@ -345,6 +382,7 @@ class MemoryPipeline:
                     "summary": info.get("text") or event.summary,
                     "source": self.log_context,
                     "timestamp": event.span_end,
+                    "clip_id": self._ev_clip.get(event.event_id),
                 })
             except Exception as exc:
                 logger.warning("Notification classification failed (continuing): %s", exc)

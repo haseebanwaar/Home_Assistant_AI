@@ -77,7 +77,7 @@ def _host_of(url):
 class CameraManager:
     def __init__(self, model_name_vlm, neo4j_store=None, activity_logger=None,
                  window_seconds=60, fps=1.0, notification_sink=None,
-                 insight_callback=None):
+                 insight_callback=None, clip_store=None):
         self.model_name_vlm = model_name_vlm
         self.neo4j = neo4j_store
         self.activity_logger = activity_logger
@@ -85,6 +85,7 @@ class CameraManager:
         self.fps = fps
         self.notification_sink = notification_sink
         self.insight_callback = insight_callback
+        self.clip_store = clip_store
         self.workers = {}  # camera_id -> CameraCaptureWorker
 
     def discover_and_start(self):
@@ -117,7 +118,8 @@ class CameraManager:
                 activity_logger=self.activity_logger,
                 window_seconds=self.window_seconds, fps=self.fps,
                 notification_sink=self.notification_sink,
-                insight_callback=self.insight_callback)
+                insight_callback=self.insight_callback,
+                clip_store=self.clip_store)
             logger.info("Started camera worker %s (%s).", camera_id, name)
         except Exception as exc:
             logger.warning("failed to start camera %s: %s", camera_id, exc)

@@ -16,6 +16,7 @@ import 'rooms/rooms_screen.dart';
 import 'assistant/assistant_screen.dart';
 import 'notifications/local_notification_controller.dart';
 import 'notifications/notifications_screen.dart';
+import 'clips/clip_viewer.dart';
 
 void main() => runApp(const HomeMindApp());
 
@@ -68,11 +69,20 @@ class ChatMessage {
   final MessageSender sender;
   String text;
   Uint8List? fullAudio; // Used to store the complete, replayable audio
+  // Footage an unprompted insight was made from, when the server kept one. The
+  // remark is a claim about something the user was not watching, so the bubble
+  // carries the way to check it.
+  final String? clipId;
+  final double? clipCoversSeconds;
+  final double? clipPlaysSeconds;
 
   ChatMessage({
     required this.sender,
     required this.text,
     this.fullAudio,
+    this.clipId,
+    this.clipCoversSeconds,
+    this.clipPlaysSeconds,
   });
 }
 
@@ -118,6 +128,8 @@ class _MyAppState extends State<MyApp> {
   String _backendActivity = 'Connecting...';
   Map<String, dynamic> _backendStatus = const {};
   Timer? _statusTimer;
+  bool _statusPollInFlight = false;
+  int _consecutiveStatusFailures = 0;
 
   // Proactive insights: id of the last one we've shown/played, plus a one-time
   // sync flag so we adopt the backend's latest id on connect without replaying
@@ -165,7 +177,7 @@ class _MyAppState extends State<MyApp> {
       if (mounted) setState(() => _captureStatus = s);
     });
     _loadHomeHub();
-    _statusTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+    _statusTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       _pollBackendStatus();
       _fetchProactiveInsights();
       _fetchNotifications();
@@ -188,6 +200,13 @@ class _MyAppState extends State<MyApp> {
       _showSnack('Enter the PC Wi-Fi address first');
       return;
     }
+    if (mounted) {
+      setState(() {
+        _backendConnected = false;
+        _backendActivity = 'Connecting...';
+      });
+    }
+    _consecutiveStatusFailures = 0;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_homeHubPreferenceKey, value);
     await _pollBackendStatus();
@@ -528,17 +547,22 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _pollBackendStatus() async {
-    if (_ipTextController.text.trim().isEmpty) return;
+    final apiBase = _apiBase;
+    if (apiBase.isEmpty || _statusPollInFlight) return;
+    _statusPollInFlight = true;
     try {
-      final responses = await Future.wait([
-        http.get(Uri.parse('$_apiBase/status')),
-        http.get(Uri.parse('$_apiBase/ready')),
-      ]).timeout(const Duration(seconds: 3));
-      if (responses.any((r) => r.statusCode != 200)) {
-        throw Exception('backend health request failed');
+      // Keep this probe single-flight. The old two-second timer could start a
+      // new probe before the previous three-second timeout had completed,
+      // which made a healthy Tailscale connection flicker offline.
+      final response = await http
+          .get(Uri.parse('$apiBase/status'))
+          .timeout(const Duration(seconds: 4));
+      if (response.statusCode != 200) {
+        throw Exception('backend health request returned ${response.statusCode}');
       }
-      final value = json.decode(responses[0].body) as Map<String, dynamic>;
-      value['readiness'] = json.decode(responses[1].body);
+      final value = json.decode(response.body) as Map<String, dynamic>;
+      if (_apiBase != apiBase) return;
+      _consecutiveStatusFailures = 0;
       if (mounted) setState(() {
         _backendConnected = true;
         _backendStatus = value;
@@ -549,14 +573,27 @@ class _MyAppState extends State<MyApp> {
         }
       });
       await _syncNotificationMonitoring();
-    } catch (_) {
-      if (mounted) setState(() {
-        _backendConnected = false;
-        if (!_isProcessing) _backendActivity = 'Backend offline';
-      });
-      // Re-sync proactive ids on the next successful connect (the server may
-      // have restarted and reset its counter).
-      _proactiveSynced = false;
+    } catch (error) {
+      if (_apiBase == apiBase) {
+        _consecutiveStatusFailures++;
+        // Tailscale can briefly pause while Android changes radio or network.
+        // Require three failed probes before declaring the hub offline.
+        if (_consecutiveStatusFailures >= 3) {
+          if (mounted) setState(() {
+            _backendConnected = false;
+            if (!_isProcessing) _backendActivity = 'Backend offline';
+          });
+          // Re-sync proactive ids on the next successful connect (the server
+          // may have restarted and reset its counter).
+          _proactiveSynced = false;
+        }
+        if (kDebugMode) {
+          print('Home hub status probe failed '
+              '($_consecutiveStatusFailures/3): $error');
+        }
+      }
+    } finally {
+      _statusPollInFlight = false;
     }
   }
 
@@ -621,12 +658,16 @@ class _MyAppState extends State<MyApp> {
           audio = base64.decode(audioB64);
         }
 
+        final clip = map['clip'] as Map<String, dynamic>?;
         if (mounted && _proactiveFeedEnabled) {
           setState(() {
             _chatHistory.add(ChatMessage(
               sender: MessageSender.assistant,
               text: '💡 ${map['text'] ?? ''}',
               fullAudio: audio,
+              clipId: map['can_ask'] == true ? map['clip_id']?.toString() : null,
+              clipCoversSeconds: (clip?['covers_seconds'] as num?)?.toDouble(),
+              clipPlaysSeconds: (clip?['plays_seconds'] as num?)?.toDouble(),
             ));
           });
         }
@@ -1259,7 +1300,10 @@ class _MyAppState extends State<MyApp> {
         itemCount: _chatHistory.length,
         itemBuilder: (context, index) {
           final message = _chatHistory[index];
-          return MessageBubble(message: message, audioPlayer: _audioPlayer);
+          return MessageBubble(
+              message: message,
+              audioPlayer: _audioPlayer,
+              apiBase: _apiBase);
         },
       ),
     );
@@ -2371,9 +2415,13 @@ class _MyAppState extends State<MyApp> {
 class MessageBubble extends StatelessWidget {
   final ChatMessage message;
   final AudioPlayer audioPlayer;
+  final String apiBase;
 
   const MessageBubble(
-      {Key? key, required this.message, required this.audioPlayer})
+      {Key? key,
+      required this.message,
+      required this.audioPlayer,
+      this.apiBase = ''})
       : super(key: key);
 
   @override
@@ -2403,21 +2451,55 @@ class MessageBubble extends StatelessWidget {
             bottomRight: Radius.circular(isUserMessage ? 4 : 18),
           ),
         ),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Flexible(
-              child: Text(
-                message.text,
-                style: const TextStyle(
-                    fontSize: 14, color: Color(0xFFE9EEF7), height: 1.45),
-              ),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(
+                  child: Text(
+                    message.text,
+                    style: const TextStyle(
+                        fontSize: 14, color: Color(0xFFE9EEF7), height: 1.45),
+                  ),
+                ),
+                if (!isUserMessage &&
+                    message.fullAudio != null &&
+                    message.fullAudio!.isNotEmpty)
+                  _buildReplayButton(),
+              ],
             ),
-            if (!isUserMessage && message.fullAudio != null && message.fullAudio!.isNotEmpty)
-              _buildReplayButton(),
+            if (message.clipId != null && apiBase.isNotEmpty)
+              _buildClipButton(context, accent),
           ],
         ),
       ),
+    );
+  }
+
+  /// Opens the footage behind an unprompted remark, and the box for asking
+  /// further questions about it.
+  Widget _buildClipButton(BuildContext context, Color accent) {
+    return TextButton.icon(
+      style: TextButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      onPressed: () => showClipSheet(
+        context,
+        apiBase: apiBase,
+        clipId: message.clipId!,
+        caption: message.text,
+        coversSeconds: message.clipCoversSeconds,
+        playsSeconds: message.clipPlaysSeconds,
+      ),
+      icon: Icon(Icons.play_circle_outline, size: 15, color: accent),
+      label: Text('Watch what I saw',
+          style: TextStyle(
+              fontSize: 11, color: accent, fontWeight: FontWeight.w700)),
     );
   }
 

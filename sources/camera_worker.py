@@ -92,7 +92,7 @@ class CameraCaptureWorker:
     def __init__(self, camera_id, name, rtsp_url, model_name_vlm,
                  neo4j_store=None, activity_logger=None,
                  window_seconds=60, fps=1.0, notification_sink=None,
-                 insight_callback=None):
+                 insight_callback=None, clip_store=None):
         self.camera_id = camera_id
         self.name = name
         self.rtsp_url = rtsp_url
@@ -101,6 +101,9 @@ class CameraCaptureWorker:
         self.window_seconds = int(window_seconds)
         self.fps = float(fps)
         self.insight_callback = insight_callback
+        # Evidence clip for this window. Written only for windows we keep, so an
+        # alert or a nudge about this camera can be watched and asked about.
+        self.clip_store = clip_store
 
         # Keep a little more than one window of frames so a batch is never starved.
         self.stream = RealtimeCameraStream(
@@ -234,20 +237,38 @@ class CameraCaptureWorker:
         # carries the camera's display name ("IPC-A22E-G") rather than its id —
         # all cameras share one room now, and the tag is what tells them apart.
         # The summary as the title makes the graph Event read meaningfully.
+        # Record the clip BEFORE ingest: the notification sink fires inside
+        # ingest, so the clip id has to already exist for an alert to carry it.
+        clip_id = None
+        if self.clip_store is not None:
+            clip_id = self.clip_store.save(
+                frames, source="camera", label=self.name or self.camera_id,
+                timestamp=timestamp, capture_fps=self.fps, summary=full_summary,
+                extra={"camera_id": self.camera_id, "camera_name": self.name})
+
         batch = {
             "timestamp": timestamp,
             "window_titles": [self.last_summary or self.name],
             "process_names": [self.name or self.camera_id],
             "repr_frame": frames[-1],
+            "clip_id": clip_id,
             "extraction": {**result.model_dump(), "selected_profile": "camera"},
         }
-        self.pipeline.ingest(batch)
+        ingested = self.pipeline.ingest(batch)
+        # Now the window has an event id, so the clip can be found from the
+        # timeline as well as from the alert that referenced it.
+        if clip_id and self.clip_store is not None:
+            try:
+                self.clip_store.annotate(
+                    clip_id, event_id=ingested.current_event.event_id)
+            except Exception as exc:
+                logger.debug("Could not annotate clip %s: %s", clip_id, exc)
         if self.insight_callback is not None and full_summary:
             try:
                 self.insight_callback(
                     full_summary, timestamp, f"camera:{self.name}",
                     {"camera_id": self.camera_id, "camera_name": self.name,
-                     "motion": motion})
+                     "motion": motion, "clip_id": clip_id})
             except Exception as exc:
                 logger.warning("Camera %s proactive callback failed: %s",
                                self.camera_id, exc)

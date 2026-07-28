@@ -173,6 +173,10 @@ class NotificationCenter:
                 "source": source,
                 "application": application or None,
                 "room_id": event.get("room_id"),
+                # The footage this alert was raised from. An alert the user can
+                # watch is checkable; one they can only read has to be believed.
+                "clip_id": (str(event.get("clip_id")).strip() or None
+                            if event.get("clip_id") else None),
                 "timestamp": now,
                 "read": False,
                 "signature": signature,

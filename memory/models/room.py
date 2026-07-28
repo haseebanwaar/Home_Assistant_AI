@@ -34,7 +34,7 @@ class RoomMatcher(BaseModel):
 class Room(BaseModel):
     room_id: str
     name: str
-    kind: str = "topic"          # activity | project | topic | daily
+    kind: str = "topic"          # screen | camera | topic | daily | agent
     auto: bool = True            # auto-created vs user-defined
     matcher: RoomMatcher = Field(default_factory=RoomMatcher)
     description: str = ""

@@ -59,6 +59,15 @@ class Task(BaseModel):
     status: TaskStatus = "todo"
 
 
+class PersonalMemoryCandidate(BaseModel):
+    # Open vocabulary on purpose: personal memory should not be limited to a
+    # developer's guess at which parts of a life may matter.
+    category: str = "other"
+    name: str
+    value: str
+    confidence: float = Field(0.5, ge=0.0, le=1.0)
+
+
 _NULLISH = {"", "none", "null", "n/a", "na", "unknown", "untitled"}
 
 
@@ -75,6 +84,7 @@ class ExtractionResult(BaseModel):
     entities: List[Entity] = Field(default_factory=list)
     claims: List[Claim] = Field(default_factory=list)
     tasks: List[Task] = Field(default_factory=list)
+    personal_memory: List[PersonalMemoryCandidate] = Field(default_factory=list)
     boundary_signal: BoundarySignal = "continuation"
 
     @field_validator("project", mode="before")

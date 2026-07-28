@@ -52,7 +52,8 @@ def _process_for_hwnd(hwnd):
 
 class RealtimeScreenCapture:
     def __init__(self, video_source,model_name_vlm, window_size=60, fps=1.0, monitor_index=1, target_resolution=None,
-                 activity_logger=None, insight_callback=None, start_capture=True, pipeline=None):
+                 activity_logger=None, insight_callback=None, start_capture=True, pipeline=None,
+                 clip_store=None):
         """
         Args:
             video_source: screen (not used)
@@ -81,6 +82,9 @@ class RealtimeScreenCapture:
         # Optional callback(description, timestamp) invoked after each minute is
         # described — used for the proactive path. Runs in the describe thread.
         self.insight_callback = insight_callback
+        # Low-res evidence clip per processed minute, so a nudge or an alert
+        # about what was on screen can be replayed and questioned.
+        self.clip_store = clip_store
         self.current_minute_apps = list()
         # Step 3: process names seen this minute, used to route the domain profile.
         self.current_minute_processes = list()
@@ -376,16 +380,30 @@ Create a retrievable memory record that preserves what matters most for future r
         else:
             description = asyncio.run(self._describe_frames(imgs))
 
+        # Recorded before ingest so the notification raised inside ingest can
+        # already point at the footage it was raised from.
+        clip_id = None
+        if self.clip_store is not None and imgs:
+            clip_id = self.clip_store.save(
+                imgs, source="screen",
+                label=(process_names[-1] if process_names else "screen"),
+                timestamp=timestamp, capture_fps=self.fps, summary=description,
+                extra={"window_titles": list(window_titles)[-3:]})
+
         if self.pipeline is not None and result is not None:
             # Live memory: sessions/events/knowledge + event-scoped dual store.
             try:
-                self.pipeline.ingest({
+                ingested = self.pipeline.ingest({
                     "timestamp": timestamp,
                     "window_titles": list(window_titles),
                     "process_names": list(process_names),
                     "repr_frame": imgs[-1] if imgs else None,
+                    "clip_id": clip_id,
                     "extraction": {**result.model_dump(), "selected_profile": profile_name},
                 })
+                if clip_id and self.clip_store is not None:
+                    self.clip_store.annotate(
+                        clip_id, event_id=ingested.current_event.event_id)
             except Exception as exc:
                 logger.warning("pipeline.ingest failed: %s", exc)
         elif self.activity_logger is not None:
@@ -394,7 +412,7 @@ Create a retrievable memory record that preserves what matters most for future r
 
         if self.insight_callback is not None:
             try:
-                self.insight_callback(description, timestamp)
+                self.insight_callback(description, timestamp, {"clip_id": clip_id})
             except Exception as exc:
                 logger.warning("insight_callback failed: %s", exc)
         logger.debug('Screen buffer %s processing ended', timestamp)

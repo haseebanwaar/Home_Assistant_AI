@@ -63,6 +63,16 @@ The Core Unit acts as a **Dispatcher**, not just a chatbot. uses autogen for cre
   to contribute without waiting for a request. Cooldowns and duplicate checks
   pace delivery without prescribing which ideas the model may consider.
 
+* **Evidence you can watch and question**
+  Anything the assistant raises unprompted — a proactive nudge, an important or
+  critical alert — carries the footage it was made from: a low-resolution,
+  sped-up clip of the exact capture window (`GET /clips/<id>`, playable inline
+  in the app). Those clips also answer follow-up questions from the video
+  itself (`POST /clips/<id>/ask` → "was he carrying anything?"), so a claim
+  about something you did not see can be checked instead of just believed.
+  Clips a notification, nudge or question referenced are kept for days; every
+  other clip is deleted within the hour (`sources/clips.py`).
+
 * **Lifelong Learning**
   The agent evolves alongside you. By continuously consolidating daily logs and visual context into its vector store, it builds a permanent, growing knowledge base. It remembers your preferences, projects, and history, ensuring that its personalization deepens over months and years of usage.
 

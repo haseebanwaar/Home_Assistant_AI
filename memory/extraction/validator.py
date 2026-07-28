@@ -9,7 +9,9 @@ import logging
 
 from pydantic import ValidationError
 
-from memory.models.extraction import Claim, Entity, ExtractionResult
+from memory.models.extraction import (
+    Claim, Entity, ExtractionResult, PersonalMemoryCandidate,
+)
 from memory.extraction.prompts import RETRY_PREFIX, RETRY_SUFFIX
 
 logger = logging.getLogger("home_assistant")
@@ -63,12 +65,19 @@ def _salvage_fields(data):
             claims.append(Claim.model_validate(raw))
         except (ValidationError, TypeError):
             continue
+    personal = []
+    for raw in data.get("personal_memory") or []:
+        try:
+            personal.append(PersonalMemoryCandidate.model_validate(raw))
+        except (ValidationError, TypeError):
+            continue
 
     # Add the optional fields one at a time, re-validating the whole model each
     # time, so a single bad value falls back to its default instead of being
     # written straight through (plain setattr skips pydantic validation).
     base = {"summary": summary, "confidence": 0.3,
-            "entities": entities, "claims": claims}
+            "entities": entities, "claims": claims,
+            "personal_memory": personal}
     result = ExtractionResult(**base)
     for field in ("activity_type", "event_type", "project", "importance"):
         if field not in data:

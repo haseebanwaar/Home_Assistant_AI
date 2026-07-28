@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 import asyncio
 import datetime
 import time
@@ -21,7 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from qdrant_client import QdrantClient
 from lmdeploy.vl.utils import encode_image_base64
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from providers.asr.parakeet import nemo_transcribe, parakeet_health
 from providers.local_openAI import client, get_model_name_vlm
@@ -29,11 +30,16 @@ from providers.tts.kokoro.kokoro_tts import run_kokoro
 from vector_store.activity_logger import ActivityLogger
 from sources.screen import RealtimeScreenCapture
 from sources.camera_manager import CameraManager
+from sources.clips import ClipStore, parse_range, valid_clip_id
+from sources.frame_budget import fit_frames, frames_as_video
 from vector_store.rag.activity_retriever import ActivityRetriever
 from memory.retrieval.evidence import EvidenceRetriever
 from tools.registry import ToolRegistry, register_default_tools
 from agents.proactive import ProactiveNarrator
+from agents.personal_agents import AGENTS as PERSONAL_AGENTS, get_agent
 from memory.notifications import NotificationCenter
+from memory.personal import PersonalMemory, learn_from_user_message
+from memory.rooms.scope import RoomScopeError, resolve_camera_scope
 
 
 load_dotenv()
@@ -74,6 +80,13 @@ def env_float(name, default, minimum=0.01):
 
 DEBUG_VERBOSE = env_bool("DEBUG_VERBOSE")
 MAX_FRAMES = env_int("MAX_FRAMES", 20)
+# Frame COUNT is not what runs out — vision tokens are. A native-resolution
+# camera frame costs thousands of them, so MAX_FRAMES alone let one live window
+# overflow the whole context. See sources/frame_budget.py.
+LIVE_FRAME_TOKEN_BUDGET = env_int("LIVE_FRAME_TOKEN_BUDGET", 6000)
+# Playback rate stamped on the live clip sent with a room chat. Matches the
+# capture rate, so the model reads its timing the same way the capture path does.
+LIVE_VIDEO_FPS = env_float("LIVE_VIDEO_FPS", 1.0)
 MAX_MEMORY_ITEMS = env_int("MAX_MEMORY_ITEMS", 20)
 
 app = FastAPI(title="Home Assistant AI")
@@ -98,6 +111,9 @@ mobile_activity_task = None
 daily_report_task = None  # nightly Coach report scheduler
 memory_pipeline = None   # Step-a: live sessions/events/knowledge pipeline
 neo4j_store = None       # optional graph sink for the live pipeline
+personal_memory = PersonalMemory(
+    os.getenv("PERSONAL_MEMORY_PATH", "data/personal_memory.sqlite3"))
+_personal_learning_tasks = set()
 _proactive_insights = deque(maxlen=20)
 _proactive_seq = 0
 notification_center = NotificationCenter(
@@ -105,6 +121,32 @@ notification_center = NotificationCenter(
     important_cooldown_seconds=env_int(
         "NOTIFICATION_COOLDOWN_SECONDS", 600, minimum=0),
 )
+clip_retention_task = None
+# Every stored capture window writes a low-res clip; retention (below) keeps only
+# the ones something referenced. See sources/clips.py.
+clip_store = ClipStore(
+    base_dir=os.getenv("CLIP_STORE_PATH", "data/clips"),
+    max_width=env_int("CLIP_MAX_WIDTH", 960, minimum=64),
+    playback_fps=env_float("CLIP_PLAYBACK_FPS", 8.0),
+    retention_minutes=env_int("CLIP_RETENTION_MINUTES", 120, minimum=0),
+    pinned_retention_days=env_int("CLIP_PINNED_RETENTION_DAYS", 7, minimum=0),
+    max_total_mb=env_int("CLIP_MAX_TOTAL_MB", 2048, minimum=0),
+    crf=env_int("CLIP_CRF", 23, minimum=0),
+    enabled=env_bool("CLIP_CAPTURE_ENABLED", True),
+)
+
+
+def notify_from_event(event):
+    """Notification sink that keeps an alert's footage alive.
+
+    Ordinary clips expire within the hour. Pinning here is what makes the
+    difference between an alert you can watch and a dead link: it happens at the
+    moment the alert is created, not when the user gets round to opening it.
+    """
+    item = notification_center.consider_event(event)
+    if item and item.get("clip_id"):
+        clip_store.pin(item["clip_id"])
+    return item
 
 
 class MobileFrameStream:
@@ -239,7 +281,7 @@ def validate_configuration():
 @app.on_event("startup")
 async def startup_event():
     global vlm_model, screen_stream, camera_manager, camera_bootstrap_task
-    global proactive, mobile_activity_task, daily_report_task
+    global proactive, mobile_activity_task, daily_report_task, clip_retention_task
     global memory_pipeline, neo4j_store
 
     validate_configuration()
@@ -291,7 +333,8 @@ async def startup_event():
             neo4j_store=neo4j_store,
             activity_logger=activity_logger,  # event-scoped Qdrant sink
             jsonl=True,                        # keep /debug/timeline populated
-            notification_sink=notification_center.consider_event,
+            notification_sink=notify_from_event,
+            personal_memory=personal_memory,
         )
         logger.info("LIVE_MEMORY enabled (graph=%s).", neo4j_store is not None)
     else:
@@ -306,6 +349,10 @@ async def startup_event():
             neo4j_store.ensure_source_room("screen")
         except Exception as exc:
             logger.warning("ensure_source_room(screen) failed: %s", exc)
+        try:
+            neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
+        except Exception as exc:
+            logger.warning("ensure_agent_rooms failed: %s", exc)
 
     # Give the assistant graph-backed memory tools when the graph is available.
     if neo4j_store is not None:
@@ -323,6 +370,7 @@ async def startup_event():
             activity_logger=activity_logger,
             insight_callback=insight_callback,
             pipeline=memory_pipeline,
+            clip_store=clip_store,
         )
         logger.info("Screen capture enabled (monitor=%d).", screen_stream.monitor_index)
     else:
@@ -338,8 +386,9 @@ async def startup_event():
             activity_logger=activity_logger,
             window_seconds=env_int("CAMERA_WINDOW_SECONDS", 60),
             fps=env_float("CAMERA_FPS", 1.0),
-            notification_sink=notification_center.consider_event,
+            notification_sink=notify_from_event,
             insight_callback=handle_observation_description if proactive is not None else None,
+            clip_store=clip_store,
         )
         camera_bootstrap_task = asyncio.create_task(
             asyncio.to_thread(camera_manager.discover_and_start))
@@ -350,11 +399,33 @@ async def startup_event():
     logger.info("Single-user POC pipeline ready.")
     mobile_activity_task = asyncio.create_task(process_mobile_activity())
 
+    if clip_store.enabled:
+        clip_retention_task = asyncio.create_task(run_clip_retention())
+        logger.info("Clip retention running (unpinned %d min, pinned %d day(s)).",
+                    clip_store.retention_seconds // 60,
+                    clip_store.pinned_retention_seconds // 86400)
+
     if neo4j_store is not None and env_bool("DAILY_REPORT_SCHEDULED", True):
         daily_report_task = asyncio.create_task(run_daily_report_scheduler())
         logger.info("Daily report scheduled for %02d:%02d local.",
                     env_int("DAILY_REPORT_HOUR", 23, minimum=0),
                     env_int("DAILY_REPORT_MINUTE", 30, minimum=0))
+
+
+async def run_clip_retention():
+    """Expire clips nothing referenced, on a slow loop off the capture threads."""
+    interval = env_int("CLIP_PRUNE_INTERVAL_SECONDS", 300, minimum=30)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        try:
+            await asyncio.to_thread(clip_store.prune)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Clip retention pass failed: %s", exc)
 
 
 async def run_daily_report_scheduler():
@@ -388,7 +459,7 @@ async def run_daily_report_scheduler():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    for task in (mobile_activity_task, daily_report_task):
+    for task in (mobile_activity_task, daily_report_task, clip_retention_task):
         if task is None:
             continue
         task.cancel()
@@ -770,8 +841,7 @@ async def room_feed(room_id: str, date: str = None, limit: int = 200,
 
 @app.post("/rooms/daily/report")
 async def daily_report(date: str = None, post: bool = True):
-    """Phase 3: generate the Coach's productivity report for a day and (by
-    default) post it into the Daily room."""
+    """Generate the Coach's daily review and post it to Creative Coach."""
     if neo4j_store is None:
         return JSONResponse(status_code=400, content={"error": "graph not enabled"})
     import datetime
@@ -799,11 +869,14 @@ async def daily_report(date: str = None, post: bool = True):
 
     posted = bool(post and metrics.get("events"))
     if posted:
+        neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
         eod = datetime.datetime.fromisoformat(ds).timestamp() + 86399
-        neo4j_store.add_message("daily", "coach", report, ts=eod)
+        neo4j_store.add_message(
+            "agent:creative-coach", "coach", report, ts=eod)
 
     return {"date": ds, "metrics": metrics, "feedback": feedback,
-            "report": report, "posted": posted}
+            "report": report, "posted": posted,
+            "posted_room_id": "agent:creative-coach" if posted else None}
 
 
 @app.post("/rooms/hygiene/archive")
@@ -1084,6 +1157,15 @@ def _camera_workers_for(applications):
     return selected
 
 
+def _require_single_camera(room, applications, live):
+    """Apply the one-camera-per-question rule to this request. See rooms.scope."""
+    connected = [worker.name or worker.camera_id
+                 for worker in (camera_manager.workers.values()
+                                if camera_manager is not None else [])
+                 if worker.status().get("connected")]
+    return resolve_camera_scope(room.get("kind"), applications, live, connected)
+
+
 def _room_live_frames(room, applications):
     """Snapshot the current frame buffers behind this room.
 
@@ -1155,10 +1237,26 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
     included — that thread is the conversation, not part of what is being filtered.
     """
     room = neo4j_store.get_room(room_id) or {"name": room_id}
+    agent = get_agent(room_id)
+    # Validated before the turn is persisted: a rejected question must not be
+    # left sitting in the room's thread as if it had been asked.
+    chosen_camera = _require_single_camera(room, applications, live)
+    if chosen_camera and not applications:
+        applications = [chosen_camera]
     neo4j_store.add_message(room_id, "user", message)
     ctx = neo4j_store.room_context(
         room_id, start=start, end=end, applications=applications)
     history = neo4j_store.room_messages(room_id, limit=12)
+
+    daily_ctx = None
+    if agent is not None:
+        today = datetime.date.today()
+        day_start = datetime.datetime.combine(
+            today, datetime.time.min).timestamp()
+        day_end = day_start + 86400
+        daily_ctx = neo4j_store.room_context(
+            "daily", event_limit=16, note_limit=0, entity_limit=20,
+            start=day_start, end=day_end)
 
     live_frames, live_labels, live_warnings = [], [], []
     if live:
@@ -1170,7 +1268,10 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
     # Over-fetch, because the source filter is applied after ranking.
     relevant = evidence_retriever.retrieve(
         message, limit=32 if applications else 8,
-        kinds=["event", "note", "claim"], room_id=room_id, start=start, end=end)
+        kinds=["event", "note", "claim"],
+        room_id=None if agent is not None else room_id,
+        start=start, end=end,
+        domain="personal" if agent is not None else None)
     if applications:
         in_scope = set(neo4j_store.room_event_ids(
             room_id, start=start, end=end, applications=applications))
@@ -1183,15 +1284,31 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
     relevant_lines = [
         f"[{item['number']}] ({item['kind']}) {item['text']}" for item in citations]
 
-    grounding = (
-        f"You are the user's assistant, chatting inside the '{room.get('name', room_id)}' room. "
-        "This room collects the user's activity, notes, and your past chat on this topic. "
-        "Use the context to answer; be concise and specific. " + INITIATIVE_PROMPT + "\n\n"
-        f"Most relevant to this question:\n- " + "\n- ".join(relevant_lines or ["(none)"]) + "\n\n"
-        f"Recent activity in this room:\n- " + "\n- ".join(ctx["events"][:8] or ["(none)"]) + "\n\n"
-        f"User's notes here:\n- " + "\n- ".join(ctx["notes"][:8] or ["(none)"]) + "\n\n"
-        f"Key things seen here: {', '.join(ctx['entities'][:15]) or '(none)'}"
-    )
+    if agent is not None:
+        grounding = (
+            f"You are {agent.name}, one of the user's persistent personal agents. "
+            "This is your own room and conversation; do not impersonate the other "
+            "agents. Use the shared personal and activity context when relevant, "
+            "but do not force every detail into every answer.\n\n"
+            f"Your role:\n{agent.instructions}\n\n{INITIATIVE_PROMPT}\n\n"
+            f"{personal_memory.context(query=message) or 'No personal profile facts learned yet.'}\n\n"
+            "Today's observed PC activity:\n- "
+            + "\n- ".join((daily_ctx or {}).get("events", []) or ["(none yet)"])
+            + "\n\nMost relevant long-term activity or memory:\n- "
+            + "\n- ".join(relevant_lines or ["(none)"])
+            + "\n\nUser notes saved specifically in your room:\n- "
+            + "\n- ".join(ctx["notes"][:12] or ["(none)"])
+        )
+    else:
+        grounding = (
+            f"You are the user's assistant, chatting inside the '{room.get('name', room_id)}' room. "
+            "This room collects the user's activity, notes, and your past chat on this topic. "
+            "Use the context to answer; be concise and specific. " + INITIATIVE_PROMPT + "\n\n"
+            f"Most relevant to this question:\n- " + "\n- ".join(relevant_lines or ["(none)"]) + "\n\n"
+            f"Recent activity in this room:\n- " + "\n- ".join(ctx["events"][:8] or ["(none)"]) + "\n\n"
+            f"User's notes here:\n- " + "\n- ".join(ctx["notes"][:8] or ["(none)"]) + "\n\n"
+            f"Key things seen here: {', '.join(ctx['entities'][:15]) or '(none)'}"
+        )
     # Activity lines are prefixed with their source, so say what that prefix is.
     if room.get("kind") in ("camera", "screen"):
         grounding += ("\n\nEach activity line begins with the "
@@ -1204,12 +1321,14 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
                       ". Answer within that scope and say so if it is too narrow "
                       "to answer, rather than drawing on anything outside it.")
     if live_frames:
-        grounding += ("\n\nThe attached images are what those sources are showing "
-                      "right now. Prefer them over remembered activity for "
-                      "anything about the present moment.")
+        grounding += (
+            f"\n\nThe attached video is what {', '.join(live_labels) or 'the source'} "
+            "is showing right now, as a short clip of the last moments. Prefer it "
+            "over remembered activity for anything about the present moment, and "
+            "answer only about what this one source can see.")
     for warning in live_warnings:
         grounding += f"\n\nLive view unavailable — {warning}."
-    if room.get("instructions"):
+    if room.get("instructions") and agent is None:
         grounding += f"\n\nRoom-specific user instructions:\n{room['instructions']}"
 
     messages = [{"role": "system", "content": grounding}]
@@ -1221,26 +1340,29 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
         role = "user" if m["role"] == "user" else "assistant"
         messages.append({"role": role, "content": m["text"]})
 
-    if live_frames:
-        content = [{"type": "text", "text": message}]
-        for image in live_frames:
-            try:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{encode_image_base64(image)}"},
-                })
-            except Exception as exc:
-                logger.warning("room live frame encode failed: %s", exc)
-        messages.append({"role": "user", "content": content})
+    # One video, full resolution, budgeted by the server — the same way the
+    # capture path feeds it, and the reason that path never overflows. Twenty
+    # frames as separate images was ~58k tokens; as video it is ~12k.
+    video_b64, frame_info = frames_as_video(
+        live_frames, fps=LIVE_VIDEO_FPS, max_frames=MAX_FRAMES)
+    if video_b64:
+        messages.append({"role": "user", "content": [
+            {"type": "text", "text": message},
+            {"type": "video_url",
+             "video_url": {"url": f"data:video/mp4;base64,{video_b64}"}},
+        ]})
     else:
+        if live_frames:
+            live_warnings.append("live frames could not be encoded")
         messages.append({"role": "user", "content": message})
 
-    meta = {"live_sources": live_labels, "live_frames": len(live_frames),
+    meta = {"live_sources": live_labels, "live_frames": frame_info["kept"],
+            "live_frame_detail": frame_info,
             "warnings": live_warnings, "applications": applications or [],
             "start": start, "end": end}
-    logger.info("room chat %s: apps=%s window=(%s,%s) live=%d frames",
-                room_id, applications, start, end, len(live_frames))
+    logger.info("room chat %s: apps=%s window=(%s,%s) live=%d frame(s) as video "
+                "at %sx%s", room_id, applications, start, end,
+                frame_info["kept"], frame_info["width"], frame_info["height"])
     return messages, citations, meta
 
 
@@ -1277,12 +1399,16 @@ async def room_chat(room_id: str, request: Request):
     if error is not None:
         return error
 
-    messages, citations, meta = _room_chat_turn(
-        room_id, turn["message"], applications=turn["applications"],
-        start=turn["start"], end=turn["end"], live=turn["live"])
+    try:
+        messages, citations, meta = _room_chat_turn(
+            room_id, turn["message"], applications=turn["applications"],
+            start=turn["start"], end=turn["end"], live=turn["live"])
+    except RoomScopeError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
     try:
         resp = await client.chat.completions.create(
-            model=vlm_model, messages=messages, max_tokens=500)
+            model=vlm_model, messages=messages,
+            max_tokens=700 if get_agent(room_id) is not None else 500)
         reply = resp.choices[0].message.content or ""
     except Exception as exc:
         logger.warning("room_chat LLM failed: %s", exc)
@@ -1290,6 +1416,31 @@ async def room_chat(room_id: str, request: Request):
 
     neo4j_store.add_message(room_id, "assistant", reply)
     return {"room_id": room_id, "reply": reply, "citations": citations, **meta}
+
+
+@app.post("/rooms/{room_id}/agent-check-in")
+async def room_agent_check_in(room_id: str):
+    """Generate an on-demand review using an agent's default check-in."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    agent = get_agent(room_id)
+    if agent is None:
+        return JSONResponse(status_code=400, content={"error": "not an agent room"})
+    if neo4j_store.get_room(room_id) is None:
+        neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
+    try:
+        messages, citations, meta = _room_chat_turn(
+            room_id, agent.check_in)
+        resp = await client.chat.completions.create(
+            model=vlm_model, messages=messages, max_tokens=750)
+        reply = resp.choices[0].message.content or ""
+    except Exception as exc:
+        logger.warning("agent check-in failed (%s): %s", room_id, exc)
+        return JSONResponse(
+            status_code=502, content={"error": f"check-in failed: {exc}"})
+    neo4j_store.add_message(room_id, "assistant", reply)
+    return {"room_id": room_id, "reply": reply,
+            "citations": citations, **meta}
 
 
 @app.post("/rooms/{room_id}/chat/stream")
@@ -1301,15 +1452,21 @@ async def room_chat_stream(room_id: str, request: Request):
     if error is not None:
         return error
 
-    messages, citations, meta = _room_chat_turn(
-        room_id, turn["message"], applications=turn["applications"],
-        start=turn["start"], end=turn["end"], live=turn["live"])
+    try:
+        messages, citations, meta = _room_chat_turn(
+            room_id, turn["message"], applications=turn["applications"],
+            start=turn["start"], end=turn["end"], live=turn["live"])
+    except RoomScopeError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
 
     def persist(reply):
         return neo4j_store.add_message(room_id, "assistant", reply)
 
     return StreamingResponse(
-        _stream_reply(messages, citations, persist, max_tokens=500, meta=meta),
+        _stream_reply(
+            messages, citations, persist,
+            max_tokens=700 if get_agent(room_id) is not None else 500,
+            meta=meta),
         media_type="application/x-ndjson")
 
 
@@ -1397,6 +1554,19 @@ async def memory_search(q: str, limit: int = 40, kinds: str = None,
         q, limit=limit, kinds=selected, start=start, end=end,
         room_id=room_id, domain=domain, semantic=semantic)
     return {"query": q, "domain": domain, "results": results}
+
+
+@app.get("/memory/personal-profile")
+async def memory_personal_profile():
+    """The evolving single-user profile and evidence-based PC routine."""
+    return personal_memory.profile()
+
+
+@app.delete("/memory/personal-profile/{fact_id}")
+async def memory_personal_fact_forget(fact_id: str):
+    if not personal_memory.forget(fact_id):
+        return JSONResponse(status_code=404, content={"error": "fact not found"})
+    return {"forgotten": True, "fact_id": fact_id}
 
 
 @app.get("/memory/events/{event_id}")
@@ -2092,16 +2262,49 @@ async def proactive_insights(since: int = 0):
     """Proactive insights newer than `since` (by id), each with base64 TTS audio
     so the end device can play them. The client tracks the last id it has seen
     and passes it as `since` to receive only new insights."""
-    items = [i for i in _proactive_insights if i["id"] > since]
+    # Clip state is re-read here rather than trusted from when the insight was
+    # made: retention may have removed the footage in the meantime.
+    items = []
+    for insight in _proactive_insights:
+        if insight["id"] <= since:
+            continue
+        clip = clip_store.describe(insight.get("clip_id"))
+        items.append({**insight, "clip": clip,
+                      "clip_id": clip["clip_id"] if clip else None,
+                      "clip_url": clip["url"] if clip else None,
+                      "can_ask": bool(clip)})
     return {"enabled": proactive is not None, "latest_id": _proactive_seq, "insights": items}
+
+
+def _with_clip(item):
+    """Attach the playable clip an alert was raised from, if it still exists.
+
+    Resolved at read time rather than stored: retention can remove a clip after
+    the alert was written, and an item that still advertised a dead `clip_url`
+    would give the user a player that fails instead of a card that doesn't offer
+    one. Falls back to the event's clip for alerts stored before clips existed.
+    """
+    clip = clip_store.describe(item.get("clip_id"))
+    if clip is None:
+        clip = clip_store.for_event(item.get("event_id"))
+    return {**item,
+            "clip_id": clip["clip_id"] if clip else None,
+            "clip_url": clip["url"] if clip else None,
+            "clip": clip,
+            # Follow-up questions are answered from the footage, so they are
+            # only offered while the footage is still on disk.
+            "can_ask": bool(clip)}
 
 
 @app.get("/notifications")
 async def notifications_list(since: int = 0, limit: int = 100,
                              unread_only: bool = False):
-    """Durable critical/important event inbox, newest first."""
-    return notification_center.list(
+    """Durable critical/important event inbox, newest first, each with its clip."""
+    payload = notification_center.list(
         since=since, limit=limit, unread_only=unread_only)
+    payload["notifications"] = [
+        _with_clip(item) for item in payload.get("notifications", [])]
+    return payload
 
 
 @app.post("/notifications/{notification_id}/read")
@@ -2109,12 +2312,141 @@ async def notification_mark_read(notification_id: str):
     item = notification_center.mark_read(notification_id)
     if item is None:
         return JSONResponse(status_code=404, content={"error": "notification not found"})
-    return {"notification": item}
+    return {"notification": _with_clip(item)}
 
 
 @app.post("/notifications/actions/read-all")
 async def notifications_mark_all_read():
     return {"updated": notification_center.mark_all_read()}
+
+
+# --- Evidence clips ---------------------------------------------------------
+# A notable event is a claim about something that happened off-screen; these
+# endpoints are how the user checks it. See sources/clips.py.
+
+CLIP_ASK_SYSTEM_PROMPT = """You answer questions about a short surveillance or \
+screen-capture clip the user is watching. Answer ONLY from what is visible in the \
+video plus the context given. Be specific and brief (1-3 sentences). If the clip \
+does not show enough to answer, say exactly what you can and cannot see — never \
+guess at identities, intentions, or anything outside the frame. Note that the clip \
+is a low-resolution, sped-up recording, so fine detail may genuinely be unreadable."""
+
+
+@app.get("/clips")
+async def clips_list(limit: int = 50, pinned_only: bool = False):
+    """Clips still on disk, newest first."""
+    return {"enabled": clip_store.enabled,
+            "clips": clip_store.list(limit=limit, pinned_only=pinned_only)}
+
+
+@app.get("/clips/{clip_id}/meta")
+async def clip_meta(clip_id: str):
+    clip = clip_store.describe(clip_id)
+    if clip is None:
+        return JSONResponse(status_code=404, content={"error": "clip not found"})
+    meta = clip_store.meta(clip_id) or {}
+    return {"clip": {**clip, "summary": meta.get("summary"),
+                     "camera_name": meta.get("camera_name"),
+                     "window_titles": meta.get("window_titles")}}
+
+
+@app.get("/clips/{clip_id}")
+async def clip_playback(clip_id: str, request: Request):
+    """Stream a clip's MP4, honouring Range requests.
+
+    Range matters: video_player and every browser <video> issue a ranged request
+    before they will start playback or allow a seek, and a server that always
+    replies 200 with the whole file makes seeking silently fail.
+    """
+    path = clip_store.path(clip_id)
+    if not valid_clip_id(clip_id) or not path or not os.path.exists(path):
+        return JSONResponse(status_code=404, content={"error": "clip not found"})
+
+    size = os.path.getsize(path)
+    headers = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=600"}
+    wanted = parse_range(request.headers.get("range"), size)
+    if wanted is None:
+        return FileResponse(path, media_type="video/mp4", headers=headers)
+    if wanted == "unsatisfiable":
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+    start, end = wanted
+
+    def chunks(chunk_size=256 * 1024):
+        remaining = end - start + 1
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            while remaining > 0:
+                data = handle.read(min(chunk_size, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+
+    return StreamingResponse(
+        chunks(), status_code=206, media_type="video/mp4",
+        headers={**headers, "Content-Range": f"bytes {start}-{end}/{size}",
+                 "Content-Length": str(end - start + 1)})
+
+
+@app.post("/clips/{clip_id}/ask")
+async def clip_ask(clip_id: str, request: Request):
+    """Answer a follow-up question from the clip's own footage."""
+    path = clip_store.path(clip_id)
+    if not valid_clip_id(clip_id) or not path or not os.path.exists(path):
+        # Checked before VLM readiness: an expired clip is permanent and the UI
+        # should say so, rather than invite a retry against a busy server.
+        return JSONResponse(status_code=404, content={
+            "error": "clip not found — it may have passed its retention window"})
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid JSON: {exc}"})
+    question = (data.get("question") or data.get("message") or "").strip() \
+        if isinstance(data, dict) else ""
+    if not question:
+        return JSONResponse(status_code=400, content={"error": "question is required"})
+    if vlm_model is None:
+        return JSONResponse(status_code=503, content={"error": "VLM not ready"})
+
+    meta = clip_store.meta(clip_id) or {}
+    context_lines = [
+        f"- source: {meta.get('source')}",
+        f"- camera/app: {meta.get('camera_name') or meta.get('label')}",
+        f"- recorded: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(meta.get('timestamp') or time.time()))}",
+        f"- covers {meta.get('covers_seconds')}s of real time, played back in "
+        f"{meta.get('plays_seconds')}s",
+    ]
+    if meta.get("summary"):
+        context_lines.append(f"- what was recorded at the time: {meta['summary']}")
+
+    video_b64 = await asyncio.to_thread(_read_clip_base64, path)
+    content = [
+        {"type": "text",
+         "text": ("Clip context:\n" + "\n".join(context_lines)
+                  + f"\n\nQuestion about this clip: {question}")},
+        {"type": "video_url",
+         "video_url": {"url": f"data:video/mp4;base64,{video_b64}"}},
+    ]
+    try:
+        response = await client.chat.completions.create(
+            model=vlm_model,
+            messages=[{"role": "system", "content": CLIP_ASK_SYSTEM_PROMPT},
+                      {"role": "user", "content": content}],
+            max_tokens=env_int("CLIP_ASK_MAX_TOKENS", 400),
+        )
+    except Exception as exc:
+        logger.warning("Clip question failed (%s): %s", clip_id, exc)
+        return JSONResponse(status_code=502, content={"error": f"VLM error: {exc}"})
+    answer = (response.choices[0].message.content or "").strip()
+    # Being asked about is itself a reason to keep the footage around.
+    clip_store.pin(clip_id)
+    return {"clip_id": clip_id, "question": question, "answer": answer,
+            "clip": clip_store.describe(clip_id)}
+
+
+def _read_clip_base64(path):
+    with open(path, "rb") as handle:
+        return base64.b64encode(handle.read()).decode("utf-8")
 
 
 NUDGE_FEEDBACK_VALUES = {"up", "down", "not_now"}
@@ -2157,9 +2489,13 @@ def handle_observation_description(description, timestamp, source="screen", cont
     global _proactive_seq
     if proactive is None:
         return
+    # The clip id is plumbing for the UI, not evidence for the narrator — it goes
+    # to the insight, never into the prompt.
+    context = dict(context or {})
+    clip_id = context.pop("clip_id", None)
     try:
         insight = asyncio.run(
-            proactive.consider(description, source=source, context=context))
+            proactive.consider(description, source=source, context=context or None))
     except Exception as exc:
         logger.warning("Proactive consider failed: %s", exc)
         return
@@ -2193,6 +2529,13 @@ def handle_observation_description(description, timestamp, source="screen", cont
             neo4j_store.add_message(room["room_id"], "insight", text, ts=timestamp)
         except Exception as exc:
             logger.warning("Posting insight to its room failed: %s", exc)
+    # An unprompted remark is the weakest kind of claim — the user did not ask
+    # for it — so it ships with the footage it was made from, kept alive past the
+    # ordinary retention window and open to follow-up questions.
+    clip = None
+    if clip_id:
+        clip_store.pin(clip_id)
+        clip = clip_store.describe(clip_id)
     _proactive_seq += 1
     _proactive_insights.append({
         "id": _proactive_seq,
@@ -2204,15 +2547,17 @@ def handle_observation_description(description, timestamp, source="screen", cont
         "evidence": insight.get("evidence") or [],
         "timestamp": timestamp,
         "audio": audio_b64,
+        "clip_id": clip_id if clip else None,
+        "clip": clip,
     })
     logger.info("Proactive insight #%d (%s): %s",
                 _proactive_seq, insight.get("kind"), text)
 
 
-def handle_screen_description(description, timestamp):
+def handle_screen_description(description, timestamp, context=None):
     """Backward-compatible desktop capture callback."""
     return handle_observation_description(
-        description, timestamp, source="desktop_screen")
+        description, timestamp, source="desktop_screen", context=context)
 
 
 async def describe_mobile_frames(source, frames):
@@ -2226,7 +2571,9 @@ async def describe_mobile_frames(source, frames):
         ),
     }]
     # Bound prompt size independently from the live conversational frame limit.
-    for frame in frames[-MAX_FRAMES:]:
+    budgeted, _ = fit_frames(
+        frames, token_budget=LIVE_FRAME_TOKEN_BUDGET, max_frames=MAX_FRAMES)
+    for frame in budgeted:
         content.append({
             "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{encode_image_base64(frame)}"},
@@ -2257,9 +2604,13 @@ async def process_mobile_activity():
             )
             mobile_stream.processed()
             if proactive is not None:
+                clip_id = await asyncio.to_thread(
+                    clip_store.save, frames, f"mobile_{source}", source,
+                    timestamp, 1.0, description)
                 await asyncio.to_thread(
                     handle_observation_description, description, timestamp,
-                    f"mobile_{source}", {"capture_source": source})
+                    f"mobile_{source}", {"capture_source": source,
+                                         "clip_id": clip_id})
             logger.info("Processed %d mobile %s frames into memory", len(frames), source)
         except Exception as exc:
             mobile_stream.last_error = f"activity processing failed: {exc}"
@@ -2416,13 +2767,18 @@ def build_user_content(transcription, image_b64, context, live):
         except Exception as exc:
             info["warnings"].append(f"image decode failed: {exc}")
 
-    # Live stream frames (screen/camera), capped at MAX_FRAMES.
+    # Live stream frames (screen/camera), capped by vision-token budget.
     if live:
         frames, source, warning = _frames_for_context(context)
         if warning:
             info["warnings"].append(warning)
         if frames:
-            frames = frames[-MAX_FRAMES:]
+            # Budgeted by vision tokens, not frame count: at native capture
+            # resolution a single window of frames can exceed the whole context.
+            frames, frame_info = fit_frames(
+                frames, token_budget=LIVE_FRAME_TOKEN_BUDGET,
+                max_frames=MAX_FRAMES)
+            info["frame_detail"] = frame_info
             for index, img in enumerate(frames):
                 try:
                     encoded = encode_image_base64(img)
@@ -2503,12 +2859,18 @@ async def gather_tool_context(transcription):
     return labelled, info
 
 
-def build_messages(concise, memory_text, chat_history, user_content):
+def build_messages(concise, memory_text, chat_history, user_content,
+                   personal_context=None):
     system_prompt = (
         CONCISE_SYSTEM_PROMPT if concise
         else "You are the user's personal assistant.\n\n" + INITIATIVE_PROMPT
     )
     messages = [{"role": "system", "content": system_prompt}]
+    if personal_context:
+        messages.append({
+            "role": "system",
+            "content": personal_context,
+        })
     if memory_text:
         messages.append({
             "role": "user",
@@ -2588,7 +2950,11 @@ async def generate_response(wav_bytes_audio, wav_bytes_image, chat_history,
 
     # 4. Build the prompt and open the streaming VLM call.
     set_pipeline_status(True, "starting_model", turn_id)
-    messages = build_messages(concise, memory_text, chat_history, user_content)
+    personal_context = (
+        personal_memory.context(query=transcription)
+        if env_bool("PERSONAL_MEMORY_ENABLED", True) else "")
+    messages = build_messages(
+        concise, memory_text, chat_history, user_content, personal_context)
     try:
         chat_response = await client.chat.completions.create(
             model=vlm_model, messages=messages, stream=True,
@@ -2623,6 +2989,26 @@ async def generate_response(wav_bytes_audio, wav_bytes_image, chat_history,
     # 6. Persist the turn into the single shared history.
     chat_history.append({"role": "user", "content": user_content})
     chat_history.append({"role": "assistant", "content": full_assistant_response})
+
+    # Learn durable autobiographical details without delaying the spoken reply.
+    # Keep a strong reference until completion and log failures instead of
+    # surfacing them as a failed assistant turn.
+    if env_bool("PERSONAL_MEMORY_ENABLED", True):
+        task = asyncio.create_task(
+            learn_from_user_message(
+                client, vlm_model, personal_memory, transcription))
+        _personal_learning_tasks.add(task)
+
+        def _learning_done(done):
+            _personal_learning_tasks.discard(done)
+            try:
+                learned = done.result()
+                if learned:
+                    logger.info("[%s] learned %d personal fact(s)", turn_id, len(learned))
+            except Exception as exc:
+                logger.warning("[%s] personal learning failed: %s", turn_id, exc)
+
+        task.add_done_callback(_learning_done)
 
     total_ms = int((time.perf_counter() - t_turn) * 1000)
     logger.info("[%s] turn done %d ms", turn_id, total_ms)

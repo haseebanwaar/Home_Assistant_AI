@@ -763,6 +763,23 @@ class Neo4jStore:
         self.run(_MERGE_ROOM_CYPHER, **_room_params(room, _json))
         return self.get_room(room.room_id)
 
+    def ensure_agent_rooms(self, agents):
+        """Idempotently create/update the built-in personal-agent rooms."""
+        import json as _json
+        from memory.models.room import Room
+
+        rooms = []
+        for position, agent in enumerate(agents, start=10):
+            room = Room(
+                room_id=agent.room_id, name=agent.name, kind="agent",
+                auto=True, description=agent.description,
+                instructions=agent.instructions, color=agent.color,
+                icon=agent.icon, pinned=True, position=position,
+            )
+            self.run(_MERGE_ROOM_CYPHER, **_room_params(room, _json))
+            rooms.append(self.get_room(room.room_id))
+        return rooms
+
     def create_room(self, room):
         """Create a user-managed topic room. Raises ValueError on duplicate id."""
         import json as _json

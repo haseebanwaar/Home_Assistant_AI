@@ -36,6 +36,16 @@ IconData _kindIcon(String kind, String name, [String? configured]) {
       return Icons.videocam;
     case 'desktop_windows':
       return Icons.desktop_windows;
+    case 'rocket_launch':
+      return Icons.rocket_launch;
+    case 'local_fire_department':
+      return Icons.local_fire_department;
+    case 'psychology':
+      return Icons.psychology;
+    case 'lightbulb':
+      return Icons.lightbulb_outline;
+    case 'menu_book':
+      return Icons.menu_book;
   }
   switch (kind) {
     case 'daily':
@@ -48,6 +58,8 @@ IconData _kindIcon(String kind, String name, [String? configured]) {
       return Icons.folder_special;
     case 'topic':
       return Icons.forum;
+    case 'agent':
+      return Icons.smart_toy_outlined;
     default: // activity
       final n = name.toLowerCase();
       if (n.contains('cod')) return Icons.code;
@@ -439,13 +451,14 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
                 PopupMenuItem(
                     value: 'pin',
                     child: Text(room['pinned'] == true ? 'Unpin' : 'Pin')),
-                if (kind != 'daily')
+                if (kind != 'daily' && kind != 'agent')
                   PopupMenuItem(
                       value: 'archive',
                       child: Text(room['archived'] == true ? 'Restore' : 'Archive')),
-                const PopupMenuItem(
-                    value: 'reroute', child: Text('Re-route events')),
-                if (kind != 'daily')
+                if (kind != 'agent')
+                  const PopupMenuItem(
+                      value: 'reroute', child: Text('Re-route events')),
+                if (kind != 'daily' && kind != 'agent')
                   const PopupMenuItem(value: 'delete', child: Text('Delete')),
               ],
             ),
@@ -505,6 +518,9 @@ class _RoomScreenState extends State<RoomScreen> {
   bool _live = false;
 
   bool get _isDaily => widget.kind == 'daily';
+  bool get _isAgent => widget.kind == 'agent';
+  bool get _isCreativeCoach =>
+      widget.roomId == 'agent:creative-coach';
   bool get _isCameraRoom => widget.kind == 'camera';
   bool get _isSourceRoom =>
       widget.kind == 'camera' || widget.kind == 'screen';
@@ -574,6 +590,10 @@ class _RoomScreenState extends State<RoomScreen> {
   @override
   void initState() {
     super.initState();
+    if (_isAgent) {
+      _mode = 'chat';
+      _kinds.remove('event');
+    }
     _load();
     if (_isSourceRoom) _loadSources();
   }
@@ -753,7 +773,14 @@ class _RoomScreenState extends State<RoomScreen> {
       } else {
         _dropPending();
         _input.text = text; // restore so the user doesn't lose their input
-        _snack('Failed: HTTP ${resp.statusCode}');
+        // The server explains a refused scope ("select which camera to watch");
+        // showing only the status code would throw that explanation away.
+        String reason = 'HTTP ${resp.statusCode}';
+        try {
+          final error = (json.decode(resp.body) as Map<String, dynamic>)['error'];
+          if (error is String && error.isNotEmpty) reason = error;
+        } catch (_) {}
+        _snack(reason);
       }
     } catch (e) {
       _dropPending();
@@ -793,6 +820,25 @@ class _RoomScreenState extends State<RoomScreen> {
     }
   }
 
+  Future<void> _generateAgentCheckIn() async {
+    setState(() => _sending = true);
+    try {
+      final resp = await http
+          .post(Uri.parse(
+              '${widget.apiBase}/rooms/${widget.roomId}/agent-check-in'))
+          .timeout(const Duration(seconds: 90));
+      if (resp.statusCode == 200) {
+        await _load();
+      } else {
+        _snack('Check-in failed: HTTP ${resp.statusCode}');
+      }
+    } catch (e) {
+      _snack('Check-in failed: $e');
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
   void _snack(String m) {
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
@@ -808,11 +854,17 @@ class _RoomScreenState extends State<RoomScreen> {
         backgroundColor: _panel,
         title: Text(widget.roomName, overflow: TextOverflow.ellipsis),
         actions: [
-          if (_isDaily)
+          if (_isCreativeCoach)
             IconButton(
-              tooltip: 'Generate Coach report',
+              tooltip: 'Generate daily Coach report',
               icon: const Icon(Icons.insights, color: _mint),
               onPressed: _sending ? null : _generateReport,
+            ),
+          if (_isAgent)
+            IconButton(
+              tooltip: 'Run agent check-in',
+              icon: const Icon(Icons.auto_awesome, color: _violet),
+              onPressed: _sending ? null : _generateAgentCheckIn,
             ),
           IconButton(
             icon: const Icon(Icons.refresh, color: _mint),
@@ -886,8 +938,10 @@ class _RoomScreenState extends State<RoomScreen> {
           const SizedBox(height: 6),
           Row(
             children: [
-              _filterChip('Activity', 'event'),
-              const SizedBox(width: 6),
+              if (!_isAgent) ...[
+                _filterChip('Activity', 'event'),
+                const SizedBox(width: 6),
+              ],
               _filterChip('Notes', 'note'),
               const SizedBox(width: 6),
               _filterChip('Chat', 'message'),
@@ -1032,6 +1086,12 @@ class _RoomScreenState extends State<RoomScreen> {
                   onSelected: (on) {
                     setState(() {
                       if (on) {
+                        // One camera at a time: a question here is about a
+                        // place, and a camera that cannot see what is being
+                        // asked about should not be part of the answer. Picking
+                        // another camera replaces the current one rather than
+                        // adding to it. Apps in the Screen room still stack.
+                        if (_isCameraRoom) _selectedSources.clear();
                         _selectedSources.add(raw);
                       } else {
                         _selectedSources.remove(raw);
