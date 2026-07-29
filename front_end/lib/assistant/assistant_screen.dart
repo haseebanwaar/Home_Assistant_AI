@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import '../memory/timeline_screen.dart';
+import '../network/http_json.dart';
 
 const _ink = Color(0xFF070B14);
 const _panel = Color(0xFF111827);
@@ -58,7 +59,7 @@ class _AssistantScreenState extends State<AssistantScreen>
     try {
       final resp = await http.get(Uri.parse('${widget.apiBase}/rooms'));
       if (resp.statusCode == 200 && mounted) {
-        final data = json.decode(resp.body) as Map<String, dynamic>;
+        final data = decodeJsonResponse(resp) as Map<String, dynamic>;
         setState(() => _rooms = (data['rooms'] as List?) ?? []);
       }
     } catch (_) {}
@@ -70,7 +71,7 @@ class _AssistantScreenState extends State<AssistantScreen>
       final resp = await http
           .get(Uri.parse('${widget.apiBase}/assistant/conversations'));
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
-      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(resp) as Map<String, dynamic>;
       final items = (data['conversations'] as List?) ?? [];
       setState(() => _conversations = items);
       final id = selectId ??
@@ -88,7 +89,7 @@ class _AssistantScreenState extends State<AssistantScreen>
     final resp = await http
         .get(Uri.parse('${widget.apiBase}/assistant/conversations/$id'));
     if (resp.statusCode != 200) return;
-    final data = json.decode(resp.body) as Map<String, dynamic>;
+    final data = decodeJsonResponse(resp) as Map<String, dynamic>;
     if (mounted) {
       setState(() =>
           _conversation = data['conversation'] as Map<String, dynamic>);
@@ -167,7 +168,7 @@ class _AssistantScreenState extends State<AssistantScreen>
       }),
     );
     if (resp.statusCode == 201) {
-      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(resp) as Map<String, dynamic>;
       final id = data['conversation']['conversation_id'].toString();
       await _loadConversations(selectId: id);
     } else {
@@ -491,7 +492,7 @@ class _ReviewPanelState extends State<ReviewPanel> {
       final resp = await http.get(Uri.parse('${widget.apiBase}$path'));
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
       setState(() =>
-          _data = json.decode(resp.body) as Map<String, dynamic>);
+          _data = decodeJsonResponse(resp) as Map<String, dynamic>);
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -686,7 +687,7 @@ class _FocusPanelState extends State<FocusPanel> {
       final resp =
           await http.get(Uri.parse('${widget.apiBase}/focus/sessions'));
       if (resp.statusCode != 200) return;
-      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(resp) as Map<String, dynamic>;
       setState(() {
         _active = data['active'] as Map<String, dynamic>?;
         _history = (data['sessions'] as List?) ?? [];
@@ -863,7 +864,7 @@ class _FocusPanelState extends State<FocusPanel> {
     final resp = await http
         .post(Uri.parse('${widget.apiBase}/focus/sessions/$id/stop'));
     if (resp.statusCode == 200) {
-      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(resp) as Map<String, dynamic>;
       final metrics = data['focus']['metrics'] as Map<String, dynamic>;
       await _load();
       if (!mounted) return;

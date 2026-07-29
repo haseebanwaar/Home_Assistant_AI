@@ -1,10 +1,9 @@
-import 'dart:convert';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 
 import '../clips/clip_viewer.dart';
+import '../network/http_json.dart';
 
 const _ink = Color(0xFF070B14);
 const _panel = Color(0xFF111827);
@@ -61,7 +60,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
       if (response.statusCode != 200) {
         throw Exception('HTTP ${response.statusCode}');
       }
-      final data = json.decode(response.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(response) as Map<String, dynamic>;
       final items = ((data['notifications'] as List?) ?? const [])
           .cast<Map<String, dynamic>>();
       if (mounted) {

@@ -98,6 +98,7 @@ class RealtimeCameraStream:
         self.last_frame_std = None
         self.frame_buffer = deque(maxlen=window_size)
         self.lock = Lock()
+        self._profile_version = 0
         self.running = True
         self.healthy = False
         self.last_error = None
@@ -117,7 +118,6 @@ class RealtimeCameraStream:
     def _capture_frames(self):
         retry_delay = self._reconnect_initial_delay
         connected_once = False
-
         while self.running and not self._stop.is_set():
             video = None
             try:
@@ -126,6 +126,8 @@ class RealtimeCameraStream:
                     self._mark_disconnected("camera source could not be opened")
                 else:
                     connection_had_frame = False
+                    next_sample_at = None
+                    profile_version = self._profile_version
                     while self.running and not self._stop.is_set():
                         ret, frame = video.read()
                         if not ret:
@@ -146,15 +148,24 @@ class RealtimeCameraStream:
                             self.healthy = True
 
                         self._record_quality(frame)
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        pil_image = Image.fromarray(frame_rgb)
-                        with self.lock:
-                            self.frame_buffer.append(pil_image)
                         self.last_frame_at = time.time()
 
-                        # Event.wait makes shutdown immediate even at low FPS.
-                        if self._stop.wait(1.0 / max(self.fps, 0.01)):
-                            break
+                        # Always drain/decode the RTSP stream. Inter-frame codecs
+                        # such as HEVC need every reference frame even though the
+                        # VLM only needs a sparse sample. Sleeping here used to
+                        # leave ~14 of every 15 camera frames unread, eventually
+                        # producing grey macroblocks and missing-POC errors.
+                        now = time.monotonic()
+                        if profile_version != self._profile_version:
+                            profile_version = self._profile_version
+                            next_sample_at = None
+                        if next_sample_at is None or now >= next_sample_at:
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            pil_image = Image.fromarray(frame_rgb)
+                            with self.lock:
+                                self.frame_buffer.append(pil_image)
+                            sample_interval = 1.0 / max(self.fps, 0.01)
+                            next_sample_at = now + sample_interval
             except Exception as exc:
                 self._mark_disconnected(f"camera stream error: {exc}")
                 logger.exception("Camera stream capture failed")
@@ -203,6 +214,15 @@ class RealtimeCameraStream:
         self._stop.set()
         self.capture_thread.join(timeout=5)
 
+    def update_sampling(self, fps, buffer_frames):
+        """Apply a new sampling rate and start a fresh bounded frame window."""
+        fps = max(float(fps), 0.01)
+        buffer_frames = max(int(buffer_frames), 1)
+        with self.lock:
+            self.fps = fps
+            self.frame_buffer = deque(maxlen=buffer_frames)
+            self._profile_version += 1
+
     def frames(self):
         with self.lock:
             return list(self.frame_buffer)
@@ -219,5 +239,6 @@ class RealtimeCameraStream:
             "flat_frame_pct": (round(100.0 * self.flat_frames / self.total_frames, 1)
                                if self.total_frames else None),
             "last_frame_std": self.last_frame_std,
+            "sample_fps": self.fps,
+            "buffer_capacity": self.frame_buffer.maxlen,
         }
-

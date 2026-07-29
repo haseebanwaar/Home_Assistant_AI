@@ -9,6 +9,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "4.0.4"
+  args:
+    dependency: transitive
+    description:
+      name: args
+      sha256: d0481093c50b1da8910eb0bb301626d4d8eb7284aa739614d2b394ee09e3ea04
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.7.0"
   async:
     dependency: "direct main"
     description:
@@ -121,14 +129,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "3.0.6"
-  csslib:
-    dependency: transitive
-    description:
-      name: csslib
-      sha256: "09bad715f418841f976c77db72d5398dc1253c21fb9c0c7f0b0b985860b2d58e"
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.0.2"
   cupertino_icons:
     dependency: "direct main"
     description:
@@ -137,6 +137,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.0.8"
+  dbus:
+    dependency: transitive
+    description:
+      name: dbus
+      sha256: d0c98dcd4f5169878b6cf8f6e0a52403a9dff371a3e2f019697accbf6f44a270
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.7.12"
   fake_async:
     dependency: transitive
     description:
@@ -296,14 +304,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.2.0"
-  html:
-    dependency: transitive
-    description:
-      name: html
-      sha256: "1fc58edeaec4307368c60d59b7e15b9d658b57d7f3125098b6294153c75337ec"
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.15.5"
   http:
     dependency: "direct main"
     description:
@@ -448,6 +448,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "3.1.1"
+  local_notifier:
+    dependency: "direct main"
+    description:
+      name: local_notifier
+      sha256: f6cfc933c6fbc961f4e52b5c880f68e41b2d3cd29aad557cc654fd211093a025
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.1.6"
   matcher:
     dependency: transitive
     description:
@@ -464,6 +472,70 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.11.1"
+  media_kit:
+    dependency: "direct main"
+    description:
+      name: media_kit
+      sha256: ae9e79597500c7ad6083a3c7b7b7544ddabfceacce7ae5c9709b0ec16a5d6643
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.2.6"
+  media_kit_libs_android_video:
+    dependency: transitive
+    description:
+      name: media_kit_libs_android_video
+      sha256: "3f6274e5ab2de512c286a25c327288601ee445ed8ac319e0ef0b66148bd8f76c"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.3.8"
+  media_kit_libs_ios_video:
+    dependency: transitive
+    description:
+      name: media_kit_libs_ios_video
+      sha256: b5382994eb37a4564c368386c154ad70ba0cc78dacdd3fb0cd9f30db6d837991
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.1.4"
+  media_kit_libs_linux:
+    dependency: transitive
+    description:
+      name: media_kit_libs_linux
+      sha256: "2b473399a49ec94452c4d4ae51cfc0f6585074398d74216092bf3d54aac37ecf"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.2.1"
+  media_kit_libs_macos_video:
+    dependency: transitive
+    description:
+      name: media_kit_libs_macos_video
+      sha256: f26aa1452b665df288e360393758f84b911f70ffb3878032e1aabba23aa1032d
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.1.4"
+  media_kit_libs_video:
+    dependency: "direct main"
+    description:
+      name: media_kit_libs_video
+      sha256: "2b235b5dac79c6020e01eef5022c6cc85fedc0df1738aadc6ea489daa12a92a9"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.0.7"
+  media_kit_libs_windows_video:
+    dependency: transitive
+    description:
+      name: media_kit_libs_windows_video
+      sha256: dff76da2778729ab650229e6b4ec6ec111eb5151431002cbd7ea304ff1f112ab
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.0.11"
+  media_kit_video:
+    dependency: "direct main"
+    description:
+      name: media_kit_video
+      sha256: afaa509e7b7e0bf247557a3a740cde903a52c34ace9810f94500e127bd7b043d
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.0.1"
   meta:
     dependency: transitive
     description:
@@ -536,6 +608,22 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "3.0.1"
+  package_info_plus:
+    dependency: transitive
+    description:
+      name: package_info_plus
+      sha256: "468c26b4254ab01979fa5e4a98cb343ea3631b9acee6f21028997419a80e1a20"
+      url: "https://pub.dev"
+    source: hosted
+    version: "9.0.1"
+  package_info_plus_platform_interface:
+    dependency: transitive
+    description:
+      name: package_info_plus_platform_interface
+      sha256: "202a487f08836a592a6bd4f901ac69b3a8f146af552bbd14407b6b41e1c3f086"
+      url: "https://pub.dev"
+    source: hosted
+    version: "3.2.1"
   path:
     dependency: transitive
     description:
@@ -736,6 +824,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.0.5"
+  safe_local_storage:
+    dependency: transitive
+    description:
+      name: safe_local_storage
+      sha256: "494b982d5edb71030650ea463d939670e91b232b588323dc75229d2c5f23e7b7"
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.0.6"
   screen_retriever:
     dependency: transitive
     description:
@@ -925,6 +1021,22 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.1.3"
+  universal_platform:
+    dependency: transitive
+    description:
+      name: universal_platform
+      sha256: "64e16458a0ea9b99260ceb5467a214c1f298d647c659af1bff6d3bf82536b1ec"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.1.0"
+  uri_parser:
+    dependency: transitive
+    description:
+      name: uri_parser
+      sha256: "051c62e5f693de98ca9f130ee707f8916e2266945565926be3ff20659f7853ce"
+      url: "https://pub.dev"
+    source: hosted
+    version: "3.0.2"
   uuid:
     dependency: transitive
     description:
@@ -941,46 +1053,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.2.0"
-  video_player:
-    dependency: "direct main"
-    description:
-      name: video_player
-      sha256: "48941c8b05732f9582116b1c01850b74dbee1d8520cd7e34ad4609d6df666845"
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.9.3"
-  video_player_android:
-    dependency: transitive
-    description:
-      name: video_player_android
-      sha256: ae7d4f1b41e3ac6d24dd9b9d5d6831b52d74a61bdd90a7a6262a33d8bb97c29a
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.8.2"
-  video_player_avfoundation:
-    dependency: transitive
-    description:
-      name: video_player_avfoundation
-      sha256: "84b4752745eeccb6e75865c9aab39b3d28eb27ba5726d352d45db8297fbd75bc"
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.7.0"
-  video_player_platform_interface:
-    dependency: transitive
-    description:
-      name: video_player_platform_interface
-      sha256: df534476c341ab2c6a835078066fc681b8265048addd853a1e3c78740316a844
-      url: "https://pub.dev"
-    source: hosted
-    version: "6.3.0"
-  video_player_web:
-    dependency: transitive
-    description:
-      name: video_player_web
-      sha256: "3ef40ea6d72434edbfdba4624b90fd3a80a0740d260667d91e7ecd2d79e13476"
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.3.4"
   vm_service:
     dependency: transitive
     description:
@@ -989,6 +1061,22 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "14.3.1"
+  wakelock_plus:
+    dependency: transitive
+    description:
+      name: wakelock_plus
+      sha256: "9296d40c9adbedaba95d1e704f4e0b434be446e2792948d0e4aa977048104228"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.4.0"
+  wakelock_plus_platform_interface:
+    dependency: transitive
+    description:
+      name: wakelock_plus_platform_interface
+      sha256: "036deb14cd62f558ca3b73006d52ce049fabcdcb2eddfe0bf0fe4e8a943b5cf2"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.3.0"
   web:
     dependency: transitive
     description:

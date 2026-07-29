@@ -6,6 +6,9 @@ import 'package:http/http.dart' as http;
 // C:\Users\haseeb\AppData\Local\Android\Sdk\platform-tools/adb pair 192.168.1.17:38535
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+// Only the initialiser is needed here; the full export collides with
+// audioplayers' PlayerState.
+import 'package:media_kit/media_kit.dart' show MediaKit;
 import 'package:record/record.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:audioplayers/audioplayers.dart';
@@ -14,13 +17,22 @@ import 'capture/frame_capture_controller.dart';
 import 'memory/timeline_screen.dart';
 import 'rooms/rooms_screen.dart';
 import 'assistant/assistant_screen.dart';
+import 'notifications/desktop_alert.dart';
 import 'notifications/local_notification_controller.dart';
 import 'notifications/notifications_screen.dart';
 import 'clips/clip_viewer.dart';
+import 'network/http_json.dart';
 import 'settings/global_hotkey_service.dart';
 import 'settings/settings_screen.dart';
 
-void main() => runApp(const HomeMindApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Must run before any Player is constructed, so clip playback works on the
+  // desktop build.
+  MediaKit.ensureInitialized();
+  await setupDesktopAlerts();
+  runApp(const HomeMindApp());
+}
 
 class HomeMindApp extends StatelessWidget {
   const HomeMindApp({super.key});
@@ -39,7 +51,7 @@ class HomeMindApp extends StatelessWidget {
           surface: const Color(0xFF111827),
         ),
         scaffoldBackgroundColor: const Color(0xFF070B14),
-        fontFamily: 'Segoe UI',
+        fontFamily: 'NotoSans',
         useMaterial3: true,
         inputDecorationTheme: InputDecorationTheme(
           filled: true,
@@ -128,6 +140,7 @@ class _MyAppState extends State<MyApp> {
       'source_reflect_shortcut';
   static const _promptShortcutPreferencePrefix =
       'reflection_prompt_shortcut_';
+  static const _promptTextPreferencePrefix = 'reflection_prompt_text_';
   static const _disabledShortcutValue = 'disabled';
   static const _defaultHomeHub = String.fromEnvironment(
     'HOME_HUB_URL',
@@ -177,6 +190,15 @@ class _MyAppState extends State<MyApp> {
   bool _eventNotificationsEnabled = true;
   bool _notificationsMuted = false;
   bool _deliveryPreferencesLoaded = false;
+  String _kokoroVoice = 'bf_lily';
+  List<KokoroVoiceOption> _kokoroVoices = const [];
+  bool _kokoroVoiceLoading = false;
+  bool _kokoroVoiceSaving = false;
+  String? _kokoroVoiceError;
+  List<CaptureSourceSetting> _captureSources = const [];
+  bool _captureSettingsLoading = false;
+  String? _captureSettingsSavingSource;
+  String? _captureSettingsError;
   final LocalNotificationController _notificationController =
       LocalNotificationController();
   int _lastNotificationSequence = 0;
@@ -195,6 +217,9 @@ class _MyAppState extends State<MyApp> {
     for (final preset in reflectionPromptPresets)
       preset.id: preset.defaultBinding,
   };
+  // Only presets the user actually reworded appear here; everything else falls
+  // back to the shipped prompt, so edits survive changes to the defaults.
+  Map<String, String> _promptTexts = {};
   final GlobalHotkeyService _globalHotkeys = createGlobalHotkeyService();
   String? _globalHotkeyError;
 
@@ -224,12 +249,14 @@ class _MyAppState extends State<MyApp> {
     _startService();
     _loadDeliveryPreferences();
     _loadShortcutPreferences();
+    _loadPromptTexts();
     _captureSub = _capture.status.listen((s) {
       if (mounted) setState(() => _captureStatus = s);
     });
     _loadHomeHub();
     _statusTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       _pollBackendStatus();
+      _loadCaptureSettings();
       _fetchProactiveInsights();
       _fetchNotifications();
     });
@@ -243,6 +270,8 @@ class _MyAppState extends State<MyApp> {
       _ipTextController.text = saved;
     }
     await _pollBackendStatus();
+    await _loadTtsSettings();
+    await _loadCaptureSettings();
   }
 
   Future<void> _connectToHomeHub() async {
@@ -261,6 +290,206 @@ class _MyAppState extends State<MyApp> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_homeHubPreferenceKey, value);
     await _pollBackendStatus();
+    await _loadTtsSettings();
+    await _loadCaptureSettings();
+  }
+
+  Future<void> _loadTtsSettings() async {
+    final apiBase = _apiBase;
+    if (apiBase.isEmpty || _kokoroVoiceLoading) return;
+    _kokoroVoiceLoading = true;
+    try {
+      final response = await http
+          .get(Uri.parse('$apiBase/settings/tts'))
+          .timeout(const Duration(seconds: 5));
+      if (response.statusCode != 200) {
+        throw Exception('TTS settings request returned ${response.statusCode}');
+      }
+      final data = decodeJsonResponse(response) as Map<String, dynamic>;
+      final voices = (data['voices'] as List? ?? const [])
+          .whereType<Map>()
+          .map(
+            (voice) => KokoroVoiceOption(
+              id: '${voice['id'] ?? ''}',
+              label: '${voice['label'] ?? voice['id'] ?? ''}',
+              name: '${voice['name'] ?? ''}',
+              accent: '${voice['accent'] ?? ''}',
+              gender: '${voice['gender'] ?? ''}',
+            ),
+          )
+          .where((voice) => voice.id.isNotEmpty)
+          .toList(growable: false);
+      final selected = '${data['voice'] ?? ''}';
+      if (!mounted || _apiBase != apiBase) return;
+      setState(() {
+        _kokoroVoices = voices;
+        if (voices.any((voice) => voice.id == selected)) {
+          _kokoroVoice = selected;
+        }
+        _kokoroVoiceError = null;
+      });
+    } catch (error) {
+      if (!mounted || _apiBase != apiBase) return;
+      setState(() {
+        _kokoroVoices = const [];
+        _kokoroVoiceError = 'Could not load Kokoro voices from the Home Hub.';
+      });
+    } finally {
+      _kokoroVoiceLoading = false;
+    }
+  }
+
+  Future<void> _updateKokoroVoice(String voice) async {
+    if (_kokoroVoiceSaving || voice == _kokoroVoice) return;
+    final apiBase = _apiBase;
+    if (apiBase.isEmpty) {
+      _showSnack('Set the home hub address first');
+      return;
+    }
+    final previous = _kokoroVoice;
+    setState(() {
+      _kokoroVoice = voice;
+      _kokoroVoiceSaving = true;
+      _kokoroVoiceError = null;
+    });
+    try {
+      final response = await http
+          .put(
+            Uri.parse('$apiBase/settings/tts'),
+            headers: const {'Content-Type': 'application/json'},
+            body: json.encode({'voice': voice}),
+          )
+          .timeout(const Duration(seconds: 5));
+      final data = decodeJsonResponse(response) as Map<String, dynamic>;
+      if (response.statusCode != 200) {
+        throw Exception('${data['error'] ?? 'Unable to save speaker voice'}');
+      }
+      final saved = '${data['voice'] ?? voice}';
+      if (!mounted) return;
+      if (_apiBase != apiBase) {
+        setState(() => _kokoroVoiceSaving = false);
+        return;
+      }
+      setState(() {
+        _kokoroVoice = saved;
+        _kokoroVoiceSaving = false;
+        _kokoroVoiceError = null;
+      });
+      _showSnack('Kokoro speaker changed');
+    } catch (error) {
+      if (!mounted) return;
+      if (_apiBase != apiBase) {
+        setState(() => _kokoroVoiceSaving = false);
+        return;
+      }
+      setState(() {
+        _kokoroVoice = previous;
+        _kokoroVoiceSaving = false;
+        _kokoroVoiceError = 'Could not save the Kokoro speaker.';
+      });
+      _showSnack('Could not change the Kokoro speaker');
+    }
+  }
+
+  List<CaptureSourceSetting> _decodeCaptureSources(
+    Map<String, dynamic> data,
+  ) {
+    return (data['sources'] as List? ?? const [])
+        .whereType<Map>()
+        .map(
+          (source) => CaptureSourceSetting(
+            id: '${source['id'] ?? ''}',
+            label: '${source['label'] ?? source['id'] ?? ''}',
+            kind: '${source['kind'] ?? ''}',
+            sampleFps:
+                (source['sample_fps'] as num?)?.toDouble() ?? 1.0,
+            inferenceIntervalSeconds:
+                (source['inference_interval_seconds'] as num?)?.toInt() ?? 60,
+            expectedFrames:
+                (source['expected_frames'] as num?)?.toInt() ?? 0,
+            bufferedFrames:
+                (source['buffered_frames'] as num?)?.toInt() ?? 0,
+            available: source['available'] == true,
+          ),
+        )
+        .where((source) => source.id.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  Future<void> _loadCaptureSettings() async {
+    final apiBase = _apiBase;
+    if (apiBase.isEmpty || _captureSettingsSavingSource != null) return;
+    if (_captureSources.isEmpty && mounted) {
+      setState(() => _captureSettingsLoading = true);
+    }
+    try {
+      final response = await http
+          .get(Uri.parse('$apiBase/settings/capture'))
+          .timeout(const Duration(seconds: 5));
+      if (response.statusCode != 200) {
+        throw Exception(
+          'Capture settings request returned ${response.statusCode}',
+        );
+      }
+      final data = decodeJsonResponse(response) as Map<String, dynamic>;
+      if (!mounted || _apiBase != apiBase) return;
+      setState(() {
+        _captureSources = _decodeCaptureSources(data);
+        _captureSettingsLoading = false;
+        _captureSettingsError = null;
+      });
+    } catch (_) {
+      if (!mounted || _apiBase != apiBase) return;
+      setState(() {
+        _captureSettingsLoading = false;
+        _captureSettingsError =
+            'Could not load automatic capture settings from the Home Hub.';
+      });
+    }
+  }
+
+  Future<void> _updateCaptureSource(
+    String sourceId,
+    double sampleFps,
+    int inferenceIntervalSeconds,
+  ) async {
+    final apiBase = _apiBase;
+    if (apiBase.isEmpty || _captureSettingsSavingSource != null) return;
+    setState(() {
+      _captureSettingsSavingSource = sourceId;
+      _captureSettingsError = null;
+    });
+    try {
+      final response = await http
+          .put(
+            Uri.parse('$apiBase/settings/capture'),
+            headers: const {'Content-Type': 'application/json'},
+            body: json.encode({
+              'source_id': sourceId,
+              'sample_fps': sampleFps,
+              'inference_interval_seconds': inferenceIntervalSeconds,
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
+      final data = decodeJsonResponse(response) as Map<String, dynamic>;
+      if (response.statusCode != 200) {
+        throw Exception('${data['error'] ?? 'Unable to save capture profile'}');
+      }
+      if (!mounted || _apiBase != apiBase) return;
+      setState(() {
+        _captureSources = _decodeCaptureSources(data);
+        _captureSettingsSavingSource = null;
+        _captureSettingsError = null;
+      });
+      _showSnack('Capture profile saved; current frame window was reset');
+    } catch (error) {
+      if (!mounted || _apiBase != apiBase) return;
+      setState(() {
+        _captureSettingsSavingSource = null;
+        _captureSettingsError = 'Could not save the capture profile.';
+      });
+      _showSnack('Could not save capture profile');
+    }
   }
 
   Future<void> _loadDeliveryPreferences() async {
@@ -328,6 +557,55 @@ class _MyAppState extends State<MyApp> {
 
   String _promptShortcutPreferenceKey(String presetId) =>
       '$_promptShortcutPreferencePrefix$presetId';
+
+  String _promptTextPreferenceKey(String presetId) =>
+      '$_promptTextPreferencePrefix$presetId';
+
+  Future<void> _loadPromptTexts() async {
+    final prefs = await SharedPreferences.getInstance();
+    final texts = <String, String>{};
+    for (final preset in reflectionPromptPresets) {
+      final saved = prefs.getString(_promptTextPreferenceKey(preset.id))?.trim();
+      if (saved != null && saved.isNotEmpty && saved != preset.prompt) {
+        texts[preset.id] = saved;
+      }
+    }
+    if (!mounted) return;
+    setState(() => _promptTexts = texts);
+  }
+
+  /// The wording a preset sends: the user's edit when there is one, else the
+  /// prompt it shipped with.
+  String _promptTextFor(ReflectionPromptPreset preset) {
+    final custom = _promptTexts[preset.id]?.trim();
+    return (custom == null || custom.isEmpty) ? preset.prompt : custom;
+  }
+
+  void _updatePromptText(String presetId, String? prompt) {
+    final trimmed = prompt?.trim();
+    setState(() {
+      final next = Map<String, String>.from(_promptTexts);
+      if (trimmed == null || trimmed.isEmpty) {
+        next.remove(presetId);
+      } else {
+        next[presetId] = trimmed;
+      }
+      _promptTexts = next;
+    });
+    unawaited(_persistPromptText(presetId, trimmed));
+  }
+
+  Future<void> _persistPromptText(String presetId, String? prompt) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = _promptTextPreferenceKey(presetId);
+    // Removing the key rather than storing the default keeps a preset tracking
+    // the shipped wording if that wording later changes.
+    if (prompt == null || prompt.isEmpty) {
+      await prefs.remove(key);
+    } else {
+      await prefs.setString(key, prompt);
+    }
+  }
 
   AppShortcutBinding? _shortcutFromPreference(
       String? saved, AppShortcutBinding fallback) {
@@ -734,7 +1012,7 @@ class _MyAppState extends State<MyApp> {
       if (response.statusCode != 200) {
         throw Exception('backend health request returned ${response.statusCode}');
       }
-      final value = json.decode(response.body) as Map<String, dynamic>;
+      final value = decodeJsonResponse(response) as Map<String, dynamic>;
       if (_apiBase != apiBase) return;
       _consecutiveStatusFailures = 0;
       if (mounted) setState(() {
@@ -747,6 +1025,9 @@ class _MyAppState extends State<MyApp> {
         }
       });
       await _syncNotificationMonitoring();
+      if (_kokoroVoices.isEmpty) {
+        unawaited(_loadTtsSettings());
+      }
     } catch (error) {
       if (_apiBase == apiBase) {
         _consecutiveStatusFailures++;
@@ -775,7 +1056,9 @@ class _MyAppState extends State<MyApp> {
     try {
       final response = await http.post(Uri.parse('$_apiBase/history/clear'))
           .timeout(const Duration(seconds: 5));
-      if (response.statusCode != 200) throw Exception(response.body);
+      if (response.statusCode != 200) {
+        throw Exception(decodeUtf8Response(response));
+      }
       if (mounted) setState(() => _chatHistory.clear());
       _showSnack('Conversation history cleared');
       await _pollBackendStatus();
@@ -788,8 +1071,10 @@ class _MyAppState extends State<MyApp> {
     try {
       final response = await http.post(Uri.parse('$_apiBase/memory/clear'))
           .timeout(const Duration(seconds: 15));
-      if (response.statusCode != 200) throw Exception(response.body);
-      final result = json.decode(response.body) as Map<String, dynamic>;
+      if (response.statusCode != 200) {
+        throw Exception(decodeUtf8Response(response));
+      }
+      final result = decodeJsonResponse(response) as Map<String, dynamic>;
       if (result['cleared'] != true) throw Exception(result['error'] ?? 'unknown error');
       _showSnack('Long-term activity memory cleared');
     } catch (e) {
@@ -798,7 +1083,7 @@ class _MyAppState extends State<MyApp> {
   }
 
   /// Poll for unprompted proactive insights and play their speech on THIS
-  /// device. New insights also land in the chat list (replayable via 💡).
+  /// device. New insights also land in the chat list for replay.
   Future<void> _fetchProactiveInsights() async {
     if (_ipTextController.text.trim().isEmpty) return;
     try {
@@ -806,7 +1091,7 @@ class _MyAppState extends State<MyApp> {
           .get(Uri.parse('$_apiBase/proactive?since=$_lastProactiveId'))
           .timeout(const Duration(seconds: 3));
       if (response.statusCode != 200) return;
-      final data = json.decode(response.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(response) as Map<String, dynamic>;
 
       // First poll after (re)connect: adopt the latest id without replaying
       // insights that were generated before the app was listening.
@@ -837,7 +1122,7 @@ class _MyAppState extends State<MyApp> {
           setState(() {
             _chatHistory.add(ChatMessage(
               sender: MessageSender.assistant,
-              text: '💡 ${map['text'] ?? ''}',
+              text: 'Insight: ${map['text'] ?? ''}',
               fullAudio: audio,
               clipId: map['can_ask'] == true ? map['clip_id']?.toString() : null,
               clipCoversSeconds: (clip?['covers_seconds'] as num?)?.toDouble(),
@@ -861,12 +1146,18 @@ class _MyAppState extends State<MyApp> {
     bool chooseSource = false,
     ReflectionPromptPreset? promptPreset,
   }) async {
-    try {
-      await _globalHotkeys.bringAppToFront();
-    } catch (error) {
-      if (mounted) {
-        setState(() => _globalHotkeyError =
-            'The shortcut fired, but HomeMind could not come forward: $error');
+    // Stealing focus defeats the point: the shortcut is pressed while working
+    // in another window, and the answer arrives as speech plus a message
+    // waiting in Home. The one exception is picking a source, which cannot be
+    // done without a visible window.
+    if (chooseSource) {
+      try {
+        await _globalHotkeys.bringAppToFront();
+      } catch (error) {
+        if (mounted) {
+          setState(() => _globalHotkeyError =
+              'The shortcut fired, but HomeMind could not come forward: $error');
+        }
       }
     }
     if (!mounted) return;
@@ -874,8 +1165,10 @@ class _MyAppState extends State<MyApp> {
       await _showReflectionSourcePicker();
     } else {
       await _reflectOnScreen(
-        question: promptPreset?.prompt,
+        question:
+            promptPreset == null ? null : _promptTextFor(promptPreset),
         actionLabel: promptPreset?.title,
+        background: true,
       );
     }
   }
@@ -887,7 +1180,7 @@ class _MyAppState extends State<MyApp> {
     if (response.statusCode != 200) {
       throw Exception('backend returned ${response.statusCode}');
     }
-    final data = json.decode(response.body) as Map<String, dynamic>;
+    final data = decodeJsonResponse(response) as Map<String, dynamic>;
     return ((data['sources'] as List?) ?? const [])
         .whereType<Map>()
         .map((item) => _ReflectionSourceOption.fromJson(
@@ -1020,7 +1313,7 @@ class _MyAppState extends State<MyApp> {
   void _runPromptPreset(ReflectionPromptPreset preset) {
     unawaited(
       _reflectOnScreen(
-        question: preset.prompt,
+        question: _promptTextFor(preset),
         actionLabel: preset.title,
       ),
     );
@@ -1158,13 +1451,22 @@ class _MyAppState extends State<MyApp> {
     _ReflectionSourceOption? requestedSource,
     String? question,
     String? actionLabel,
+    // Set when a global shortcut started this and the window stayed back, so
+    // failures are reported by the OS instead of to an unwatched SnackBar.
+    bool background = false,
   }) async {
+    final label = actionLabel ?? 'Reflection';
+    Future<void> report(String message) async {
+      _showSnack(message);
+      if (background) await showDesktopAlert(label, message);
+    }
+
     if (_reflecting) {
-      _showSnack('A reflection is already running');
+      await report('A reflection is already running');
       return;
     }
     if (_apiBase.isEmpty) {
-      _showSnack('Connect to the home hub first');
+      await report('Connect to the home hub first');
       return;
     }
     if (Navigator.of(context).canPop()) {
@@ -1198,9 +1500,10 @@ class _MyAppState extends State<MyApp> {
           // The VLM needs real time on a cold model; a short timeout here just
           // throws away an answer the server is still producing.
           .timeout(const Duration(seconds: 180));
-      final data = json.decode(response.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(response) as Map<String, dynamic>;
       if (response.statusCode != 200) {
-        _showSnack('Reflection failed: ${data['error'] ?? response.statusCode}');
+        await report(
+            'Reflection failed: ${data['error'] ?? response.statusCode}');
         return;
       }
       final audioB64 = data['audio'];
@@ -1212,7 +1515,7 @@ class _MyAppState extends State<MyApp> {
       setState(() {
         _chatHistory.add(ChatMessage(
           sender: MessageSender.assistant,
-          text: '🔎 ${data['text'] ?? ''}',
+          text: 'Reflection: ${data['text'] ?? ''}',
           fullAudio: audio,
           clipId: data['clip_id']?.toString(),
           clipCoversSeconds: (clip?['covers_seconds'] as num?)?.toDouble(),
@@ -1224,7 +1527,7 @@ class _MyAppState extends State<MyApp> {
         if (!_isAudioPlaying) _playNextInQueue();
       }
     } catch (e) {
-      _showSnack('Could not reflect on the screen: $e');
+      await report('Could not reflect on the screen: $e');
     } finally {
       if (mounted) setState(() => _reflecting = false);
     }
@@ -1238,7 +1541,7 @@ class _MyAppState extends State<MyApp> {
               '$_apiBase/notifications?since=$_lastNotificationSequence&limit=50'))
           .timeout(const Duration(seconds: 3));
       if (response.statusCode != 200) return;
-      final data = json.decode(response.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(response) as Map<String, dynamic>;
       final latest = (data['latest_sequence'] as num?)?.toInt() ?? 0;
       if (mounted) {
         setState(() {
@@ -1317,7 +1620,10 @@ class _MyAppState extends State<MyApp> {
                          'source': _captureSource.name}),
     ).timeout(const Duration(seconds: 5));
     if (response.statusCode != 200) {
-      throw Exception('backend returned ${response.statusCode}: ${response.body}');
+      throw Exception(
+        'backend returned ${response.statusCode}: '
+        '${decodeUtf8Response(response)}',
+      );
     }
     await _pollBackendStatus();
   }
@@ -1330,7 +1636,9 @@ class _MyAppState extends State<MyApp> {
         headers: {'Content-Type': 'application/json'},
         body: json.encode({'action': pause ? 'pause' : 'resume'}),
       ).timeout(const Duration(seconds: 5));
-      if (response.statusCode != 200) throw Exception(response.body);
+      if (response.statusCode != 200) {
+        throw Exception(decodeUtf8Response(response));
+      }
       await _pollBackendStatus();
     } catch (e) {
       _showSnack('Failed to ${pause ? 'pause' : 'resume'} screen: $e');
@@ -1345,7 +1653,9 @@ class _MyAppState extends State<MyApp> {
         headers: {'Content-Type': 'application/json'},
         body: json.encode({'action': pause ? 'pause' : 'resume'}),
       ).timeout(const Duration(seconds: 5));
-      if (response.statusCode != 200) throw Exception(response.body);
+      if (response.statusCode != 200) {
+        throw Exception(decodeUtf8Response(response));
+      }
       await _pollBackendStatus();
     } catch (e) {
       _showSnack('Failed to ${pause ? 'pause' : 'resume'} camera: $e');
@@ -1878,9 +2188,25 @@ class _MyAppState extends State<MyApp> {
       onChooseReflectionSource: _showReflectionSourcePicker,
       promptShortcuts: _promptShortcuts,
       onPromptShortcutChanged: _updatePromptShortcut,
+      promptTexts: _promptTexts,
+      onPromptTextChanged: _updatePromptText,
       onRunPrompt: _runPromptPreset,
       globalHotkeysSupported: _globalHotkeys.isSupported,
       globalHotkeyError: _globalHotkeyError,
+      kokoroVoice: _kokoroVoice,
+      kokoroVoices: _kokoroVoices,
+      onKokoroVoiceChanged: (voice) {
+        unawaited(_updateKokoroVoice(voice));
+      },
+      kokoroVoiceSaving: _kokoroVoiceSaving,
+      kokoroVoiceError: _kokoroVoiceError,
+      captureSources: _captureSources,
+      captureSettingsLoading: _captureSettingsLoading,
+      captureSettingsSavingSource: _captureSettingsSavingSource,
+      captureSettingsError: _captureSettingsError,
+      onCaptureSourceChanged: (sourceId, fps, interval) {
+        unawaited(_updateCaptureSource(sourceId, fps, interval));
+      },
     );
   }
 

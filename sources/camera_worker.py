@@ -30,6 +30,10 @@ import numpy as np
 from sources.rtsp import RealtimeCameraStream
 from sources.motion_gate import MotionGate
 from sources.camera_validation import HEALTH, classify
+from sources.capture_settings import (
+    expected_frame_count,
+    validate_capture_profile,
+)
 from memory.models.extraction import ENTITY_TYPE_SUGGESTIONS
 from memory.extraction.validator import run_extraction
 from memory.pipeline import MemoryPipeline
@@ -98,8 +102,9 @@ class CameraCaptureWorker:
         self.rtsp_url = rtsp_url
         self.model_name_vlm = model_name_vlm
         self.neo4j = neo4j_store
-        self.window_seconds = int(window_seconds)
-        self.fps = float(fps)
+        self.fps, self.window_seconds = validate_capture_profile(
+            fps, window_seconds
+        )
         self.insight_callback = insight_callback
         # Evidence clip for this window. Written only for windows we keep, so an
         # alert or a nudge about this camera can be watched and asked about.
@@ -107,7 +112,10 @@ class CameraCaptureWorker:
 
         # Keep a little more than one window of frames so a batch is never starved.
         self.stream = RealtimeCameraStream(
-            rtsp_url, window_size=int(window_seconds * fps) + 5, fps=fps)
+            rtsp_url,
+            window_size=expected_frame_count(self.fps, self.window_seconds),
+            fps=self.fps,
+        )
         # Per-camera pipeline: independent SessionManager so this camera's timeline
         # never entangles with the screen's or another camera's.
         self.pipeline = MemoryPipeline(
@@ -120,6 +128,7 @@ class CameraCaptureWorker:
         self._client = new_vlm_client()
         self._paused = False
         self._stop = Event()
+        self._profile_changed = Event()
         self.frames_processed = 0
         self.events_logged = 0
         self.last_processed_at = None
@@ -172,9 +181,12 @@ class CameraCaptureWorker:
         while not self._stop.is_set() and not self.stream.healthy and self.stream.running:
             self._stop.wait(1.0)
         while not self._stop.is_set():
-            self._stop.wait(self.window_seconds)
+            profile_changed = self._profile_changed.wait(self.window_seconds)
+            self._profile_changed.clear()
             if self._stop.is_set():
                 break
+            if profile_changed:
+                continue
             if self._paused or not self.stream.running:
                 continue
             try:
@@ -343,11 +355,38 @@ class CameraCaptureWorker:
             "last_processed_at": self.last_processed_at,
             "last_summary": self.last_summary,
             "last_motion": self.last_motion,
+            "sample_fps": self.fps,
+            "inference_interval_seconds": self.window_seconds,
+            "expected_frames": expected_frame_count(
+                self.fps, self.window_seconds
+            ),
             "error": self.last_error or st.get("error"),
         }
 
+    def update_capture_profile(self, sample_fps, inference_interval_seconds):
+        """Start a fresh sampling/inference window using the new profile."""
+        fps, interval = validate_capture_profile(
+            sample_fps, inference_interval_seconds
+        )
+        self.fps = fps
+        self.window_seconds = interval
+        self.stream.update_sampling(
+            fps, expected_frame_count(fps, interval)
+        )
+        self.pipeline.expected_seconds = interval
+        self._idle_windows = 0
+        self._profile_changed.set()
+        logger.info(
+            "Camera %s capture profile changed to %.3g fps / %ds; "
+            "frame buffer reset.",
+            self.camera_id,
+            fps,
+            interval,
+        )
+
     def cleanup(self):
         self._stop.set()
+        self._profile_changed.set()
         try:
             self.stream.cleanup()
         except Exception:

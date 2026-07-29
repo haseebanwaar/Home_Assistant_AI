@@ -77,7 +77,7 @@ def _host_of(url):
 class CameraManager:
     def __init__(self, model_name_vlm, neo4j_store=None, activity_logger=None,
                  window_seconds=60, fps=1.0, notification_sink=None,
-                 insight_callback=None, clip_store=None):
+                 insight_callback=None, clip_store=None, profile_store=None):
         self.model_name_vlm = model_name_vlm
         self.neo4j = neo4j_store
         self.activity_logger = activity_logger
@@ -86,6 +86,7 @@ class CameraManager:
         self.notification_sink = notification_sink
         self.insight_callback = insight_callback
         self.clip_store = clip_store
+        self.profile_store = profile_store
         self.workers = {}  # camera_id -> CameraCaptureWorker
 
     def discover_and_start(self):
@@ -112,11 +113,16 @@ class CameraManager:
             except Exception as exc:
                 logger.warning("ensure_source_room(camera) failed: %s", exc)
         try:
+            fps, interval = self.fps, self.window_seconds
+            if self.profile_store is not None:
+                fps, interval = self.profile_store.resolve(
+                    camera_id, fps, interval
+                )
             self.workers[camera_id] = CameraCaptureWorker(
                 camera_id=camera_id, name=name, rtsp_url=rtsp_url,
                 model_name_vlm=self.model_name_vlm, neo4j_store=self.neo4j,
                 activity_logger=self.activity_logger,
-                window_seconds=self.window_seconds, fps=self.fps,
+                window_seconds=interval, fps=fps,
                 notification_sink=self.notification_sink,
                 insight_callback=self.insight_callback,
                 clip_store=self.clip_store)
@@ -144,45 +150,20 @@ class CameraManager:
     def health_all(self):
         return [w.health() for w in self.workers.values()]
 
+    def update_capture_profile(
+        self, camera_id, sample_fps, inference_interval_seconds
+    ):
+        worker = self.workers.get(camera_id)
+        if worker is None:
+            return None
+        worker.update_capture_profile(
+            sample_fps, inference_interval_seconds
+        )
+        return worker.status()
+
     def cleanup_all(self):
         for w in self.workers.values():
             try:
                 w.cleanup()
             except Exception:
                 logger.warning("camera %s cleanup failed", w.camera_id, exc_info=True)
-
-
-
-
-
-
-
-
-
-
-
-
-import torch
-import soundfile as sf
-from qwen_tts import Qwen3TTSModel
-
-# Load the model
-model = Qwen3TTSModel.from_pretrained(
-    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-    device_map="cuda:0",
-    dtype=torch.bfloat16,
-    # attn_implementation="flash_attention_2",
-    attn_implementation="sdpa",
-)
-
-# Generate speech with specific instructions
-wavs, sr = model.generate_custom_voice(
-    text="其实我真的有发现，我是一个特别善于观察别人情绪的人。",
-    language="Chinese",
-    speaker="Vivian",
-    instruct="用特别愤怒的语气说",
-)
-
-# Save the generated audio
-sf.write("output_custom_voice.wav", wavs[0], sr)
-

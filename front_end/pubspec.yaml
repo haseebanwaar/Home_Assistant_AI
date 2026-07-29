@@ -36,7 +36,6 @@ dependencies:
   cupertino_icons: ^1.0.8
   record: ^5.2.0
 #  record: ^5.1.2
-  video_player: any
   image: any
   file_picker: any
   image_picker: any
@@ -52,6 +51,10 @@ dependencies:
   shared_preferences: ^2.5.3
   hotkey_manager: ^0.2.3
   window_manager: ^0.5.2
+  media_kit: ^1.2.6
+  media_kit_video: ^2.0.1
+  media_kit_libs_video: ^1.0.7
+  local_notifier: ^0.1.6
 
 dev_dependencies:
   flutter_test:
@@ -74,6 +77,11 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  fonts:
+    - family: NotoSans
+      fonts:
+        - asset: assets/fonts/NotoSans-Variable.ttf
 
   # To add assets to your application, add an assets section, like this:
   # assets:

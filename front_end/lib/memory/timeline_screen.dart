@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
+import '../network/http_json.dart';
+
 const _ink = Color(0xFF070B14);
 const _panel = Color(0xFF111827);
 const _panelRaised = Color(0xFF182235);
@@ -121,7 +123,7 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
       );
       final resp = await http.get(uri).timeout(const Duration(seconds: 20));
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
-      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(resp) as Map<String, dynamic>;
       setState(() => _sessions = (data['sessions'] as List?) ?? []);
     } catch (e) {
       setState(() => _timelineError = e.toString());
@@ -142,7 +144,7 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
       );
       final resp = await http.get(uri).timeout(const Duration(seconds: 20));
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
-      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(resp) as Map<String, dynamic>;
       setState(() => _entities = (data['entities'] as List?) ?? []);
     } catch (e) {
       _snack('Could not load entities: $e');
@@ -155,7 +157,7 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
     try {
       final resp = await http.get(Uri.parse('${widget.apiBase}/rooms'));
       if (resp.statusCode != 200) return;
-      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(resp) as Map<String, dynamic>;
       if (mounted) setState(() => _rooms = (data['rooms'] as List?) ?? []);
     } catch (_) {}
   }
@@ -169,7 +171,7 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
       if (mounted) {
         setState(
-          () => _profile = json.decode(resp.body) as Map<String, dynamic>,
+          () => _profile = decodeJsonResponse(resp) as Map<String, dynamic>,
         );
       }
     } catch (e) {
@@ -200,7 +202,7 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
       );
       final resp = await http.get(uri).timeout(const Duration(seconds: 30));
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
-      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(resp) as Map<String, dynamic>;
       setState(() => _results = (data['results'] as List?) ?? []);
     } catch (e) {
       setState(() => _searchError = e.toString());
@@ -1077,7 +1079,7 @@ class _MemoryEventScreenState extends State<MemoryEventScreen> {
         Uri.parse('${widget.apiBase}/memory/events/${widget.eventId}'),
       );
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
-      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(resp) as Map<String, dynamic>;
       setState(() {
         _event = data['event'] as Map<String, dynamic>;
         _error = null;
@@ -1390,7 +1392,7 @@ class _MemoryEntityScreenState extends State<MemoryEntityScreen> {
       );
       final resp = await http.get(uri);
       if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
-      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(resp) as Map<String, dynamic>;
       setState(() {
         _entity = data['entity'] as Map<String, dynamic>;
         _error = null;

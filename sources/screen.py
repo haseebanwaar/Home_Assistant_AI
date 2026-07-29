@@ -20,6 +20,10 @@ import pygetwindow as gw
 
 from memory.models.observation import Observation
 from memory.debug import write_jsonl
+from sources.capture_settings import (
+    expected_frame_count,
+    validate_capture_profile,
+)
 
 # Windows-only PID lookup for the active window (Step 1: process_name capture).
 try:
@@ -64,10 +68,15 @@ class RealtimeScreenCapture:
             activity_logger: an instance of ActivityLogger to log each minute of activity
         """
         self.video_source = video_source
-        self.window_size = window_size
-        self.fps = fps
-        self.frame_buffer = deque(maxlen=window_size)
+        self.fps, self.window_size = validate_capture_profile(
+            fps, window_size
+        )
+        self.frame_buffer = deque(
+            maxlen=expected_frame_count(self.fps, self.window_size)
+        )
         self.lock = Lock()
+        self._profile_changed = Event()
+        self._profile_version = 0
         self.running = True
         # When paused, the capture loop keeps the thread alive but stops grabbing
         # frames and processing batches, so screen memory can be halted from the UI
@@ -496,10 +505,15 @@ Create a retrievable memory record that preserves what matters most for future r
                 self.running = False
                 return
             self.healthy = True
-            seconds = 0
+            profile_version = self._profile_version
+            next_batch_at = time.monotonic() + self.window_size
             last_frame = None
 
             while self.running:
+                if profile_version != self._profile_version:
+                    profile_version = self._profile_version
+                    next_batch_at = time.monotonic() + self.window_size
+                    last_frame = None
                 # Paused: hold the thread but capture/process nothing. Reset the
                 # per-minute state so we don't emit a stale batch on resume.
                 if self.paused:
@@ -508,9 +522,9 @@ Create a retrievable memory record that preserves what matters most for future r
                             self.frame_buffer.clear()
                         self.current_minute_apps = list()
                         self.current_minute_processes = list()
-                        seconds = 0
                         last_frame = None
-                    time.sleep(0.3)
+                    self._profile_changed.wait(0.3)
+                    self._profile_changed.clear()
                     continue
 
                 # Poll the active window every iteration so window switches during
@@ -537,7 +551,7 @@ Create a retrievable memory record that preserves what matters most for future r
                     last_frame = img
                     logger.debug('buffer = %d (new frame added)', len(self.frame_buffer))
 
-                if seconds == 60:
+                if time.monotonic() >= next_batch_at:
                     with self.lock:
                         # Always snapshot + keep the last 2 frames as overlap, so a
                         # heartbeat still has a frame even on a static screen.
@@ -580,10 +594,10 @@ Create a retrievable memory record that preserves what matters most for future r
                         # as carryover (the worker uses the snapshot above).
                         self.current_minute_apps = self.current_minute_apps[-1:]
                         self.current_minute_processes = self.current_minute_processes[-1:]
-                    seconds = 2
+                    next_batch_at = time.monotonic() + self.window_size
                 # Handle dynamic framerates (adjust as needed)
-                time.sleep(1.0 / self.fps)
-                seconds +=1
+                self._profile_changed.wait(1.0 / self.fps)
+                self._profile_changed.clear()
 
 
     # todo, not sure for now  how i want to implement it, postponed
@@ -601,8 +615,37 @@ Create a retrievable memory record that preserves what matters most for future r
         self.paused = False
         logger.info("Screen capture resumed.")
 
+    def update_capture_profile(self, sample_fps, inference_interval_seconds):
+        """Apply a new profile and discard the current/pending capture window."""
+        fps, interval = validate_capture_profile(
+            sample_fps, inference_interval_seconds
+        )
+        with self.lock:
+            self.fps = fps
+            self.window_size = interval
+            self.frame_buffer = deque(
+                maxlen=expected_frame_count(fps, interval)
+            )
+            self.current_minute_apps = []
+            self.current_minute_processes = []
+            self._profile_version += 1
+        with self._mailbox_lock:
+            self._mailbox = None
+            self._mailbox_wake.clear()
+        if self.pipeline is not None:
+            self.pipeline.expected_seconds = interval
+        self._idle_minutes = 0
+        self._profile_changed.set()
+        logger.info(
+            "Screen capture profile changed to %.3g fps / %ds; "
+            "frame buffer reset.",
+            fps,
+            interval,
+        )
+
     def cleanup(self):
         self.running = False
+        self._profile_changed.set()
         self._mailbox_wake.set()  # unblock the worker so it can exit
         if self.capture_thread is not None:
             self.capture_thread.join(timeout=5)
@@ -630,5 +673,10 @@ Create a retrievable memory record that preserves what matters most for future r
             "paused": self.paused,
             "frames": len(self.frame_buffer),
             "monitor_index": self.monitor_index,
+            "sample_fps": self.fps,
+            "inference_interval_seconds": self.window_size,
+            "expected_frames": expected_frame_count(
+                self.fps, self.window_size
+            ),
             "error": self.last_error,
         }

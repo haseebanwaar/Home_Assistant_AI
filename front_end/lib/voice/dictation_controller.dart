@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:record/record.dart';
 
+import '../network/http_json.dart';
+
 /// Records a clip and turns it into text via the backend's `/transcribe`.
 ///
 /// This is dictation, not conversation: the caller decides what the words
@@ -70,7 +72,7 @@ class DictationController {
           body: json.encode({'data': audio}),
         )
         .timeout(const Duration(seconds: 45));
-    final body = json.decode(response.body);
+    final body = decodeJsonResponse(response);
     if (response.statusCode != 200) {
       final detail = body is Map ? body['error'] : null;
       throw detail?.toString() ?? 'transcription failed (HTTP ${response.statusCode})';

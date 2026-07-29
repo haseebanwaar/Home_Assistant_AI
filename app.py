@@ -26,12 +26,20 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 
 from providers.asr.parakeet import nemo_transcribe, parakeet_health
 from providers.local_openAI import client, get_model_name_vlm
-from providers.tts.kokoro.kokoro_tts import run_kokoro
+from providers.tts.kokoro.kokoro_tts import (
+    get_kokoro_voice_settings,
+    run_kokoro,
+    set_kokoro_voice,
+)
 from vector_store.activity_logger import ActivityLogger
 from sources.screen import RealtimeScreenCapture
 from sources.camera_manager import CameraManager
 from sources.clips import ClipStore, parse_range, valid_clip_id
 from sources.frame_budget import fit_frames, frames_as_video
+from sources.capture_settings import (
+    SourceCaptureSettings,
+    validate_capture_profile,
+)
 from vector_store.rag.activity_retriever import ActivityRetriever
 from memory.retrieval.evidence import EvidenceRetriever
 from tools.registry import ToolRegistry, register_default_tools
@@ -99,6 +107,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def add_utf8_charset(request: Request, call_next):
+    """Make text encoding unambiguous to browsers and native HTTP clients."""
+    response = await call_next(request)
+    content_type = response.headers.get("content-type", "")
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if (
+        media_type in {"application/json", "application/x-ndjson"}
+        and "charset=" not in content_type.lower()
+    ):
+        response.headers["content-type"] = f"{content_type}; charset=utf-8"
+    return response
+
+
 # === GLOBALS (single-user POC: one conversation, one active context) ===
 _chat_history = []
 _current_context = "talker"
@@ -106,6 +129,7 @@ vlm_model = None
 screen_stream = None
 camera_manager = None
 camera_bootstrap_task = None
+source_capture_settings = SourceCaptureSettings()
 proactive = None
 mobile_activity_task = None
 daily_report_task = None  # nightly Coach report scheduler
@@ -285,6 +309,11 @@ async def startup_event():
     global memory_pipeline, neo4j_store
 
     validate_configuration()
+    screen_fps, screen_interval = source_capture_settings.resolve(
+        "pc_screen",
+        env_float("SCREEN_FPS", 1.0),
+        env_int("SCREEN_WINDOW_SECONDS", 60),
+    )
     logger.info("Loading model...")
     try:
         vlm_model = await get_model_name_vlm()
@@ -330,7 +359,7 @@ async def startup_event():
                 neo4j_store = None
         memory_pipeline = MemoryPipeline(
             id_strategy="deterministic",
-            expected_seconds=env_int("SCREEN_WINDOW_SECONDS", 60),
+            expected_seconds=screen_interval,
             neo4j_store=neo4j_store,
             activity_logger=activity_logger,  # event-scoped Qdrant sink
             jsonl=True,                        # keep /debug/timeline populated
@@ -365,8 +394,8 @@ async def startup_event():
         screen_stream = RealtimeScreenCapture(
             video_source="",
             model_name_vlm=vlm_model,
-            window_size=env_int("SCREEN_WINDOW_SECONDS", 60),
-            fps=env_float("SCREEN_FPS", 1.0),
+            window_size=screen_interval,
+            fps=screen_fps,
             monitor_index=env_int("SCREEN_MONITOR_INDEX", 1),
             activity_logger=activity_logger,
             insight_callback=insight_callback,
@@ -390,6 +419,7 @@ async def startup_event():
             notification_sink=notify_from_event,
             insight_callback=handle_observation_description if proactive is not None else None,
             clip_store=clip_store,
+            profile_store=source_capture_settings,
         )
         camera_bootstrap_task = asyncio.create_task(
             asyncio.to_thread(camera_manager.discover_and_start))
@@ -521,6 +551,116 @@ async def status():
         "pipeline": dict(_pipeline_status),
         "debug_verbose": DEBUG_VERBOSE,
     }
+
+
+@app.get("/settings/tts")
+async def tts_settings():
+    """Return the active Kokoro speaker and the voices supported by this app."""
+    return get_kokoro_voice_settings()
+
+
+@app.put("/settings/tts")
+async def update_tts_settings(request: Request):
+    """Persist the Kokoro speaker used by chat, reflection, and proactive TTS."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(
+            status_code=400, content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict) or not isinstance(data.get("voice"), str):
+        return JSONResponse(
+            status_code=400, content={"error": "voice must be a string"})
+    try:
+        set_kokoro_voice(data["voice"].strip())
+    except (OSError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return get_kokoro_voice_settings()
+
+
+def _capture_settings_payload():
+    sources = []
+    if screen_stream is not None:
+        status = screen_stream.status()
+        sources.append({
+            "id": "pc_screen",
+            "label": "PC screen",
+            "kind": "screen",
+            "available": bool(status.get("running")),
+            "sample_fps": status["sample_fps"],
+            "inference_interval_seconds":
+                status["inference_interval_seconds"],
+            "expected_frames": status["expected_frames"],
+            "buffered_frames": status.get("frames", 0),
+        })
+    if camera_manager is not None:
+        for worker in camera_manager.workers.values():
+            status = worker.status()
+            sources.append({
+                "id": worker.camera_id,
+                "label": worker.name or worker.camera_id,
+                "kind": "camera",
+                "available": bool(status.get("connected")),
+                "sample_fps": status["sample_fps"],
+                "inference_interval_seconds":
+                    status["inference_interval_seconds"],
+                "expected_frames": status["expected_frames"],
+                "buffered_frames": status.get("buffered_frames", 0),
+            })
+    return {"sources": sources}
+
+
+@app.get("/settings/capture")
+async def capture_settings():
+    """Return the live per-source sampling and inference schedules."""
+    return _capture_settings_payload()
+
+
+@app.put("/settings/capture")
+async def update_capture_settings(request: Request):
+    """Persist and immediately apply one autonomous source's capture profile."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(
+            status_code=400, content={"error": f"invalid JSON: {exc}"}
+        )
+    if not isinstance(data, dict):
+        return JSONResponse(
+            status_code=400, content={"error": "request must be an object"}
+        )
+    source_id = str(data.get("source_id") or "").strip()
+    try:
+        fps, interval = validate_capture_profile(
+            data.get("sample_fps"),
+            data.get("inference_interval_seconds"),
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+    if source_id == "pc_screen":
+        if screen_stream is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "PC screen capture is disabled"},
+            )
+        target = screen_stream
+    else:
+        target = (
+            camera_manager.workers.get(source_id)
+            if camera_manager is not None
+            else None
+        )
+        if target is None:
+            return JSONResponse(
+                status_code=404, content={"error": "capture source not found"}
+            )
+
+    try:
+        source_capture_settings.set(source_id, fps, interval)
+        target.update_capture_profile(fps, interval)
+    except (OSError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return _capture_settings_payload()
 
 
 @app.post("/capture/control")

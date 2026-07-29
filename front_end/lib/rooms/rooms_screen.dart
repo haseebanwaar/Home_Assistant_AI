@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
 import '../voice/dictation_controller.dart';
+import '../network/http_json.dart';
 
 const _ink = Color(0xFF070B14);
 const _panel = Color(0xFF111827);
@@ -147,7 +148,7 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
               '${widget.apiBase}/rooms?include_archived=$_showArchived'))
           .timeout(const Duration(seconds: 15));
       if (resp.statusCode == 200) {
-        final data = json.decode(resp.body) as Map<String, dynamic>;
+        final data = decodeJsonResponse(resp) as Map<String, dynamic>;
         setState(() => _rooms = (data['rooms'] as List?) ?? []);
       } else {
         setState(() => _error = 'HTTP ${resp.statusCode}');
@@ -183,7 +184,7 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
         final resp = await http.get(
             Uri.parse('${widget.apiBase}/rooms/${summary['room_id']}'));
         if (resp.statusCode == 200) {
-          room = (json.decode(resp.body) as Map<String, dynamic>)['room']
+          room = (decodeJsonResponse(resp) as Map<String, dynamic>)['room']
               as Map<String, dynamic>;
         }
       } catch (_) {}
@@ -301,7 +302,7 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
 
   String _errorText(http.Response resp) {
     try {
-      return (json.decode(resp.body) as Map<String, dynamic>)['error']
+      return (decodeJsonResponse(resp) as Map<String, dynamic>)['error']
               ?.toString() ??
           'HTTP ${resp.statusCode}';
     } catch (_) {
@@ -615,7 +616,7 @@ class _RoomScreenState extends State<RoomScreen> {
           .get(Uri.parse('${widget.apiBase}/rooms/${widget.roomId}/sources'))
           .timeout(const Duration(seconds: 10));
       if (resp.statusCode != 200) return;
-      final data = json.decode(resp.body) as Map<String, dynamic>;
+      final data = decodeJsonResponse(resp) as Map<String, dynamic>;
       final sources = ((data['sources'] as List?) ?? [])
           .cast<Map<String, dynamic>>()
           .where((s) => (s['application'] ?? '').toString().trim().isNotEmpty)
@@ -690,7 +691,7 @@ class _RoomScreenState extends State<RoomScreen> {
           .get(uri)
           .timeout(const Duration(seconds: 15));
       if (resp.statusCode == 200) {
-        final data = json.decode(resp.body) as Map<String, dynamic>;
+        final data = decodeJsonResponse(resp) as Map<String, dynamic>;
         final feed = (data['feed'] as List?) ?? [];
         setState(() => _feed = feed.reversed.toList()); // newest at bottom
         _jumpToBottom();
@@ -777,7 +778,8 @@ class _RoomScreenState extends State<RoomScreen> {
         // showing only the status code would throw that explanation away.
         String reason = 'HTTP ${resp.statusCode}';
         try {
-          final error = (json.decode(resp.body) as Map<String, dynamic>)['error'];
+          final error =
+              (decodeJsonResponse(resp) as Map<String, dynamic>)['error'];
           if (error is String && error.isNotEmpty) reason = error;
         } catch (_) {}
         _snack(reason);
@@ -804,7 +806,7 @@ class _RoomScreenState extends State<RoomScreen> {
           .post(Uri.parse('${widget.apiBase}/rooms/daily/report'))
           .timeout(const Duration(seconds: 90));
       if (resp.statusCode == 200) {
-        final data = json.decode(resp.body) as Map<String, dynamic>;
+        final data = decodeJsonResponse(resp) as Map<String, dynamic>;
         if (data['posted'] == true) {
           await _load();
         } else {
@@ -1654,7 +1656,7 @@ class _RoomScreenState extends State<RoomScreen> {
         return;
       }
       final rooms =
-          ((json.decode(resp.body) as Map<String, dynamic>)['rooms'] as List)
+          ((decodeJsonResponse(resp) as Map<String, dynamic>)['rooms'] as List)
               .cast<Map<String, dynamic>>()
               .where((r) => r['kind'] != 'daily')
               .toList();
