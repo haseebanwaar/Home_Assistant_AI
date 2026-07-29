@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 
 import '../clips/clip_viewer.dart';
@@ -227,6 +228,28 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     );
   }
 
+  /// Copy the whole alert in one tap, for when the text worth keeping is
+  /// longer than a comfortable drag-select on a phone.
+  Widget _copyButton(Map<String, dynamic> item, Color color) {
+    return IconButton(
+      tooltip: 'Copy text',
+      visualDensity: VisualDensity.compact,
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      constraints: const BoxConstraints(),
+      iconSize: 15,
+      icon: Icon(Icons.copy_all_outlined, color: color),
+      onPressed: () {
+        final text = [
+          (item['title'] ?? '').toString(),
+          (item['body'] ?? '').toString(),
+        ].where((part) => part.isNotEmpty).join('\n');
+        Clipboard.setData(ClipboardData(text: text));
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Copied to clipboard')));
+      },
+    );
+  }
+
   Widget _notificationCard(Map<String, dynamic> item) {
     final clip = item['clip'] as Map<String, dynamic>?;
     final clipId = item['can_ask'] == true ? item['clip_id']?.toString() : null;
@@ -278,7 +301,9 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                   Row(
                     children: [
                       Expanded(
-                        child: Text((item['title'] ?? '').toString(),
+                        child: SelectableText(
+                            (item['title'] ?? '').toString(),
+                            onTap: () => _markRead(item),
                             style: TextStyle(
                                 color: Colors.white,
                                 fontSize: 12.5,
@@ -291,7 +316,11 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                     ],
                   ),
                   const SizedBox(height: 5),
-                  Text((item['body'] ?? '').toString(),
+                  // Selectable: alerts often carry a command or path worth
+                  // copying, so the body must not be inert text. Tapping it
+                  // still marks the alert read, like the rest of the card.
+                  SelectableText((item['body'] ?? '').toString(),
+                      onTap: () => _markRead(item),
                       style: const TextStyle(
                           color: Colors.white70, fontSize: 12, height: 1.35)),
                   const SizedBox(height: 7),
@@ -304,6 +333,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                           style: TextStyle(color: color, fontSize: 10.5),
                         ),
                       ),
+                      _copyButton(item, color),
                       if (clipId != null) _clipToggle(item, clipId, color),
                     ],
                   ),

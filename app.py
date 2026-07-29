@@ -306,6 +306,7 @@ async def startup_event():
             retriever=evidence_retriever,
             # Lazy — the graph is connected further down in this same startup.
             store_getter=lambda: neo4j_store,
+            personal_memory=personal_memory,
         )
         insight_callback = handle_screen_description
         logger.info("Proactive narrator enabled (cooldown=%ds).", proactive.cooldown_seconds)
@@ -2224,19 +2225,6 @@ async def debug_possibly_same_as():
     return {"possibly_same_as": neo4j_store.possibly_same_as()}
 
 
-@app.post("/debug/daily-note")
-async def debug_daily_note(date: str = None, resolve: bool = True):
-    """Step 13: generate today's (or `date`) Obsidian note + Pending-Merges."""
-    if neo4j_store is None:
-        return {"error": "graph not enabled (start with MEMORY_NEO4J=1)"}
-    from memory.summary.daily_summarizer import export_to_vault
-    if resolve:
-        neo4j_store.resolve_entities()
-    vault = os.getenv("OBSIDIAN_VAULT", "obsidian_notes")
-    paths = export_to_vault(neo4j_store, vault, date)
-    return {"written": paths}
-
-
 @app.post("/history/clear")
 async def clear_history_endpoint():
     """One-shot clear of the in-memory conversation."""
@@ -2482,6 +2470,181 @@ async def proactive_history(limit: int = 50):
     return {"nudges": neo4j_store.list_nudges(limit=limit)}
 
 
+REFLECT_SYSTEM_PROMPT = """You are looking at the last few seconds of what the user \
+is actually doing on screen (or in front of the camera). They pressed a key to ask \
+for your take right now, so they want something useful — not a description of their \
+own screen back at them.
+
+Work out what they are engaged in from the frames, then respond in the way that \
+activity deserves:
+- Reading (book, paper, article, docs): engage with the actual content on the page — \
+the argument, what it implies, what is worth questioning. Not "you are reading a book".
+- Code: read it properly. Point out bugs, errors on screen, failing output, or the \
+next thing they should try. Quote the exact line or command when it matters.
+- A terminal, error message or stack trace: say what it means and what to run next.
+- Browsing or research: connect what is on screen to what they seem to be after.
+- Something selected, highlighted, or pointed at: treat it as the question. That is \
+almost always why they asked.
+- Writing or a document: react to the substance, not the formatting.
+
+Rules:
+- Be concrete and grounded in what is visible. Never invent text you cannot read.
+- If a command, snippet or exact string is the answer, write it out in full so it can \
+be copied.
+- Say what you are unsure about instead of guessing.
+- Keep it short — a few sentences, or a short list. No preamble, no summary of these \
+instructions, no offering to help further."""
+
+
+@app.get("/reflect/sources")
+async def reflect_sources():
+    """Live sources that can be attached to an on-demand reflection."""
+    sources = []
+    screen_status = screen_stream.status() if screen_stream is not None else {}
+    sources.append({
+        "id": "pc_screen",
+        "label": "PC screen",
+        "context": "screen",
+        "available": bool(screen_status.get("healthy")),
+        "detail": (
+            f"{len(screen_stream.frames())} buffered frames"
+            if screen_stream is not None else "Screen capture is disabled"),
+    })
+
+    mobile_status = mobile_stream.status()
+    mobile_source = mobile_status.get("source")
+    mobile_active = mobile_status.get("active") is True
+    for source_id, source_kind, label in (
+            ("mobile_screen", "screen", "Mobile screen"),
+            ("mobile_camera", "camera", "Mobile camera")):
+        buffered = len(mobile_stream.frames(source_kind))
+        sources.append({
+            "id": source_id,
+            "label": label,
+            "context": source_kind,
+            "available": mobile_active and mobile_source == source_kind and buffered > 0,
+            "detail": (
+                f"{buffered} buffered frames"
+                if buffered else "Start this mobile capture source first"),
+        })
+
+    if camera_manager is not None:
+        for worker in camera_manager.workers.values():
+            status = worker.status()
+            buffered = len(worker.stream.frames())
+            sources.append({
+                "id": worker.camera_id,
+                "label": worker.name or worker.camera_id,
+                "context": "camera",
+                "available": bool(status.get("connected")) and buffered > 0,
+                "detail": (
+                    f"{buffered} buffered frames"
+                    if buffered else status.get("error") or "Waiting for frames"),
+            })
+    return {"sources": sources}
+
+
+@app.post("/reflect")
+async def reflect_now(request: Request):
+    """Look at the last N live frames and say something useful about what the user
+    is doing right now.
+
+    Triggered by hand, so unlike the proactive narrator it always answers: the
+    user asked, and silence would read as a broken shortcut.
+    """
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    context = (data.get("context") or "screen").strip().lower()
+    if context not in ("screen", "camera"):
+        return JSONResponse(status_code=400, content={
+            "error": "context must be 'screen' or 'camera'"})
+    requested_source = (data.get("source") or "").strip()
+    try:
+        count = int(data.get("frames") or env_int("REFLECT_FRAMES", 10))
+    except (TypeError, ValueError):
+        count = env_int("REFLECT_FRAMES", 10)
+    count = max(1, min(count, MAX_FRAMES))
+    hint = (data.get("question") or "").strip()
+    speak = data.get("speak", False) is True
+
+    if vlm_model is None:
+        return JSONResponse(status_code=503, content={"error": "VLM not ready"})
+    frames, source, warning = _frames_for_context(
+        context, requested_source=requested_source or None)
+    if not frames:
+        return JSONResponse(status_code=409, content={
+            "error": warning or f"no live {context} frames — start capture first"})
+
+    window = frames[-count:]
+    timestamp = time.time()
+    budgeted, frame_detail = fit_frames(
+        window, token_budget=LIVE_FRAME_TOKEN_BUDGET, max_frames=count)
+    instruction = (
+        f"These are the last {len(budgeted)} frames from {source}, in "
+        "order, oldest first. What is going on, and what is the most useful thing "
+        "you can tell them about it right now?")
+    if hint:
+        instruction += (
+            "\n\nThe user requested the following analysis lens. Follow it "
+            f"directly and ground the answer in what is visible:\n{hint}")
+    content = [{"type": "text", "text": instruction}]
+    for frame in budgeted:
+        content.append({
+            "type": "image_url",
+            "image_url": {"max_dynamic_patch": 9,
+                          "url": f"data:image/jpeg;base64,{encode_image_base64(frame)}"},
+        })
+
+    try:
+        response = await client.chat.completions.create(
+            model=vlm_model,
+            messages=[{"role": "system", "content": REFLECT_SYSTEM_PROMPT},
+                      {"role": "user", "content": content}],
+            max_tokens=env_int("REFLECT_MAX_TOKENS", 500),
+        )
+    except Exception as exc:
+        logger.warning("Reflect failed (%s): %s", source, exc)
+        return JSONResponse(status_code=502, content={"error": f"VLM error: {exc}"})
+    text = (response.choices[0].message.content or "").strip()
+    if not text:
+        return JSONResponse(status_code=502, content={"error": "empty reflection"})
+
+    # Ship the footage the remark was made from, same as an unprompted insight, so
+    # "what did you actually see?" is one tap away.
+    clip = None
+    clip_id = await asyncio.to_thread(
+        clip_store.save, window, f"reflect_{source}", source, timestamp, 1.0, text)
+    if clip_id:
+        clip_store.pin(clip_id)
+        clip = clip_store.describe(clip_id)
+
+    audio_b64 = None
+    if speak:
+        try:
+            audio_b64 = await asyncio.to_thread(
+                lambda: base64.b64encode(run_kokoro(text)).decode("utf-8"))
+        except Exception as exc:
+            logger.warning("Reflect TTS failed: %s", exc)
+
+    logger.info("Reflection on %d %s frames: %s", len(budgeted), source, text[:120])
+    return {
+        "text": text,
+        "context": context,
+        "source": source,
+        "frames": len(budgeted),
+        "frame_detail": frame_detail,
+        "timestamp": timestamp,
+        "audio": audio_b64,
+        "clip_id": clip_id if clip else None,
+        "clip": clip,
+        "warnings": [warning] if warning else [],
+    }
+
+
 def handle_observation_description(description, timestamp, source="screen", context=None):
     """Capture-thread callback: ask the narrator for an insight, synthesize its
     speech, and queue it for the end device to play (no server-side playback).
@@ -2724,8 +2887,30 @@ def decode_audio_to_array(wav_bytes_audio):
     return data
 
 
-def _frames_for_context(context):
-    """Return (frames_list, source_label, warning) for the requested live context."""
+def _frames_for_context(context, requested_source=None):
+    """Return frames for an automatic context or one explicitly named source."""
+    if requested_source == "pc_screen":
+        if screen_stream is None or not screen_stream.status().get("healthy"):
+            return [], "pc_screen", "PC screen stream unavailable"
+        return screen_stream.frames(), "pc_screen", None
+    if requested_source == "mobile_screen":
+        frames = mobile_stream.frames("screen")
+        return (frames, "mobile_screen", None) if frames else (
+            [], "mobile_screen", "mobile screen stream unavailable")
+    if requested_source == "mobile_camera":
+        frames = mobile_stream.frames("camera")
+        return (frames, "mobile_camera", None) if frames else (
+            [], "mobile_camera", "mobile camera stream unavailable")
+    if requested_source:
+        worker = (
+            camera_manager.workers.get(requested_source)
+            if camera_manager is not None else None)
+        if worker is None:
+            return [], requested_source, "selected camera was not found"
+        if not worker.status().get("connected"):
+            return [], requested_source, "selected camera is offline"
+        return worker.stream.frames(), requested_source, None
+
     if context == "screen":
         mobile_frames = mobile_stream.frames("screen")
         if mobile_frames:

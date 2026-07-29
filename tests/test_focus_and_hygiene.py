@@ -8,7 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from agents.proactive import ProactiveNarrator, _SYSTEM_PROMPT, _similar
+from agents.proactive import (
+    ProactiveNarrator, _SYSTEM_PROMPT, _repeats_opening, _similar,
+)
 from memory.extraction.prompts import _naming_block, build_system_prompt
 from memory.rooms.hygiene import merge_suggestions, stale_rooms
 from memory.summary import focus_recap
@@ -146,9 +148,21 @@ def test_distinct_nudges_are_not_suppressed():
                         "Your Neo4j password is missing from the env file.")
 
 
+def test_reused_opening_is_detected_independently_of_the_rest_of_the_message():
+    assert _repeats_opening(
+        "It looks like the build passed.",
+        ["It looks as though that retry recovered."])
+    assert not _repeats_opening(
+        "That retry recovered.",
+        ["It looks as though that retry recovered."])
+
+
 def test_proactive_prompt_uses_open_ended_model_judgment():
     assert "full judgment and creativity" in _SYSTEM_PROMPT
     assert "not a list of allowed reasons" in _SYSTEM_PROMPT
+    assert "linked memory" in _SYSTEM_PROMPT
+    assert "Adapt your tone to the moment" in _SYSTEM_PROMPT
+    assert "Vary the opening words" in _SYSTEM_PROMPT
     assert "Speak up ONLY" not in _SYSTEM_PROMPT
     assert "Most of the time you should stay silent" not in _SYSTEM_PROMPT
 
@@ -162,6 +176,19 @@ def test_proactive_context_includes_source_without_prescribing_a_verdict():
     assert "Live observation source: camera:Driveway" in prompt
     assert "camera_id: camera:driveway" in prompt
     assert "warranted" not in prompt
+
+
+def test_proactive_prompt_includes_personal_context_and_openings_to_avoid():
+    narrator = ProactiveNarrator("model", client=None)
+    prompt = narrator._build_prompt(
+        "The user is debugging a camera stream.", focus=None, evidence=[],
+        personal_context="The user prefers direct technical suggestions.",
+        recent_texts=["It looks like the stream stalled again."])
+
+    assert "prefers direct technical suggestions" in prompt
+    assert "it looks like the" in prompt
+    assert "do not repeat or closely imitate" in prompt
+    assert "tone that fits the live moment" in prompt
 
 
 def test_proactive_decision_preserves_observation_source():
@@ -182,6 +209,84 @@ def test_proactive_decision_preserves_observation_source():
     # source into kind gave every camera its own kind ('camera:Driveway') and
     # logged nudges under a device name instead of a category.
     assert result["kind"] == "insight"
+
+
+def test_proactive_rewrites_a_repeated_opening_instead_of_silently_dropping_it():
+    class Completions:
+        def __init__(self):
+            self.responses = iter([
+                "It looks like the same decoder fault.",
+                "That decoder fault matches Tuesday's failed buffer handoff.",
+            ])
+            self.calls = 0
+
+        async def create(self, **_kwargs):
+            self.calls += 1
+            message = SimpleNamespace(content=next(self.responses))
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    class Store:
+        def active_focus_session(self):
+            return None
+
+        def list_nudges(self, limit=10):
+            return [{"text": "It looks like the stream recovered."}]
+
+        def recent_nudge_feedback(self, limit=8):
+            return []
+
+    completions = Completions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    narrator = ProactiveNarrator(
+        "model", client, cooldown_seconds=0, store_getter=Store)
+
+    result = asyncio.run(narrator.consider("The decoder fault appeared again."))
+
+    assert result["text"].startswith("That decoder fault")
+    assert completions.calls == 2
+
+
+def test_recall_follows_event_entity_links_and_excludes_the_recent_window():
+    class Retriever:
+        def retrieve(self, *_args, **kwargs):
+            assert kwargs["end"] == 100
+            assert "entity" in kwargs["kinds"]
+            return [{
+                "kind": "event", "id": "seed", "title": "Code",
+                "text": "Worked on the Atlas decoder.", "ts": 50,
+            }]
+
+    class Store:
+        def entities_for_events(self, event_ids):
+            assert event_ids == ["seed"]
+            return {"seed": [{"name": "Atlas", "type": "project"}]}
+
+        def entity_detail(self, entity_id):
+            assert entity_id == "Atlas"
+            return {
+                "claims": [{
+                    "claim_id": "claim-old",
+                    "text": "The ring buffer owns retries.",
+                    "last_seen": 40,
+                }],
+                "events": [{
+                    "event_id": "recent",
+                    "summary": "Changed the decoder today.",
+                    "application": "Code",
+                    "span_start": 200,
+                }],
+            }
+
+    narrator = ProactiveNarrator(
+        "model", client=None, retriever=Retriever(), store_getter=Store)
+    recalled = narrator._recall("Debugging the Atlas decoder", now=1000)
+
+    assert recalled[0]["entities"][0]["name"] == "Atlas"
+    assert any(
+        item.get("relationship") == "linked through Atlas"
+        and item.get("text") == "The ring buffer owns retries."
+        for item in recalled)
+    assert not any(item.get("id") == "recent" for item in recalled)
 
 
 # -- corrections teaching the extractor ------------------------------------

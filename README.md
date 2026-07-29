@@ -58,10 +58,11 @@ The Core Unit acts as a **Dispatcher**, not just a chatbot. uses autogen for cre
 
 * **Proactivity**
   Proactive initiative is enabled by default across desktop, mobile, and camera
-  observations. The model combines live context, long-term memory, active focus
-  goals, and past reactions, then uses its own judgment to decide when and how
-  to contribute without waiting for a request. Cooldowns and duplicate checks
-  pace delivery without prescribing which ideas the model may consider.
+  observations. The model combines live context, graph-linked project/entity
+  memory, personal preferences, active focus goals, and past reactions, then
+  adapts its tone and varies its opening while deciding how to contribute.
+  Cooldowns and duplicate checks pace delivery without prescribing which ideas
+  the model may consider.
 
 * **Evidence you can watch and question**
   Anything the assistant raises unprompted — a proactive nudge, an important or
@@ -72,6 +73,28 @@ The Core Unit acts as a **Dispatcher**, not just a chatbot. uses autogen for cre
   about something you did not see can be checked instead of just believed.
   Clips a notification, nudge or question referenced are kept for days; every
   other clip is deleted within the hour (`sources/clips.py`).
+
+* **On-demand reflection**
+  `Alt+Shift+W` reflects on the current screen or camera context.
+  `Alt+Shift+S` first asks whether to attach the PC screen, mobile screen,
+  mobile camera, or a particular home camera. Both bindings are configurable
+  in Settings and registered globally on desktop while the app is running;
+  equivalent touch controls are shown in the Android UI.
+
+  Guided reflection adds nine configurable prompt shortcuts:
+
+  * `Alt+Shift+1` — Do you agree?
+  * `Alt+Shift+2` — Critically analyze
+  * `Alt+Shift+3` — Explain this simply
+  * `Alt+Shift+4` — Distill key points
+  * `Alt+Shift+5` — Explain this code
+  * `Alt+Shift+6` — Review this code
+  * `Alt+Shift+7` — Am I doing this okay?
+  * `Alt+Shift+8` — What should I do next?
+  * `Alt+Shift+9` — Challenge this
+
+  The same actions are available from the in-app prompt palette for touch use
+  or when remembering a direct binding would interrupt the task.
 
 * **Lifelong Learning**
   The agent evolves alongside you. By continuously consolidating daily logs and visual context into its vector store, it builds a permanent, growing knowledge base. It remembers your preferences, projects, and history, ensuring that its personalization deepens over months and years of usage.

@@ -17,6 +17,8 @@ import 'assistant/assistant_screen.dart';
 import 'notifications/local_notification_controller.dart';
 import 'notifications/notifications_screen.dart';
 import 'clips/clip_viewer.dart';
+import 'settings/global_hotkey_service.dart';
+import 'settings/settings_screen.dart';
 
 void main() => runApp(const HomeMindApp());
 
@@ -86,6 +88,32 @@ class ChatMessage {
   });
 }
 
+class _ReflectionSourceOption {
+  const _ReflectionSourceOption({
+    required this.id,
+    required this.label,
+    required this.context,
+    required this.available,
+    required this.detail,
+  });
+
+  final String id;
+  final String label;
+  final String context;
+  final bool available;
+  final String detail;
+
+  factory _ReflectionSourceOption.fromJson(Map<String, dynamic> data) {
+    return _ReflectionSourceOption(
+      id: '${data['id'] ?? ''}',
+      label: '${data['label'] ?? data['id'] ?? 'Source'}',
+      context: '${data['context'] ?? 'screen'}',
+      available: data['available'] == true,
+      detail: '${data['detail'] ?? ''}',
+    );
+  }
+}
+
 class MyApp extends StatefulWidget {
   const MyApp({Key? key}) : super(key: key);
 
@@ -95,6 +123,12 @@ class MyApp extends StatefulWidget {
 
 class _MyAppState extends State<MyApp> {
   static const _homeHubPreferenceKey = 'home_hub_url';
+  static const _reflectShortcutPreferenceKey = 'reflect_shortcut';
+  static const _sourceReflectShortcutPreferenceKey =
+      'source_reflect_shortcut';
+  static const _promptShortcutPreferencePrefix =
+      'reflection_prompt_shortcut_';
+  static const _disabledShortcutValue = 'disabled';
   static const _defaultHomeHub = String.fromEnvironment(
     'HOME_HUB_URL',
     defaultValue: '192.168.1.37',
@@ -148,6 +182,22 @@ class _MyAppState extends State<MyApp> {
   int _lastNotificationSequence = 0;
   int _unreadNotifications = 0;
 
+  // On-demand reflection (Alt+Shift+W by default). Ten frames at the 1fps the
+  // backend buffers is the last ten seconds of whatever is being captured.
+  static const int _reflectFrames = 10;
+  bool _reflecting = false;
+  bool _choosingReflectionSource = false;
+  AppShortcutBinding? _reflectShortcut =
+      AppShortcutBinding.reflectionDefault;
+  AppShortcutBinding? _sourceReflectShortcut =
+      AppShortcutBinding.sourceReflectionDefault;
+  Map<String, AppShortcutBinding?> _promptShortcuts = {
+    for (final preset in reflectionPromptPresets)
+      preset.id: preset.defaultBinding,
+  };
+  final GlobalHotkeyService _globalHotkeys = createGlobalHotkeyService();
+  String? _globalHotkeyError;
+
   // Add these lines for the context selection
   final List<String> _contextOptions = ['talker', 'screen', 'camera'];
   final List<bool> _selectedContexts = [true, false, false]; // 'talker' is selected by default
@@ -173,6 +223,7 @@ class _MyAppState extends State<MyApp> {
     _setupAudioPlayerListener();
     _startService();
     _loadDeliveryPreferences();
+    _loadShortcutPreferences();
     _captureSub = _capture.status.listen((s) {
       if (mounted) setState(() => _captureStatus = s);
     });
@@ -230,6 +281,128 @@ class _MyAppState extends State<MyApp> {
     await _syncNotificationMonitoring();
   }
 
+  Future<void> _loadShortcutPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    final shortcut = _shortcutFromPreference(
+      prefs.getString(_reflectShortcutPreferenceKey),
+      AppShortcutBinding.reflectionDefault,
+    );
+    final usedBindings = <AppShortcutBinding>{
+      if (shortcut != null) shortcut,
+    };
+    var sourceShortcut = _shortcutFromPreference(
+      prefs.getString(_sourceReflectShortcutPreferenceKey),
+      AppShortcutBinding.sourceReflectionDefault,
+    );
+    if (sourceShortcut != null && usedBindings.contains(sourceShortcut)) {
+      sourceShortcut =
+          usedBindings.contains(AppShortcutBinding.sourceReflectionDefault)
+              ? null
+              : AppShortcutBinding.sourceReflectionDefault;
+    }
+    if (sourceShortcut != null) usedBindings.add(sourceShortcut);
+
+    final promptShortcuts = <String, AppShortcutBinding?>{};
+    for (final preset in reflectionPromptPresets) {
+      var binding = _shortcutFromPreference(
+        prefs.getString(_promptShortcutPreferenceKey(preset.id)),
+        preset.defaultBinding,
+      );
+      if (binding != null && usedBindings.contains(binding)) {
+        binding =
+            usedBindings.contains(preset.defaultBinding)
+                ? null
+                : preset.defaultBinding;
+      }
+      promptShortcuts[preset.id] = binding;
+      if (binding != null) usedBindings.add(binding);
+    }
+    if (!mounted) return;
+    setState(() {
+      _reflectShortcut = shortcut;
+      _sourceReflectShortcut = sourceShortcut;
+      _promptShortcuts = promptShortcuts;
+    });
+    await _syncGlobalHotkeys();
+  }
+
+  String _promptShortcutPreferenceKey(String presetId) =>
+      '$_promptShortcutPreferencePrefix$presetId';
+
+  AppShortcutBinding? _shortcutFromPreference(
+      String? saved, AppShortcutBinding fallback) {
+    if (saved == _disabledShortcutValue) return null;
+    return AppShortcutBinding.tryDecode(saved) ?? fallback;
+  }
+
+  void _updateReflectShortcut(AppShortcutBinding? shortcut) {
+    setState(() => _reflectShortcut = shortcut);
+    unawaited(_persistShortcutPreference(
+        _reflectShortcutPreferenceKey, shortcut));
+  }
+
+  void _updateSourceReflectShortcut(AppShortcutBinding? shortcut) {
+    setState(() => _sourceReflectShortcut = shortcut);
+    unawaited(_persistShortcutPreference(
+        _sourceReflectShortcutPreferenceKey, shortcut));
+  }
+
+  void _updatePromptShortcut(
+    String presetId,
+    AppShortcutBinding? shortcut,
+  ) {
+    setState(() {
+      _promptShortcuts = Map<String, AppShortcutBinding?>.from(
+        _promptShortcuts,
+      )..[presetId] = shortcut;
+    });
+    unawaited(
+      _persistShortcutPreference(
+        _promptShortcutPreferenceKey(presetId),
+        shortcut,
+      ),
+    );
+  }
+
+  Future<void> _persistShortcutPreference(
+      String key, AppShortcutBinding? shortcut) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      key,
+      shortcut?.encode() ?? _disabledShortcutValue,
+    );
+    await _syncGlobalHotkeys();
+  }
+
+  Future<void> _syncGlobalHotkeys() async {
+    final registrations = <GlobalHotkeyRegistration>[
+      if (_reflectShortcut case final shortcut?)
+        GlobalHotkeyRegistration(
+          name: 'Reflect now',
+          binding: shortcut,
+          onPressed: () => unawaited(_runGlobalReflection()),
+        ),
+      if (_sourceReflectShortcut case final shortcut?)
+        GlobalHotkeyRegistration(
+          name: 'Reflect from source',
+          binding: shortcut,
+          onPressed: () =>
+              unawaited(_runGlobalReflection(chooseSource: true)),
+        ),
+      for (final preset in reflectionPromptPresets)
+        if (_promptShortcuts[preset.id] case final shortcut?)
+          GlobalHotkeyRegistration(
+            name: preset.title,
+            binding: shortcut,
+            onPressed: () => unawaited(
+              _runGlobalReflection(promptPreset: preset),
+            ),
+          ),
+    ];
+    final error = await _globalHotkeys.sync(registrations);
+    if (mounted) setState(() => _globalHotkeyError = error);
+  }
+
   Future<void> _persistDeliveryPreferences() async {
     final prefs = await SharedPreferences.getInstance();
     await Future.wait([
@@ -272,6 +445,7 @@ class _MyAppState extends State<MyApp> {
     _capture.dispose();
     _fpsController.dispose();
     _statusTimer?.cancel();
+    unawaited(_globalHotkeys.dispose());
     super.dispose();
   }
 
@@ -680,6 +854,379 @@ class _MyAppState extends State<MyApp> {
       }
     } catch (_) {
       // Transient/offline — connectivity is surfaced by the status poll.
+    }
+  }
+
+  Future<void> _runGlobalReflection({
+    bool chooseSource = false,
+    ReflectionPromptPreset? promptPreset,
+  }) async {
+    try {
+      await _globalHotkeys.bringAppToFront();
+    } catch (error) {
+      if (mounted) {
+        setState(() => _globalHotkeyError =
+            'The shortcut fired, but HomeMind could not come forward: $error');
+      }
+    }
+    if (!mounted) return;
+    if (chooseSource) {
+      await _showReflectionSourcePicker();
+    } else {
+      await _reflectOnScreen(
+        question: promptPreset?.prompt,
+        actionLabel: promptPreset?.title,
+      );
+    }
+  }
+
+  Future<List<_ReflectionSourceOption>> _reflectionSources() async {
+    final response = await http
+        .get(Uri.parse('$_apiBase/reflect/sources'))
+        .timeout(const Duration(seconds: 5));
+    if (response.statusCode != 200) {
+      throw Exception('backend returned ${response.statusCode}');
+    }
+    final data = json.decode(response.body) as Map<String, dynamic>;
+    return ((data['sources'] as List?) ?? const [])
+        .whereType<Map>()
+        .map((item) => _ReflectionSourceOption.fromJson(
+            Map<String, dynamic>.from(item)))
+        .where((source) => source.id.isNotEmpty)
+        .toList();
+  }
+
+  Future<void> _showReflectionSourcePicker() async {
+    if (_reflecting) {
+      _showSnack('A reflection is already running');
+      return;
+    }
+    if (_choosingReflectionSource) return;
+    if (_apiBase.isEmpty) {
+      _showSnack('Connect to the home hub first');
+      return;
+    }
+    _choosingReflectionSource = true;
+    _showSnack('Loading live reflection sources…');
+    List<_ReflectionSourceOption> sources;
+    try {
+      sources = await _reflectionSources();
+    } catch (error) {
+      _showSnack('Could not load reflection sources: $error');
+      _choosingReflectionSource = false;
+      return;
+    }
+    if (!mounted) {
+      _choosingReflectionSource = false;
+      return;
+    }
+    _ReflectionSourceOption? selected;
+    try {
+      selected = await showModalBottomSheet<_ReflectionSourceOption>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: _panel,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+        ),
+        builder: (sheetContext) => SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(18, 10, 18, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 38,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: _line,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+                const Text('Reflect from source',
+                    style:
+                        TextStyle(fontSize: 19, fontWeight: FontWeight.w800)),
+                const SizedBox(height: 5),
+                const Text(
+                  'Choose the exact live frames HomeMind should attach.',
+                  style: TextStyle(color: _muted, fontSize: 11.5),
+                ),
+                const SizedBox(height: 14),
+                if (sources.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 22),
+                    child: Center(
+                      child: Text('No reflection sources are configured.',
+                          style: TextStyle(color: _muted)),
+                    ),
+                  )
+                else
+                  ...sources.map((source) {
+                    final isMobile = source.id.startsWith('mobile_');
+                    final icon = source.id == 'pc_screen'
+                        ? Icons.desktop_windows_outlined
+                        : isMobile
+                            ? (source.context == 'screen'
+                                ? Icons.phone_android_outlined
+                                : Icons.phone_iphone_outlined)
+                            : Icons.videocam_outlined;
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Material(
+                        color: _panelRaised,
+                        borderRadius: BorderRadius.circular(14),
+                        child: ListTile(
+                          enabled: source.available,
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14)),
+                          leading: Icon(icon,
+                              color: source.available ? _mint : _muted),
+                          title: Text(source.label,
+                              style: const TextStyle(
+                                  fontSize: 13, fontWeight: FontWeight.w700)),
+                          subtitle: Text(source.detail,
+                              style:
+                                  const TextStyle(color: _muted, fontSize: 10)),
+                          trailing: source.available
+                              ? const Icon(Icons.chevron_right_rounded,
+                                  color: _muted)
+                              : const Text('Unavailable',
+                                  style:
+                                      TextStyle(color: _muted, fontSize: 9.5)),
+                          onTap: source.available
+                              ? () => Navigator.pop(sheetContext, source)
+                              : null,
+                        ),
+                      ),
+                    );
+                  }),
+              ],
+            ),
+          ),
+        ),
+      );
+    } finally {
+      _choosingReflectionSource = false;
+    }
+    if (selected != null && mounted) {
+      await _reflectOnScreen(requestedSource: selected);
+    }
+  }
+
+  void _runPromptPreset(ReflectionPromptPreset preset) {
+    unawaited(
+      _reflectOnScreen(
+        question: preset.prompt,
+        actionLabel: preset.title,
+      ),
+    );
+  }
+
+  IconData _promptPresetIcon(ReflectionPromptKind kind) {
+    return switch (kind) {
+      ReflectionPromptKind.reading => Icons.menu_book_outlined,
+      ReflectionPromptKind.code => Icons.code_rounded,
+      ReflectionPromptKind.guidance => Icons.route_outlined,
+    };
+  }
+
+  Color _promptPresetColor(ReflectionPromptKind kind) {
+    return switch (kind) {
+      ReflectionPromptKind.reading => _mint,
+      ReflectionPromptKind.code => const Color(0xFF62B5FF),
+      ReflectionPromptKind.guidance => const Color(0xFFFFC857),
+    };
+  }
+
+  Future<void> _showPromptActionPicker() async {
+    if (_reflecting) {
+      _showSnack('A reflection is already running');
+      return;
+    }
+    final selected = await showModalBottomSheet<ReflectionPromptPreset>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: _panel,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: SizedBox(
+          height: MediaQuery.sizeOf(sheetContext).height * .76,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 10, 18, 0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 38,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: _line,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    const Text(
+                      'Guided reflection',
+                      style:
+                          TextStyle(fontSize: 19, fontWeight: FontWeight.w800),
+                    ),
+                    const SizedBox(height: 5),
+                    const Text(
+                      'Run a general prompt on the current Screen or Camera context.',
+                      style: TextStyle(color: _muted, fontSize: 11.5),
+                    ),
+                    const SizedBox(height: 14),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: ListView(
+                  key: const Key('prompt-action-list'),
+                  padding: const EdgeInsets.fromLTRB(18, 0, 18, 24),
+                  children: [
+                    for (final preset in reflectionPromptPresets)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Material(
+                          color: _panelRaised,
+                          borderRadius: BorderRadius.circular(14),
+                          child: ListTile(
+                            key: ValueKey('prompt-action-${preset.id}'),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            leading: Icon(
+                              _promptPresetIcon(preset.kind),
+                              color: _promptPresetColor(preset.kind),
+                            ),
+                            title: Text(
+                              preset.title,
+                              style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            subtitle: Text(
+                              '${_promptShortcuts[preset.id]?.label ?? 'Shortcut disabled'}'
+                              ' • ${preset.description}',
+                              style:
+                                  const TextStyle(color: _muted, fontSize: 10),
+                            ),
+                            trailing: const Icon(
+                              Icons.chevron_right_rounded,
+                              color: _muted,
+                            ),
+                            onTap:
+                                () => Navigator.pop(sheetContext, preset),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (selected != null && mounted) {
+      await _reflectOnScreen(
+        question: selected.prompt,
+        actionLabel: selected.title,
+      );
+    }
+  }
+
+  /// Ask the backend what it makes of the last few seconds of live frames.
+  ///
+  /// Bound to the configurable reflection shortcut (Alt+Shift+W by default):
+  /// the point is to get an opinion on whatever is on screen *right now* (the
+  /// page being read, the error in the terminal, the thing just highlighted)
+  /// without breaking off to type a question.
+  Future<void> _reflectOnScreen({
+    _ReflectionSourceOption? requestedSource,
+    String? question,
+    String? actionLabel,
+  }) async {
+    if (_reflecting) {
+      _showSnack('A reflection is already running');
+      return;
+    }
+    if (_apiBase.isEmpty) {
+      _showSnack('Connect to the home hub first');
+      return;
+    }
+    if (Navigator.of(context).canPop()) {
+      Navigator.of(context).popUntil((route) => route.isFirst);
+    }
+    setState(() {
+      _reflecting = true;
+      // The answer lands in the Home conversation, so go there to see it.
+      _workspaceIndex = 0;
+    });
+    _showSnack(
+      actionLabel == null
+          ? 'Looking at the last ${_reflectFrames}s…'
+          : '$actionLabel • looking at the last ${_reflectFrames}s…',
+    );
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$_apiBase/reflect'),
+            headers: const {'Content-Type': 'application/json'},
+            body: json.encode({
+              'context': requestedSource?.context ??
+                  (_currentContext == 'camera' ? 'camera' : 'screen'),
+              if (requestedSource != null) 'source': requestedSource.id,
+              'frames': _reflectFrames,
+              'speak': _proactiveVoiceEnabled,
+              if (question != null && question.trim().isNotEmpty)
+                'question': question.trim(),
+            }),
+          )
+          // The VLM needs real time on a cold model; a short timeout here just
+          // throws away an answer the server is still producing.
+          .timeout(const Duration(seconds: 180));
+      final data = json.decode(response.body) as Map<String, dynamic>;
+      if (response.statusCode != 200) {
+        _showSnack('Reflection failed: ${data['error'] ?? response.statusCode}');
+        return;
+      }
+      final audioB64 = data['audio'];
+      final audio = audioB64 is String && audioB64.isNotEmpty
+          ? base64.decode(audioB64)
+          : null;
+      final clip = data['clip'] as Map<String, dynamic>?;
+      if (!mounted) return;
+      setState(() {
+        _chatHistory.add(ChatMessage(
+          sender: MessageSender.assistant,
+          text: '🔎 ${data['text'] ?? ''}',
+          fullAudio: audio,
+          clipId: data['clip_id']?.toString(),
+          clipCoversSeconds: (clip?['covers_seconds'] as num?)?.toDouble(),
+          clipPlaysSeconds: (clip?['plays_seconds'] as num?)?.toDouble(),
+        ));
+      });
+      if (_proactiveVoiceEnabled && audio != null) {
+        _audioQueue.add(audio);
+        if (!_isAudioPlaying) _playNextInQueue();
+      }
+    } catch (e) {
+      _showSnack('Could not reflect on the screen: $e');
+    } finally {
+      if (mounted) setState(() => _reflecting = false);
     }
   }
 
@@ -1320,6 +1867,23 @@ class _MyAppState extends State<MyApp> {
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => screen));
   }
 
+  Widget _settingsScreen() {
+    return SettingsScreen(
+      reflectionShortcut: _reflectShortcut,
+      sourceReflectionShortcut: _sourceReflectShortcut,
+      reflectFrames: _reflectFrames,
+      onReflectionShortcutChanged: _updateReflectShortcut,
+      onSourceReflectionShortcutChanged: _updateSourceReflectShortcut,
+      onReflectNow: _reflectOnScreen,
+      onChooseReflectionSource: _showReflectionSourcePicker,
+      promptShortcuts: _promptShortcuts,
+      onPromptShortcutChanged: _updatePromptShortcut,
+      onRunPrompt: _runPromptPreset,
+      globalHotkeysSupported: _globalHotkeys.isSupported,
+      globalHotkeyError: _globalHotkeyError,
+    );
+  }
+
   Widget _workspaceNavItem({
     required IconData icon,
     required String label,
@@ -1473,7 +2037,13 @@ class _MyAppState extends State<MyApp> {
               onTap: _showCaptureSheet,
             ),
             _workspaceNavItem(
-              icon: Icons.settings_outlined,
+              icon: Icons.tune_rounded,
+              label: 'Settings',
+              selected: _workspaceIndex == 5,
+              onTap: () => _openWorkspace(5, _settingsScreen()),
+            ),
+            _workspaceNavItem(
+              icon: Icons.hub_outlined,
               label: 'Home hub',
               onTap: _showConnectionSheet,
             ),
@@ -2218,6 +2788,35 @@ class _MyAppState extends State<MyApp> {
             onTap: () =>
                 _openWorkspace(3, MemoryTimelineScreen(apiBase: _apiBase)),
           ),
+          const SizedBox(height: 7),
+          action(
+            icon: _reflecting ? Icons.hourglass_top : Icons.psychology_outlined,
+            title: 'Reflect now',
+            subtitle: _reflecting
+                ? 'Reading the last ${_reflectFrames}s…'
+                : '${_reflectShortcut?.label ?? 'Shortcut disabled'} • '
+                    'last ${_reflectFrames}s of frames',
+            color: const Color(0xFFFFC857),
+            onTap: _reflecting ? () {} : _reflectOnScreen,
+          ),
+          const SizedBox(height: 7),
+          action(
+            icon: Icons.add_to_photos_outlined,
+            title: 'Reflect from source…',
+            subtitle:
+                '${_sourceReflectShortcut?.label ?? 'Shortcut disabled'} • '
+                'screen, mobile or camera',
+            color: const Color(0xFF62B5FF),
+            onTap: _reflecting ? () {} : _showReflectionSourcePicker,
+          ),
+          const SizedBox(height: 7),
+          action(
+            icon: Icons.auto_awesome_outlined,
+            title: 'Guided reflection…',
+            subtitle: '9 reading, code and guidance prompts',
+            color: _mint,
+            onTap: _reflecting ? () {} : _showPromptActionPicker,
+          ),
         ],
       ),
     );
@@ -2225,7 +2824,7 @@ class _MyAppState extends State<MyApp> {
 
   Widget _buildMobileControls() {
     return Container(
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
       decoration: BoxDecoration(
         color: _panel,
         borderRadius: BorderRadius.circular(20),
@@ -2258,6 +2857,40 @@ class _MyAppState extends State<MyApp> {
               ),
             ],
           ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: _reflecting ? null : _reflectOnScreen,
+                  icon: Icon(
+                      _reflecting
+                          ? Icons.hourglass_top
+                          : Icons.psychology_outlined,
+                      size: 17),
+                  label: Text(_reflecting ? 'Working…' : 'Reflect'),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed:
+                      _reflecting ? null : _showReflectionSourcePicker,
+                  icon: const Icon(Icons.add_to_photos_outlined, size: 17),
+                  label: const Text('Source'),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: OutlinedButton.icon(
+                  key: const Key('mobile-guided-reflection-button'),
+                  onPressed: _reflecting ? null : _showPromptActionPicker,
+                  icon: const Icon(Icons.auto_awesome_outlined, size: 17),
+                  label: const Text('Prompts'),
+                ),
+              ),
+            ],
+          ),
           ListTile(
             dense: true,
             contentPadding: const EdgeInsets.fromLTRB(4, 4, 4, 0),
@@ -2279,6 +2912,31 @@ class _MyAppState extends State<MyApp> {
   @override
   Widget build(BuildContext context) {
     final Size s = MediaQuery.of(context).size;
+    final shortcutBindings = <ShortcutActivator, VoidCallback>{};
+    final reflectShortcut = _reflectShortcut;
+    if (reflectShortcut != null) {
+      shortcutBindings[reflectShortcut.activator] = _reflectOnScreen;
+    }
+    final sourceReflectShortcut = _sourceReflectShortcut;
+    if (sourceReflectShortcut != null) {
+      shortcutBindings[sourceReflectShortcut.activator] =
+          _showReflectionSourcePicker;
+    }
+    for (final preset in reflectionPromptPresets) {
+      final shortcut = _promptShortcuts[preset.id];
+      if (shortcut != null) {
+        shortcutBindings[shortcut.activator] = () => _runPromptPreset(preset);
+      }
+    }
+    // The configured combination works anywhere in the focused app, including
+    // inside a text field: the key event bubbles up to this binding.
+    return CallbackShortcuts(
+      bindings: shortcutBindings,
+      child: Focus(autofocus: true, child: _buildShell(s)),
+    );
+  }
+
+  Widget _buildShell(Size s) {
     return Scaffold(
       key: _scaffoldKey,
       drawer: SizedBox(
@@ -2377,6 +3035,9 @@ class _MyAppState extends State<MyApp> {
                 }
               },
             );
+            break;
+          case 5:
+            workspace = _settingsScreen();
             break;
           default:
             workspace = home;
