@@ -52,6 +52,88 @@ The Core Unit acts as a **Dispatcher**, not just a chatbot. uses autogen for cre
 
 ---
 
+### Optional room agent runtime
+
+The existing `FastAPI -> AsyncOpenAI -> Qwen` path remains the default. An
+optional conversation manager can route explicitly selected rooms through
+PydanticAI, using the same `AsyncOpenAI` client, model name, and
+OpenAI-compatible endpoint. PydanticAI owns the multi-step model/tool loop for
+those rooms and exposes MCP tools from a standard multi-server configuration.
+
+Install the optional layer with:
+
+```powershell
+pip install -r requirements-agent.txt
+```
+
+The MCP extra pulls FastMCP, which tracks the newest Starlette. Starlette 1.x
+drops the router arguments FastAPI 0.118 passes, so `requirements-agent.txt`
+pins Starlette to a compatible range — installing it unpinned breaks `app.py`
+at import time.
+
+Then opt in exact rooms:
+
+```dotenv
+AGENT_RUNTIME_ENABLED=true
+AGENT_ROOM_IDS=agent:tomorrow-planner,agent:phd-helper
+MCP_CONFIG_PATH=./mcp.config.json
+MCP_FILESYSTEM_ROOT=C:/d/project/home_assistant_AI
+```
+
+#### Tools
+
+Agent rooms see two kinds of tool:
+
+* **MCP servers** — everything external. Copy `mcp.config.example.json` to
+  `mcp.config.json` and add filesystem, Git, GitHub, Playwright, or any other
+  server under `mcpServers`. URL entries use Streamable HTTP (or SSE when the
+  URL ends in `/sse`); command/args entries use stdio, and `${VAR}` /
+  `${VAR:-default}` are expanded from the environment. The file is trusted
+  configuration because stdio entries launch local processes, so it is
+  git-ignored. The bundled browser entry expects Playwright MCP on
+  `MCP_BROWSER_URL`: `npx @playwright/mcp@latest --port 8931`.
+* **The activity graph** (`agents/graph_tools.py`) — the one native toolset,
+  because this application's own memory has no MCP server. It exposes
+  `graph_search_memory`, `graph_recent_activity`, `graph_event_detail`,
+  `graph_day_summary` and `graph_room_overview`. All are read-only and trim
+  storage columns and long text before the results reach the model.
+
+MCP sessions open once per agent run rather than once per tool call. On Windows
+this needs a subprocess-capable event loop, which is what uvicorn installs.
+
+#### Responses
+
+Direct room chat responses retain their existing shape. Agent responses add
+`execution: agent` plus the PydanticAI run IDs and the tool call/output trace.
+Streaming room chat retains NDJSON; after the tool loop completes it emits the
+final text and tool trace. `GET /agent-runtime/status` reports routing, limits,
+native toolset count and configured MCP server names without connecting to any
+of them.
+
+#### Structured outputs
+
+Calls that need data rather than prose pass a Pydantic model as `output_type`
+(see `agents/schemas.py`). Both paths honour it: PydanticAI validates and
+retries on the agent path, and the direct path validates the same model after
+extracting JSON from the reply. The next-day planner uses `PlanProposal` and
+`PlanEvaluation` this way instead of scraping dictionaries out of free text.
+
+One-shot extraction over evidence the caller already gathered passes
+`allow_agent=False` to stay on the direct path even inside an agent room —
+tools cannot improve the answer there and a stray tool loop can exhaust the
+run's budget.
+
+#### Tests
+
+`tests/test_agent_runtime.py`, `tests/test_graph_tools.py` and
+`tests/test_mcp_config.py` cover routing, toolset composition, config loading
+and both structured-output paths. The live MCP test actually spawns the
+filesystem server over stdio and is opt-in:
+
+```powershell
+$env:MCP_LIVE_TEST=1; python -m pytest tests/test_mcp_config.py
+```
+
 ### Goals 
 * **Productivity Enhancer**
   It enhances your productivty while working by helping you cambat distractions. it can watch videos along side you helping you grasp difficult concepts.

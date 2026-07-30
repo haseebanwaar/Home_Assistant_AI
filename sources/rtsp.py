@@ -18,7 +18,13 @@ these are HD cameras and resolution is what they are for. Corruption that gets
 through is caught after extraction instead; see `sources.camera_validation`.
 
 `flat_frame_pct` in `status()` is how you tell a decode problem from a quiet
-scene without reading VLM summaries.
+scene without reading VLM summaries. It is measured over sampled frames (see
+`_record_quality`), so it reports the quality of what the VLM was shown.
+
+Draining and sampling are deliberately separated: every frame is grabbed so the
+decoder keeps its references, but only frames at `fps` are retrieved into
+pixels. Reading (grab+retrieve) every frame instead cost a full CPU core per
+pair of HD cameras to produce frames that were immediately discarded.
 """
 import os
 import re
@@ -37,6 +43,13 @@ logger = logging.getLogger("home_assistant")
 _RTSP_TRANSPORT = os.getenv("CAMERA_RTSP_TRANSPORT", "tcp").strip()
 if _RTSP_TRANSPORT and "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ:
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{_RTSP_TRANSPORT}"
+
+# FFmpeg frame-threads per decoder. Left to FFmpeg, HEVC picks one thread per
+# core: on a 12-core box two cameras opened 24 decoder threads that each burned
+# 1-2% of a core purely in scheduling overhead. Two threads per camera is enough
+# to stay ahead of a ~15 fps HD stream. 0 restores FFmpeg's own choice.
+# Raise this (and watch `flat_frame_pct`) if a stream starts falling behind.
+_DECODER_THREADS = int(os.getenv("CAMERA_DECODER_THREADS", "2"))
 
 # Vendor patterns for "same camera, lighter stream". Anything that matches
 # neither is passed through untouched rather than guessed at.
@@ -122,6 +135,12 @@ class RealtimeCameraStream:
             video = None
             try:
                 video = cv2.VideoCapture(self.video_source)
+                if _DECODER_THREADS > 0:
+                    try:
+                        video.set(cv2.CAP_PROP_N_THREADS, _DECODER_THREADS)
+                    except Exception:
+                        logger.debug("decoder thread cap not supported",
+                                     exc_info=True)
                 if not video.isOpened():
                     self._mark_disconnected("camera source could not be opened")
                 else:
@@ -129,8 +148,12 @@ class RealtimeCameraStream:
                     next_sample_at = None
                     profile_version = self._profile_version
                     while self.running and not self._stop.is_set():
-                        ret, frame = video.read()
-                        if not ret:
+                        # Always drain the RTSP stream. Inter-frame codecs such
+                        # as HEVC need every reference frame even though the VLM
+                        # only needs a sparse sample. Sleeping here used to leave
+                        # ~14 of every 15 camera frames unread, eventually
+                        # producing grey macroblocks and missing-POC errors.
+                        if not video.grab():
                             self._mark_disconnected(
                                 "camera stream stopped returning frames")
                             break
@@ -147,25 +170,34 @@ class RealtimeCameraStream:
                             self.last_error = None
                             self.healthy = True
 
-                        self._record_quality(frame)
+                        # Liveness is about the stream, not the sample, so it is
+                        # stamped on every grabbed frame.
                         self.last_frame_at = time.time()
 
-                        # Always drain/decode the RTSP stream. Inter-frame codecs
-                        # such as HEVC need every reference frame even though the
-                        # VLM only needs a sparse sample. Sleeping here used to
-                        # leave ~14 of every 15 camera frames unread, eventually
-                        # producing grey macroblocks and missing-POC errors.
                         now = time.monotonic()
                         if profile_version != self._profile_version:
                             profile_version = self._profile_version
                             next_sample_at = None
-                        if next_sample_at is None or now >= next_sample_at:
-                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            pil_image = Image.fromarray(frame_rgb)
-                            with self.lock:
-                                self.frame_buffer.append(pil_image)
-                            sample_interval = 1.0 / max(self.fps, 0.01)
-                            next_sample_at = now + sample_interval
+                        if next_sample_at is not None and now < next_sample_at:
+                            continue
+
+                        # Only the frames we keep are converted to pixels.
+                        # `grab` demuxes and decodes; `retrieve` is the YUV->BGR
+                        # copy, and paying it 15x per second per camera to throw
+                        # 14 of those frames away is what pegged a whole core.
+                        # The sampling clock advances either way: a frame that
+                        # will not decode must not turn this back into a
+                        # full-rate retrieve loop.
+                        next_sample_at = now + 1.0 / max(self.fps, 0.01)
+                        ok, frame = video.retrieve()
+                        if not ok:
+                            continue
+
+                        self._record_quality(frame)
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        pil_image = Image.fromarray(frame_rgb)
+                        with self.lock:
+                            self.frame_buffer.append(pil_image)
             except Exception as exc:
                 self._mark_disconnected(f"camera stream error: {exc}")
                 logger.exception("Camera stream capture failed")
@@ -185,8 +217,10 @@ class RealtimeCameraStream:
     def _record_quality(self, frame):
         """Track how many frames come back visually flat (see __init__).
 
-        Measured on a 1-in-8 subsample so this stays negligible at full frame
-        rate across several cameras.
+        Called only on sampled frames — the ones the VLM will actually see —
+        because those are the ones whose quality matters, and because the
+        unsampled frames are never decoded to pixels to measure. Measured on a
+        1-in-8 subsample so it stays negligible across several cameras.
         """
         try:
             sub = frame[::8, ::8]

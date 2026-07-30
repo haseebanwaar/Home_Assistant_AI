@@ -12,6 +12,7 @@ Store writes are optional and fail-safe:
 
 A batch is a dict:
     {timestamp, window_titles[], process_names[], repr_frame(np|None),
+     last_input_at(float|None),
      extraction: {summary, activity_type, entities[], claims[], selected_profile}}
 """
 from __future__ import annotations
@@ -78,8 +79,9 @@ class MemoryPipeline:
     def __init__(self, id_strategy="counter", expected_seconds=60.0,
                  neo4j_store=None, activity_logger=None, jsonl=False,
                  log_context="screen", notification_sink=None,
-                 personal_memory=None):
-        self.manager = SessionManager(id_strategy=id_strategy)
+                 personal_memory=None, idle_grace_seconds=None):
+        self.manager = SessionManager(id_strategy=id_strategy,
+                                      idle_grace_seconds=idle_grace_seconds)
         self.expected_seconds = expected_seconds
         self.neo4j = neo4j_store
         self.activity_logger = activity_logger
@@ -157,6 +159,9 @@ class MemoryPipeline:
             timestamp=ts, activity_type=activity,
             application=app_of(ctx), project_id=project,
             boundary_label=label, summary=title_of(ctx),
+            # When the capture source knows when the user last touched the
+            # keyboard, the timeline uses it to refuse to credit unattended gaps.
+            active_until=batch.get("last_input_at"),
         )
         result.current_event.memory_domain = (
             "home" if self.log_context == "camera" else "personal")

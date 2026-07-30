@@ -15,6 +15,7 @@ import re
 from neo4j import GraphDatabase
 
 from memory.retrieval.terms import tokenize
+from memory.summary.reports import PRODUCTIVITY_DOMAIN
 
 logger = logging.getLogger("home_assistant")
 
@@ -1143,16 +1144,22 @@ class Neo4jStore:
         return [dict(r) for r in self.run(
             _DAY_ENTITIES_CYPHER, date=date_str, limit=limit, domain=domain)]
 
-    def day_claims(self, date_str, limit=20):
-        return [dict(r) for r in self.run(_DAY_CLAIMS_CYPHER, date=date_str, limit=limit)]
+    def day_claims(self, date_str, limit=20, domain=PRODUCTIVITY_DOMAIN):
+        return [dict(r) for r in self.run(
+            _DAY_CLAIMS_CYPHER, date=date_str, limit=limit, domain=domain)]
 
-    def daily_metrics(self, date_str):
-        """Deterministic productivity metrics for a day (Phase 3 Coach input)."""
-        totals = self.run(_DAILY_TOTALS_CYPHER, date=date_str)
+    def range_metrics(self, start_date, end_date, domain=PRODUCTIVITY_DOMAIN):
+        """Deterministic productivity metrics over an inclusive date range.
+
+        Screen-only by default — see `_EVENT_DOMAIN_EXPR`. Pass domain=None for
+        every source, or 'home' for the camera side.
+        """
+        params = {"start": start_date, "end": end_date, "domain": domain}
+        totals = self.run(_RANGE_TOTALS_CYPHER, **params)
         t = dict(totals[0]) if totals else {}
-        by_activity = [dict(r) for r in self.run(_DAILY_BY_ACTIVITY_CYPHER, date=date_str)]
-        by_app = [dict(r) for r in self.run(_DAILY_BY_APP_CYPHER, date=date_str)]
-        by_project = [dict(r) for r in self.run(_DAILY_BY_PROJECT_CYPHER, date=date_str)]
+        by_activity = [dict(r) for r in self.run(_RANGE_BY_ACTIVITY_CYPHER, **params)]
+        by_app = [dict(r) for r in self.run(_RANGE_BY_APP_CYPHER, **params)]
+        by_project = [dict(r) for r in self.run(_RANGE_BY_PROJECT_CYPHER, **params)]
 
         active = t.get("active_seconds") or 0.0
         events = t.get("events") or 0
@@ -1161,11 +1168,14 @@ class Neo4jStore:
         avg_event = (active / events) if events else 0.0
         focus_score = round(min(100.0, (avg_event / 300.0) * 100.0))
         return {
-            "date": date_str,
+            "start_date": start_date,
+            "end_date": end_date,
+            "domain": domain,
             "active_seconds": round(active, 1),
             "active_minutes": round(active / 60.0, 1),
             "events": events,
             "sessions": t.get("sessions") or 0,
+            "active_days": t.get("active_days") or 0,
             "switches": switches,
             "longest_block_seconds": round(t.get("longest_block") or 0.0, 1),
             "avg_event_seconds": round(avg_event, 1),
@@ -1175,6 +1185,21 @@ class Neo4jStore:
             "by_app": by_app,
             "by_project": by_project,
         }
+
+    def daily_metrics(self, date_str, domain=PRODUCTIVITY_DOMAIN):
+        """One day's productivity metrics (Phase 3 Coach input)."""
+        metrics = self.range_metrics(date_str, date_str, domain=domain)
+        metrics["date"] = date_str
+        return metrics
+
+    def activity_series(self, start_date, end_date, domain=PRODUCTIVITY_DOMAIN):
+        """Minutes per activity per day over an inclusive range.
+
+        Returns the flat (date, activity, minutes, events) rows; the caller
+        pivots them into whichever chart shape it needs.
+        """
+        return [dict(r) for r in self.run(
+            _ACTIVITY_SERIES_CYPHER, start=start_date, end=end_date, domain=domain)]
 
     def resolve_entities(self, fuzzy_threshold=0.9):
         """Step 12: propose POSSIBLY_SAME_AS links over all entities (idempotent).
@@ -2512,36 +2537,77 @@ ORDER BY mentions DESC, name
 LIMIT $limit
 """
 
-_DAILY_TOTALS_CYPHER = """
-MATCH (d:Day {date: $date})-[:HAS_SESSION]->(s:Session)-[:HAS_EVENT]->(e:Event)
+# Which domain an event's *time* belongs to, for the report queries below.
+#
+# Productivity is a screen measurement. A camera event is an observation of the
+# house — it is not work the user did — so counting its span as active minutes
+# inflated every report. `memory_domain` is the primary signal, and membership of
+# a camera room overrides it: the pipeline only writes 'home' when log_context is
+# exactly 'camera', so a source named 'mobile_camera' or 'camera:front-door' is
+# stored as 'personal' while still being routed into Cameras. That routing is the
+# thing to trust, and it also covers events written before memory_domain existed.
+_EVENT_DOMAIN_EXPR = """CASE
+         WHEN coalesce(e.memory_domain, 'personal') = 'home'
+              OR EXISTS { MATCH (:Room {kind: 'camera'})-[:CONTAINS]->(e) }
+         THEN 'home' ELSE 'personal' END"""
+
+# Appended inside an existing WHERE. $domain NULL means "every source".
+_DOMAIN_CLAUSE = f"\n  AND ($domain IS NULL OR ({_EVENT_DOMAIN_EXPR}) = $domain)"
+
+# Day.date is ISO, so a lexicographic range is a chronological one. All the
+# report queries span [$start, $end] inclusive; a single day passes start == end.
+_RANGE_TOTALS_CYPHER = f"""
+MATCH (d:Day)-[:HAS_SESSION]->(s:Session)-[:HAS_EVENT]->(e:Event)
+WHERE d.date >= $start AND d.date <= $end{_DOMAIN_CLAUSE}
 RETURN sum(e.span_seconds) AS active_seconds, count(e) AS events,
        count(DISTINCT s) AS sessions, max(e.span_seconds) AS longest_block,
+       count(DISTINCT d.date) AS active_days,
        sum(CASE WHEN e.boundary_label <> 'append' THEN 1 ELSE 0 END) AS switches
 """
 
-_DAILY_BY_ACTIVITY_CYPHER = """
-MATCH (d:Day {date: $date})-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(e:Event)
-RETURN e.activity_type AS activity, round(sum(e.span_seconds) / 60.0, 1) AS minutes
+# activity_type is coalesced rather than dropped: a null key is a hole in a
+# chart's category axis, and the time was still spent.
+_RANGE_BY_ACTIVITY_CYPHER = f"""
+MATCH (d:Day)-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(e:Event)
+WHERE d.date >= $start AND d.date <= $end{_DOMAIN_CLAUSE}
+RETURN coalesce(e.activity_type, 'other') AS activity,
+       round(sum(e.span_seconds) / 60.0, 1) AS minutes,
+       count(e) AS events
 ORDER BY minutes DESC
 """
 
-_DAILY_BY_APP_CYPHER = """
-MATCH (d:Day {date: $date})-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(e:Event)
+_RANGE_BY_APP_CYPHER = f"""
+MATCH (d:Day)-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(e:Event)
+WHERE d.date >= $start AND d.date <= $end
+  AND e.application IS NOT NULL{_DOMAIN_CLAUSE}
 RETURN e.application AS app, round(sum(e.span_seconds) / 60.0, 1) AS minutes
 ORDER BY minutes DESC
 LIMIT 10
 """
 
-_DAILY_BY_PROJECT_CYPHER = """
-MATCH (d:Day {date: $date})-[:HAS_SESSION]->(s:Session)-[:HAS_EVENT]->(e:Event)
-WHERE s.project_id IS NOT NULL
+_RANGE_BY_PROJECT_CYPHER = f"""
+MATCH (d:Day)-[:HAS_SESSION]->(s:Session)-[:HAS_EVENT]->(e:Event)
+WHERE d.date >= $start AND d.date <= $end
+  AND s.project_id IS NOT NULL{_DOMAIN_CLAUSE}
 RETURN s.project_id AS project, round(sum(e.span_seconds) / 60.0, 1) AS minutes
 ORDER BY minutes DESC
 LIMIT 10
 """
 
-_DAY_CLAIMS_CYPHER = """
-MATCH (d:Day {date: $date})-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(e:Event)-[:SUPPORTS]->(c:Claim)
+# One row per (day, activity) — the shape the per-activity trend charts plot.
+_ACTIVITY_SERIES_CYPHER = f"""
+MATCH (d:Day)-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(e:Event)
+WHERE d.date >= $start AND d.date <= $end{_DOMAIN_CLAUSE}
+RETURN d.date AS date, coalesce(e.activity_type, 'other') AS activity,
+       round(sum(e.span_seconds) / 60.0, 1) AS minutes,
+       count(e) AS events
+ORDER BY date, minutes DESC
+"""
+
+_DAY_CLAIMS_CYPHER = f"""
+MATCH (d:Day {{date: $date}})-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(e:Event)
+      -[:SUPPORTS]->(c:Claim)
+WHERE true{_DOMAIN_CLAUSE}
 RETURN c.text AS text, c.confidence AS confidence
 ORDER BY c.confidence DESC
 LIMIT $limit

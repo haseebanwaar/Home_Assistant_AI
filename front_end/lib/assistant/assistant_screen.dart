@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import '../memory/timeline_screen.dart';
 import '../network/http_json.dart';
+import '../reports/reports_screen.dart';
 
 const _ink = Color(0xFF070B14);
 const _panel = Color(0xFF111827);
@@ -12,11 +13,6 @@ const _line = Color(0xFF263246);
 const _mint = Color(0xFF6EE7D8);
 const _violet = Color(0xFF8B7CF6);
 const _muted = Color(0xFF91A0B8);
-
-String _iso(DateTime value) =>
-    '${value.year.toString().padLeft(4, '0')}-'
-    '${value.month.toString().padLeft(2, '0')}-'
-    '${value.day.toString().padLeft(2, '0')}';
 
 class AssistantScreen extends StatefulWidget {
   final String apiBase;
@@ -201,7 +197,7 @@ class _AssistantScreenState extends State<AssistantScreen>
           unselectedLabelColor: _muted,
           tabs: const [
             Tab(icon: Icon(Icons.chat_bubble_outline), text: 'Conversations'),
-            Tab(icon: Icon(Icons.insights), text: 'Reviews'),
+            Tab(icon: Icon(Icons.insights), text: 'Reports'),
             Tab(icon: Icon(Icons.center_focus_strong), text: 'Focus'),
           ],
         ),
@@ -210,7 +206,7 @@ class _AssistantScreenState extends State<AssistantScreen>
         controller: _tabs,
         children: [
           _conversationTab(),
-          ReviewPanel(apiBase: widget.apiBase),
+          ReportsPanel(apiBase: widget.apiBase),
           FocusPanel(apiBase: widget.apiBase, rooms: _rooms),
         ],
       ),
@@ -459,194 +455,6 @@ class _ConversationPanelState extends State<ConversationPanel> {
               style: const TextStyle(color: Colors.white70, height: 1.4)),
         ),
       );
-    }
-  }
-}
-
-class ReviewPanel extends StatefulWidget {
-  final String apiBase;
-  const ReviewPanel({super.key, required this.apiBase});
-
-  @override
-  State<ReviewPanel> createState() => _ReviewPanelState();
-}
-
-class _ReviewPanelState extends State<ReviewPanel> {
-  DateTime _date = DateTime.now();
-  bool _weekly = false;
-  bool _loading = false;
-  Map<String, dynamic>? _data;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    setState(() => _loading = true);
-    try {
-      final path = _weekly
-          ? '/reviews/weekly?end_date=${_iso(_date)}'
-          : '/reviews/daily?date=${_iso(_date)}';
-      final resp = await http.get(Uri.parse('${widget.apiBase}$path'));
-      if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
-      setState(() =>
-          _data = decodeJsonResponse(resp) as Map<String, dynamic>);
-    } finally {
-      if (mounted) setState(() => _loading = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Container(
-          color: _panel,
-          padding: const EdgeInsets.all(10),
-          child: Row(
-            children: [
-              SegmentedButton<bool>(
-                segments: const [
-                  ButtonSegment(value: false, label: Text('Daily')),
-                  ButtonSegment(value: true, label: Text('Weekly')),
-                ],
-                selected: {_weekly},
-                onSelectionChanged: (value) {
-                  setState(() => _weekly = value.first);
-                  _load();
-                },
-              ),
-              const Spacer(),
-              TextButton.icon(
-                onPressed: _pick,
-                icon: const Icon(Icons.event),
-                label: Text(_iso(_date)),
-              ),
-            ],
-          ),
-        ),
-        if (_loading)
-          const LinearProgressIndicator(minHeight: 2, color: _mint),
-        Expanded(
-          child: _data == null
-              ? const Center(
-                  child: Text('No review available.',
-                      style: TextStyle(color: _muted)))
-              : _weekly
-                  ? _weeklyView()
-                  : _dailyView(),
-        ),
-      ],
-    );
-  }
-
-  Future<void> _pick() async {
-    final value = await showDatePicker(
-      context: context,
-      initialDate: _date,
-      firstDate: DateTime(2020),
-      lastDate: DateTime.now().add(const Duration(days: 1)),
-    );
-    if (value == null) return;
-    setState(() => _date = value);
-    _load();
-  }
-
-  Widget _dailyView() {
-    final metrics =
-        (_data!['metrics'] as Map<String, dynamic>?) ?? {};
-    return ListView(
-      padding: const EdgeInsets.all(14),
-      children: [
-        _metricGrid(metrics),
-        const SizedBox(height: 16),
-        SelectableText((_data!['report'] ?? '').toString(),
-            style:
-                const TextStyle(color: Colors.white70, height: 1.45)),
-        const SizedBox(height: 16),
-        FilledButton.icon(
-          onPressed: _generateCoach,
-          icon: const Icon(Icons.auto_awesome),
-          label: const Text('Generate Coach feedback in Daily room'),
-        ),
-      ],
-    );
-  }
-
-  Widget _weeklyView() {
-    final summary =
-        (_data!['summary'] as Map<String, dynamic>?) ?? {};
-    final days = (_data!['days'] as List?) ?? [];
-    return ListView(
-      padding: const EdgeInsets.all(14),
-      children: [
-        _metricGrid({
-          'active_minutes': summary['active_minutes'],
-          'events': summary['events'],
-          'focus_score': summary['average_focus_score'],
-          'switches': summary['switches'],
-        }),
-        const SizedBox(height: 18),
-        const Text('Daily trend',
-            style: TextStyle(
-                color: _mint, fontWeight: FontWeight.w700)),
-        ...days.map((day) => ListTile(
-              title: Text(day['date'].toString(),
-                  style: const TextStyle(color: Colors.white)),
-              subtitle: Text(
-                  '${day['active_minutes']} min · ${day['events']} events',
-                  style: const TextStyle(color: _muted)),
-              trailing: Text('${day['focus_score']}/100',
-                  style: const TextStyle(color: _mint)),
-            )),
-      ],
-    );
-  }
-
-  Widget _metricGrid(Map<String, dynamic> metrics) {
-    final items = [
-      ('Active', '${metrics['active_minutes'] ?? 0} min'),
-      ('Events', '${metrics['events'] ?? 0}'),
-      ('Focus', '${metrics['focus_score'] ?? 0}/100'),
-      ('Switches', '${metrics['switches'] ?? 0}'),
-    ];
-    return Wrap(
-      spacing: 9,
-      runSpacing: 9,
-      children: items
-          .map((item) => Container(
-                width: 145,
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                    color: _panelRaised,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: _line)),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(item.$1,
-                        style:
-                            const TextStyle(color: _muted, fontSize: 11)),
-                    Text(item.$2,
-                        style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 18,
-                            fontWeight: FontWeight.w700)),
-                  ],
-                ),
-              ))
-          .toList(),
-    );
-  }
-
-  Future<void> _generateCoach() async {
-    final resp = await http.post(Uri.parse(
-        '${widget.apiBase}/rooms/daily/report?date=${_iso(_date)}&post=true'));
-    if (resp.statusCode == 200 && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Coach report posted to Daily')));
     }
   }
 }

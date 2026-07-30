@@ -33,6 +33,7 @@ from providers.tts.kokoro.kokoro_tts import (
 )
 from vector_store.activity_logger import ActivityLogger
 from sources.screen import RealtimeScreenCapture
+from sources.idle import InputIdleGate
 from sources.camera_manager import CameraManager
 from sources.clips import ClipStore, parse_range, valid_clip_id
 from sources.frame_budget import fit_frames, frames_as_video
@@ -45,9 +46,31 @@ from memory.retrieval.evidence import EvidenceRetriever
 from tools.registry import ToolRegistry, register_default_tools
 from agents.proactive import ProactiveNarrator
 from agents.personal_agents import AGENTS as PERSONAL_AGENTS, get_agent
+from agents.agent_runtime import AgentRuntime, AgentRuntimeUnavailable
+from agents.conversation_manager import ConversationManager
+from agents.graph_tools import graph_toolset_factory
+from agents.schemas import PlanEvaluation, PlanProposal
+from agents.tomorrow_planner import (
+    TomorrowPlanStore,
+    lock_at as tomorrow_plan_lock_at,
+    plan_phase as tomorrow_plan_phase,
+)
 from memory.notifications import NotificationCenter
 from memory.personal import PersonalMemory, learn_from_user_message
 from memory.rooms.scope import RoomScopeError, resolve_camera_scope
+from memory.summary.reports import (
+    PERIOD_DAYS,
+    PRODUCTIVITY_DOMAIN,
+    BaselineError,
+    PeriodError,
+    compare as compare_periods,
+    date_range,
+    period_window,
+    pivot_series,
+    previous_window,
+    resolve_baseline,
+    series_activities,
+)
 
 
 load_dotenv()
@@ -126,6 +149,13 @@ async def add_utf8_charset(request: Request, call_next):
 _chat_history = []
 _current_context = "talker"
 vlm_model = None
+agent_runtime = AgentRuntime(
+    client=client,
+    # Resolved lazily: the graph connects during startup, after this point.
+    local_toolsets=graph_toolset_factory(lambda: neo4j_store),
+)
+conversation_manager = ConversationManager(
+    client=client, model_name=lambda: vlm_model, agent_runtime=agent_runtime)
 screen_stream = None
 camera_manager = None
 camera_bootstrap_task = None
@@ -133,6 +163,8 @@ source_capture_settings = SourceCaptureSettings()
 proactive = None
 mobile_activity_task = None
 daily_report_task = None  # nightly Coach report scheduler
+tomorrow_planner_task = None
+tomorrow_plan_store = TomorrowPlanStore()
 memory_pipeline = None   # Step-a: live sessions/events/knowledge pipeline
 neo4j_store = None       # optional graph sink for the live pipeline
 personal_memory = PersonalMemory(
@@ -306,6 +338,7 @@ def validate_configuration():
 async def startup_event():
     global vlm_model, screen_stream, camera_manager, camera_bootstrap_task
     global proactive, mobile_activity_task, daily_report_task, clip_retention_task
+    global tomorrow_planner_task
     global memory_pipeline, neo4j_store
 
     validate_configuration()
@@ -342,6 +375,14 @@ async def startup_event():
     else:
         logger.info("Proactive narrator disabled.")
 
+    # Keyboard/mouse presence, shared by the capture loop (which stops capturing
+    # while the user is away) and the timeline (which stops crediting time).
+    # INPUT_IDLE_TIMEOUT_SECONDS=0 opts out of both.
+    screen_idle_gate = InputIdleGate()
+    logger.info("Input idle cut-off: %s",
+                f"{screen_idle_gate.timeout_seconds:.0f}s"
+                if screen_idle_gate.enabled else "disabled")
+
     # Step-a: optional live memory pipeline (sessions/events/knowledge + stores).
     # Fully opt-in — unset LIVE_MEMORY leaves the legacy per-minute path unchanged.
     if env_bool("LIVE_MEMORY", True):
@@ -365,6 +406,10 @@ async def startup_event():
             jsonl=True,                        # keep /debug/timeline populated
             notification_sink=notify_from_event,
             personal_memory=personal_memory,
+            # Screen time is the user's time: an event ends no later than the
+            # keyboard/mouse cut-off after they last touched the machine, so a
+            # window left in the foreground can't collect the hours they were away.
+            idle_grace_seconds=screen_idle_gate.timeout_seconds or None,
         )
         logger.info("LIVE_MEMORY enabled (graph=%s).", neo4j_store is not None)
     else:
@@ -401,6 +446,7 @@ async def startup_event():
             insight_callback=insight_callback,
             pipeline=memory_pipeline,
             clip_store=clip_store,
+            idle_gate=screen_idle_gate,
         )
         logger.info("Screen capture enabled (monitor=%d).", screen_stream.monitor_index)
     else:
@@ -441,6 +487,13 @@ async def startup_event():
         logger.info("Daily report scheduled for %02d:%02d local.",
                     env_int("DAILY_REPORT_HOUR", 23, minimum=0),
                     env_int("DAILY_REPORT_MINUTE", 30, minimum=0))
+    if neo4j_store is not None and env_bool("TOMORROW_PLANNER_ENABLED", True):
+        tomorrow_planner_task = asyncio.create_task(
+            run_tomorrow_planner_scheduler()
+        )
+        logger.info(
+            "Tomorrow planner scheduled (proposal 23:00, tracking 10:30)."
+        )
 
 
 async def run_clip_retention():
@@ -488,9 +541,259 @@ async def run_daily_report_scheduler():
             logger.warning("Scheduled daily report failed: %s", exc)
 
 
+PLANNER_ROOM = "agent:tomorrow-planner"
+
+PLANNER_PROPOSAL_SHAPE = """Return ONLY JSON:
+{
+  "summary": "one concise sentence explaining the predicted focus",
+  "tasks": [
+    {
+      "title": "specific observable task",
+      "priority": "high|medium|low",
+      "estimated_minutes": 30,
+      "rationale": "brief evidence-grounded reason"
+    }
+  ]
+}"""
+
+PLANNER_EVALUATION_SHAPE = """Return ONLY JSON:
+{
+  "completions": [
+    {"task_id": "exact id", "completed": true, "evidence": "direct evidence"}
+  ],
+  "assessment": "2-3 concise sentences: progress, risk, and next best task"
+}"""
+
+
+def _planner_activity_context(target_date, days=7):
+    target = datetime.date.fromisoformat(target_date)
+    end = min(datetime.date.today(), target - datetime.timedelta(days=1))
+    history = []
+    for offset in range(days):
+        day = end - datetime.timedelta(days=offset)
+        ds = day.isoformat()
+        metrics = neo4j_store.daily_metrics(ds)
+        claims = neo4j_store.day_claims(ds, limit=12)
+        if metrics.get("events") or claims:
+            history.append({"date": ds, "metrics": metrics, "claims": claims})
+    return history
+
+
+def _planner_fallback_tasks(history):
+    projects = []
+    for day in history:
+        for item in day["metrics"].get("by_project", []):
+            name = str(item.get("project") or "").strip()
+            if name and name not in projects:
+                projects.append(name)
+    tasks = [
+        {
+            "title": f"Continue focused work on {name}",
+            "priority": "high" if index == 0 else "medium",
+            "estimated_minutes": 90,
+            "rationale": "This was an active recent project.",
+        }
+        for index, name in enumerate(projects[:3])
+    ]
+    if not tasks:
+        tasks.append({
+            "title": "Review current priorities and choose one focused outcome",
+            "priority": "high",
+            "estimated_minutes": 30,
+            "rationale": "There was not enough recent activity evidence for a "
+                         "more specific prediction.",
+        })
+    tasks.append({
+        "title": "Review progress and prepare the next concrete step",
+        "priority": "medium",
+        "estimated_minutes": 20,
+        "rationale": "Close the day with an explicit continuation point.",
+    })
+    return tasks
+
+
+def _planner_message(plan, heading="Tomorrow's proposed plan"):
+    lines = [f"## {heading} — {plan['date']}", "", plan.get("summary") or ""]
+    for task in plan["tasks"]:
+        lines.append(
+            f"- [ ] {task['title']} "
+            f"({task['estimated_minutes']} min, {task['priority']})"
+        )
+    lines.append(
+        "\nEditable until 10:30 AM on the target day; tracking starts after that."
+    )
+    return "\n".join(lines)
+
+
+async def generate_tomorrow_plan(date_str=None):
+    if neo4j_store is None:
+        raise RuntimeError("graph not enabled")
+    target = date_str or (
+        datetime.date.today() + datetime.timedelta(days=1)
+    ).isoformat()
+    datetime.date.fromisoformat(target)
+    existing = tomorrow_plan_store.get(target)
+    if existing:
+        return existing
+    history = _planner_activity_context(target)
+    compact = []
+    for day in history:
+        metrics = day["metrics"]
+        compact.append({
+            "date": day["date"],
+            "active_minutes": metrics.get("active_minutes"),
+            "focus_score": metrics.get("focus_score"),
+            "activities": metrics.get("by_activity", [])[:6],
+            "projects": metrics.get("by_project", [])[:8],
+            "apps": metrics.get("by_app", [])[:8],
+            "accomplishments": [
+                claim.get("text") for claim in day["claims"][:10]
+            ],
+        })
+    prompt = f"""You are predicting a realistic plan for the user's next day,
+{target}, from their recent observed activity.
+{PLANNER_PROPOSAL_SHAPE}
+Create 3-7 tasks. Prefer unfinished or recurring work and concrete outcomes over
+vague productivity advice. Keep the total workload realistic. Do not invent
+deadlines, meetings, or obligations not supported by the evidence.
+
+Recent activity:
+{json.dumps(compact, ensure_ascii=False)}
+"""
+    summary = ""
+    tasks = []
+    try:
+        result = await conversation_manager.complete(
+            room_id=PLANNER_ROOM,
+            room=neo4j_store.get_room(PLANNER_ROOM),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=900,
+            output_type=PlanProposal,
+            # The evidence is already assembled above; tools would only add
+            # round trips to a one-shot extraction.
+            allow_agent=False,
+        )
+        proposal = result.output
+        summary = proposal.summary.strip()
+        tasks = [task.model_dump() for task in proposal.tasks]
+    except Exception as exc:
+        logger.warning("Tomorrow plan generation failed, using fallback: %s", exc)
+    if not tasks:
+        tasks = _planner_fallback_tasks(history)
+        summary = (
+            "A conservative continuation plan based on recent projects."
+        )
+    plan = tomorrow_plan_store.save_generated(target, summary, tasks)
+    neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
+    neo4j_store.add_message(
+        "agent:tomorrow-planner", "planner", _planner_message(plan)
+    )
+    return plan
+
+
+async def evaluate_tomorrow_plan(date_str=None):
+    if neo4j_store is None:
+        raise RuntimeError("graph not enabled")
+    target = date_str or datetime.date.today().isoformat()
+    plan = tomorrow_plan_store.get(target)
+    if plan is None:
+        raise KeyError("plan not found")
+    if tomorrow_plan_phase(plan) == "draft":
+        raise ValueError("tracking begins at 10:30 AM")
+    metrics = neo4j_store.daily_metrics(target)
+    claims = neo4j_store.day_claims(target, limit=40)
+    evidence = {
+        "metrics": metrics,
+        "claims": [item.get("text") for item in claims],
+    }
+    prompt = f"""Evaluate today's observed activity against the user's finalized
+task plan.
+{PLANNER_EVALUATION_SHAPE}
+Mark a task complete ONLY when the activity directly demonstrates its outcome.
+Mere app usage, related browsing, or partial work is not completion. Omit tasks
+without enough evidence.
+
+Plan:
+{json.dumps(plan["tasks"], ensure_ascii=False)}
+
+Observed activity:
+{json.dumps(evidence, ensure_ascii=False)}
+"""
+    completions = []
+    assessment = "No reliable activity evidence is available yet."
+    try:
+        result = await conversation_manager.complete(
+            room_id=PLANNER_ROOM,
+            room=neo4j_store.get_room(PLANNER_ROOM),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=700,
+            output_type=PlanEvaluation,
+            allow_agent=False,  # one-shot extraction over the evidence above
+        )
+        evaluation = result.output
+        completions = [item.model_dump() for item in evaluation.completions]
+        assessment = evaluation.assessment.strip() or assessment
+    except Exception as exc:
+        logger.warning("Tomorrow plan evaluation failed: %s", exc)
+    updated, changed = tomorrow_plan_store.apply_evaluation(
+        target, completions, assessment
+    )
+    if changed:
+        completed = [
+            task["title"] for task in updated["tasks"] if task["id"] in changed
+        ]
+        neo4j_store.add_message(
+            "agent:tomorrow-planner",
+            "planner",
+            "Automatically completed from activity evidence:\n- "
+            + "\n- ".join(completed)
+            + f"\n\n{assessment}",
+        )
+    return updated
+
+
+async def run_tomorrow_planner_scheduler():
+    """Propose at 23:00, lock at 10:30, then reassess every 30 minutes."""
+    evaluation_seconds = env_int(
+        "TOMORROW_PLAN_EVALUATION_SECONDS", 1800, minimum=300
+    )
+    while True:
+        now = datetime.datetime.now()
+        try:
+            if now.hour >= 23:
+                target = (now.date() + datetime.timedelta(days=1)).isoformat()
+                if tomorrow_plan_store.get(target) is None:
+                    await generate_tomorrow_plan(target)
+
+            today = now.date().isoformat()
+            plan = tomorrow_plan_store.get(today)
+            if plan and now >= tomorrow_plan_lock_at(today):
+                if not plan.get("finalized_at"):
+                    plan = tomorrow_plan_store.finalize(today)
+                    neo4j_store.add_message(
+                        "agent:tomorrow-planner",
+                        "planner",
+                        "The plan is now final. Tracking has started; tasks can "
+                        "be checked manually or completed from activity evidence.",
+                    )
+                last = float(plan.get("last_evaluated_at") or 0)
+                if time.time() - last >= evaluation_seconds:
+                    await evaluate_tomorrow_plan(today)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Tomorrow planner scheduler pass failed: %s", exc)
+        await asyncio.sleep(60)
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
-    for task in (mobile_activity_task, daily_report_task, clip_retention_task):
+    for task in (
+        mobile_activity_task,
+        daily_report_task,
+        tomorrow_planner_task,
+        clip_retention_task,
+    ):
         if task is None:
             continue
         task.cancel()
@@ -845,6 +1148,12 @@ async def rooms_list(include_archived: bool = False):
     return {"rooms": neo4j_store.list_rooms(include_archived=include_archived)}
 
 
+@app.get("/agent-runtime/status")
+async def agent_runtime_status():
+    """Report opt-in agent routing without opening any MCP connections."""
+    return agent_runtime.status()
+
+
 @app.post("/rooms")
 async def rooms_create(request: Request):
     """Create a user-managed topic room with optional routing matchers."""
@@ -989,22 +1298,27 @@ async def daily_report(date: str = None, post: bool = True):
     from memory.summary.coach import format_report, coach_prompt
 
     ds = date or _today_iso()
+    # Screen-only, like every report: what the cameras saw is not the user's work.
     metrics = neo4j_store.daily_metrics(ds)
     claims = neo4j_store.day_claims(ds, limit=8)
-    entities = neo4j_store.day_entities(ds, limit=12)
+    entities = neo4j_store.day_entities(ds, limit=12, domain=PRODUCTIVITY_DOMAIN)
+    comparison = compare_periods(
+        metrics, neo4j_store.range_metrics(*previous_window("daily", ds)))
 
     feedback = ""
     if metrics.get("events"):
         try:
             resp = await client.chat.completions.create(
                 model=vlm_model,
-                messages=[{"role": "user", "content": coach_prompt(metrics, claims)}],
+                messages=[{"role": "user", "content": coach_prompt(
+                    metrics, claims, comparison=comparison)}],
                 max_tokens=350)
             feedback = (resp.choices[0].message.content or "").strip()
         except Exception as exc:
             logger.warning("coach feedback LLM failed: %s", exc)
 
-    report = format_report(metrics, claims=claims, entities=entities)
+    report = format_report(metrics, claims=claims, entities=entities,
+                           comparison=comparison)
     if feedback:
         report += f"\n\n## Coach\n{feedback}"
 
@@ -1016,8 +1330,116 @@ async def daily_report(date: str = None, post: bool = True):
             "agent:creative-coach", "coach", report, ts=eod)
 
     return {"date": ds, "metrics": metrics, "feedback": feedback,
-            "report": report, "posted": posted,
+            "comparison": comparison, "report": report, "posted": posted,
             "posted_room_id": "agent:creative-coach" if posted else None}
+
+
+@app.get("/planner/plan")
+async def tomorrow_plan_get(date: str = None):
+    """Return a dated plan, or the plan most relevant at the current time."""
+    try:
+        plan = (
+            tomorrow_plan_store.get(date)
+            if date
+            else tomorrow_plan_store.active()
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return tomorrow_plan_store.payload(plan)
+
+
+@app.post("/planner/plan/generate")
+async def tomorrow_plan_generate(request: Request):
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    date_str = str(data.get("date") or "").strip() or (
+        datetime.date.today() + datetime.timedelta(days=1)
+    ).isoformat()
+    try:
+        plan = await generate_tomorrow_plan(date_str)
+    except (KeyError, RuntimeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return tomorrow_plan_store.payload(plan)
+
+
+@app.put("/planner/plans/{date_str}")
+async def tomorrow_plan_update(date_str: str, request: Request):
+    """Replace an editable draft's summary and ordered task list."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(
+            status_code=400, content={"error": f"invalid JSON: {exc}"}
+        )
+    if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
+        return JSONResponse(
+            status_code=400, content={"error": "tasks must be a list"}
+        )
+    try:
+        plan = tomorrow_plan_store.replace_draft(
+            date_str, data.get("summary"), data["tasks"]
+        )
+    except KeyError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    except ValueError as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    return tomorrow_plan_store.payload(plan)
+
+
+@app.patch("/planner/plans/{date_str}/tasks/{task_id}")
+async def tomorrow_plan_task_update(
+    date_str: str, task_id: str, request: Request
+):
+    """Manually check or uncheck a task without rewriting the plan."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(
+            status_code=400, content={"error": f"invalid JSON: {exc}"}
+        )
+    if not isinstance(data, dict) or not isinstance(data.get("completed"), bool):
+        return JSONResponse(
+            status_code=400, content={"error": "completed must be a boolean"}
+        )
+    plan = tomorrow_plan_store.get(date_str)
+    if plan is None:
+        return JSONResponse(status_code=404, content={"error": "plan not found"})
+    if tomorrow_plan_phase(plan) == "draft":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "manual tracking begins at 10:30 AM"},
+        )
+    try:
+        updated = tomorrow_plan_store.set_completed(
+            date_str, task_id, data["completed"]
+        )
+    except KeyError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    return tomorrow_plan_store.payload(updated)
+
+
+@app.post("/planner/plans/{date_str}/finalize")
+async def tomorrow_plan_finalize(date_str: str):
+    try:
+        plan = tomorrow_plan_store.finalize(date_str)
+    except KeyError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    return tomorrow_plan_store.payload(plan)
+
+
+@app.post("/planner/plans/{date_str}/evaluate")
+async def tomorrow_plan_evaluate(date_str: str):
+    try:
+        plan = await evaluate_tomorrow_plan(date_str)
+    except KeyError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    except (RuntimeError, ValueError) as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    return tomorrow_plan_store.payload(plan)
 
 
 @app.post("/rooms/hygiene/archive")
@@ -1546,17 +1968,32 @@ async def room_chat(room_id: str, request: Request):
             start=turn["start"], end=turn["end"], live=turn["live"])
     except RoomScopeError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
+    room = neo4j_store.get_room(room_id)
     try:
-        resp = await client.chat.completions.create(
-            model=vlm_model, messages=messages,
-            max_tokens=700 if get_agent(room_id) is not None else 500)
-        reply = resp.choices[0].message.content or ""
+        result = await conversation_manager.complete(
+            room_id=room_id,
+            room=room,
+            messages=messages,
+            max_tokens=700 if get_agent(room_id) is not None else 500,
+        )
+        reply = result.reply
+    except AgentRuntimeUnavailable as exc:
+        logger.warning("room_chat agent runtime unavailable: %s", exc)
+        return JSONResponse(status_code=503, content={"error": str(exc)})
     except Exception as exc:
         logger.warning("room_chat LLM failed: %s", exc)
         return JSONResponse(status_code=502, content={"error": f"chat failed: {exc}"})
 
     neo4j_store.add_message(room_id, "assistant", reply)
-    return {"room_id": room_id, "reply": reply, "citations": citations, **meta}
+    response = {
+        "room_id": room_id,
+        "reply": reply,
+        "citations": citations,
+        **meta,
+    }
+    if result.execution == "agent":
+        response.update({"execution": "agent", "agent": result.agent})
+    return response
 
 
 @app.post("/rooms/{room_id}/agent-check-in")
@@ -1572,16 +2009,23 @@ async def room_agent_check_in(room_id: str):
     try:
         messages, citations, meta = _room_chat_turn(
             room_id, agent.check_in)
-        resp = await client.chat.completions.create(
-            model=vlm_model, messages=messages, max_tokens=750)
-        reply = resp.choices[0].message.content or ""
+        room = neo4j_store.get_room(room_id)
+        result = await conversation_manager.complete(
+            room_id=room_id, room=room, messages=messages, max_tokens=750)
+        reply = result.reply
+    except AgentRuntimeUnavailable as exc:
+        logger.warning("agent check-in runtime unavailable (%s): %s", room_id, exc)
+        return JSONResponse(status_code=503, content={"error": str(exc)})
     except Exception as exc:
         logger.warning("agent check-in failed (%s): %s", room_id, exc)
         return JSONResponse(
             status_code=502, content={"error": f"check-in failed: {exc}"})
     neo4j_store.add_message(room_id, "assistant", reply)
-    return {"room_id": room_id, "reply": reply,
-            "citations": citations, **meta}
+    response = {"room_id": room_id, "reply": reply,
+                "citations": citations, **meta}
+    if result.execution == "agent":
+        response.update({"execution": "agent", "agent": result.agent})
+    return response
 
 
 @app.post("/rooms/{room_id}/chat/stream")
@@ -1602,6 +2046,21 @@ async def room_chat_stream(room_id: str, request: Request):
 
     def persist(reply):
         return neo4j_store.add_message(room_id, "assistant", reply)
+
+    room = neo4j_store.get_room(room_id)
+    if conversation_manager.uses_agent(room_id, room):
+        return StreamingResponse(
+            _stream_agent_reply(
+                room_id=room_id,
+                room=room,
+                messages=messages,
+                citations=citations,
+                on_complete=persist,
+                max_tokens=700 if get_agent(room_id) is not None else 500,
+                meta=meta,
+            ),
+            media_type="application/x-ndjson",
+        )
 
     return StreamingResponse(
         _stream_reply(
@@ -2057,6 +2516,45 @@ async def assistant_conversation_message(conversation_id: str, request: Request)
     return {"reply": reply, "citations": citations, "message": saved}
 
 
+async def _stream_agent_reply(
+        room_id, room, messages, citations, on_complete, max_tokens=700, meta=None):
+    """NDJSON-compatible agent response including MCP tool results.
+
+    The agent loop may make several model/tool round trips before text exists.
+    We therefore preserve the room stream contract and emit the completed answer
+    as one delta, with the tool trace attached to the final event.
+    """
+    yield json.dumps({"type": "citations", "citations": citations,
+                      "execution": "agent", **(meta or {})}) + "\n"
+    try:
+        result = await conversation_manager.complete(
+            room_id=room_id,
+            room=room,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+    except Exception as exc:
+        logger.warning("streaming room agent failed: %s", exc)
+        yield json.dumps({"type": "error", "error": str(exc)}) + "\n"
+        return
+
+    reply = result.reply
+    if reply:
+        yield json.dumps({"type": "delta", "text": reply}) + "\n"
+    saved = None
+    try:
+        saved = on_complete(reply)
+    except Exception as exc:
+        logger.warning("persisting streamed agent reply failed: %s", exc)
+    yield json.dumps({
+        "type": "done",
+        "reply": reply,
+        "message": saved,
+        "execution": result.execution,
+        "agent": result.agent or None,
+    }) + "\n"
+
+
 async def _stream_reply(messages, citations, on_complete, max_tokens=700, meta=None):
     """NDJSON token stream, citations first.
 
@@ -2139,6 +2637,86 @@ async def memory_alias_delete(alias_id: str):
     return {"deleted": True, "alias_id": alias_id}
 
 
+PERIOD_HEADINGS = {"daily": "Daily report", "weekly": "Weekly report",
+                   "monthly": "Monthly report"}
+
+
+@app.get("/reports/activity")
+async def report_activity(period: str = "daily", date: str = None,
+                         compare: bool = True, include_home: bool = False,
+                         baseline: str = "previous", baseline_date: str = None,
+                         baseline_start: str = None, baseline_end: str = None):
+    """One activity report: metrics, per-day/per-activity series, and text.
+
+    The single endpoint behind the Reports view. `period` picks the window
+    (daily/weekly/monthly, all ending on `date`), `compare` adds a baseline to
+    hold it against. Screen-only unless `include_home` is set — productivity is a
+    screen measurement, and a camera watching the hallway is not the user working.
+
+    `baseline` chooses what that comparison is measured against:
+      previous  the same-length window immediately before (default)
+      day       one chosen day (`baseline_date`)
+      range     a chosen window (`baseline_start`/`baseline_end`), averaged per
+                active day — and the current window is averaged the same way, so
+                "yesterday vs last month" compares two typical days.
+    """
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    from memory.summary.coach import format_report
+
+    try:
+        start, end = period_window(period, date or _today_iso())
+    except PeriodError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid date: {exc}"})
+
+    domain = None if include_home else PRODUCTIVITY_DOMAIN
+    metrics = neo4j_store.range_metrics(start, end, domain=domain)
+    series = pivot_series(
+        neo4j_store.activity_series(start, end, domain=domain), start, end)
+
+    comparison = None
+    if compare:
+        try:
+            base_start, base_end, averaged = resolve_baseline(
+                baseline, period, start, baseline_date=baseline_date,
+                baseline_start=baseline_start, baseline_end=baseline_end)
+        except BaselineError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        comparison = compare_periods(
+            metrics, neo4j_store.range_metrics(base_start, base_end, domain=domain),
+            averaged=averaged, mode=baseline)
+
+    # Claims and entities are day-scoped in the graph, so a multi-day window
+    # gathers them across its days, newest first. Only days the series shows as
+    # active are queried — a 30-day window is otherwise 60 round trips, most of
+    # them asking empty days for nothing.
+    claims, entities = [], []
+    active_days = [d["date"] for d in series if d["total_minutes"] > 0]
+    for day in reversed(active_days):
+        if len(claims) >= 12 and len(entities) >= 12:
+            break
+        claims.extend(neo4j_store.day_claims(day, limit=6, domain=domain))
+        entities.extend(neo4j_store.day_entities(day, limit=8, domain=domain))
+    seen = set()
+    entities = [e for e in entities
+                if not (e["name"] in seen or seen.add(e["name"]))][:12]
+
+    return {
+        "period": period, "period_days": PERIOD_DAYS[period],
+        "start_date": start, "end_date": end,
+        "domain": domain, "metrics": metrics,
+        "series": series, "activities": series_activities(series),
+        "by_activity": metrics.get("by_activity", []),
+        "comparison": comparison, "claims": claims[:12], "entities": entities,
+        "report": format_report(
+            metrics, claims=claims[:12], entities=entities,
+            heading=PERIOD_HEADINGS[period], comparison=comparison,
+            series=series),
+    }
+
+
 @app.get("/reviews/daily")
 async def review_daily(date: str = None):
     if neo4j_store is None:
@@ -2147,7 +2725,7 @@ async def review_daily(date: str = None):
     day = date or _today_iso()
     metrics = neo4j_store.daily_metrics(day)
     claims = neo4j_store.day_claims(day, limit=8)
-    entities = neo4j_store.day_entities(day, limit=12)
+    entities = neo4j_store.day_entities(day, limit=12, domain=PRODUCTIVITY_DOMAIN)
     return {"date": day, "metrics": metrics, "claims": claims,
             "entities": entities,
             "report": format_report(metrics, claims=claims, entities=entities)}
@@ -2158,19 +2736,16 @@ async def review_weekly(end_date: str = None):
     if neo4j_store is None:
         return JSONResponse(status_code=400, content={"error": "graph not enabled"})
     try:
-        end = datetime.date.fromisoformat(end_date) if end_date else datetime.date.today()
+        start, end = period_window("weekly", end_date or _today_iso())
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": f"invalid date: {exc}"})
-    days = []
-    for offset in range(6, -1, -1):
-        day = end - datetime.timedelta(days=offset)
-        days.append(neo4j_store.daily_metrics(day.isoformat()))
+    days = [neo4j_store.daily_metrics(day) for day in date_range(start, end)]
     active = sum(day.get("active_minutes") or 0 for day in days)
     events = sum(day.get("events") or 0 for day in days)
     switches = sum(day.get("switches") or 0 for day in days)
     focus_days = [day.get("focus_score") or 0 for day in days if day.get("events")]
     return {
-        "start_date": days[0]["date"], "end_date": days[-1]["date"], "days": days,
+        "start_date": start, "end_date": end, "days": days,
         "summary": {
             "active_minutes": round(active, 1), "events": events,
             "switches": switches,

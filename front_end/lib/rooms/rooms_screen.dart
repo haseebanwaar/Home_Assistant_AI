@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 
 import '../voice/dictation_controller.dart';
 import '../network/http_json.dart';
+import 'tomorrow_plan_screen.dart';
 
 const _ink = Color(0xFF070B14);
 const _panel = Color(0xFF111827);
@@ -47,6 +48,8 @@ IconData _kindIcon(String kind, String name, [String? configured]) {
       return Icons.lightbulb_outline;
     case 'menu_book':
       return Icons.menu_book;
+    case 'event_note':
+      return Icons.event_note;
   }
   switch (kind) {
     case 'daily':
@@ -161,6 +164,16 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
   }
 
   void _open(Map<String, dynamic> room) {
+    if (room['room_id'] == 'agent:tomorrow-planner') {
+      Navigator.of(context)
+          .push(
+            MaterialPageRoute(
+              builder: (_) => TomorrowPlanScreen(apiBase: widget.apiBase),
+            ),
+          )
+          .then((_) => _load());
+      return;
+    }
     Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => RoomScreen(
         apiBase: widget.apiBase,

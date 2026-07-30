@@ -27,6 +27,9 @@ Thumbs.db
 # Environment variables
 .env
 
+# Local MCP server config (may launch local processes / hold tokens)
+mcp.config.json
+
 # Compiled files
 *.out
 *.class

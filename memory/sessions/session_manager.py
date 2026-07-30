@@ -13,6 +13,14 @@ is fixed to the next event's span_start the moment that next event opens
 (incremental close), so consecutive events share edges with no gaps/overlaps.
 `finalize()` extends the last still-open event by a tail so it has real duration.
 
+Tiling is capped by `idle_grace_seconds`. Tiling assumes the gap between two
+observations was spent doing the outgoing thing, which is true for a switch a
+minute later and false for a machine left alone overnight — that is how a window
+nobody touched collects hours. When a grace is set, an event ends no later than
+`last known user activity + grace`, so an unattended gap is simply not counted
+and the timeline has a hole where the user was away. Callers that have no input
+signal (cameras: nobody is at the keyboard) leave it None and keep full tiling.
+
 Sessions key on (application, project_id) — NOT the VLM's per-minute
 activity_type, which jitters and would shatter one continuous window into several
 sessions. activity_type is instead a session property set to the dominant label
@@ -55,15 +63,22 @@ def _det_event_id(session_id, span_start):
 
 
 class SessionManager:
-    def __init__(self, id_strategy="counter"):
+    def __init__(self, id_strategy="counter", idle_grace_seconds=None):
         if id_strategy not in ("counter", "deterministic"):
             raise ValueError(f"unknown id_strategy: {id_strategy}")
         self.id_strategy = id_strategy
+        # None disables the cap and restores pure tiling (see module docstring).
+        self.idle_grace_seconds = (None if idle_grace_seconds is None
+                                   else max(0.0, float(idle_grace_seconds)))
         self.sessions = {}          # session_key -> Session
         self.events: List[Event] = []  # chronological
         self._order = []            # session_key insertion order
         self._current_key = None
         self._current_event: Optional[Event] = None
+        # event_id -> the latest moment the user was known to be present during
+        # it. Kept here rather than on Event so the stored graph shape is
+        # unchanged; only span_end (which it caps) is persisted.
+        self._active_until = {}
         self._sid = 0
         self._eid = 0
         self._finalized = False
@@ -84,9 +99,31 @@ class SessionManager:
         self._eid += 1
         return f"evt-{self._eid}"
 
-    def observe(self, timestamp, activity_type, application,
-                project_id=None, boundary_label="append", summary="") -> ObserveResult:
-        """Ingest one chronological observation; returns what changed."""
+    def _close_event(self, event, at):
+        """End `event` at `at`, capped by the idle grace, and refresh its span.
+
+        Must be called before `event.span_end` is overwritten: the current value
+        is the last observation this event saw, which is the fallback for when the
+        user was last known to be present.
+        """
+        limit = None
+        if self.idle_grace_seconds is not None:
+            active_until = self._active_until.get(event.event_id, event.span_end)
+            limit = active_until + self.idle_grace_seconds
+        end = at if limit is None else min(at, limit)
+        # An event never runs backwards, however the caps land.
+        event.span_end = max(end, event.span_start)
+        event.span_seconds = round(event.span_end - event.span_start, 3)
+
+    def observe(self, timestamp, activity_type, application, project_id=None,
+                boundary_label="append", summary="",
+                active_until=None) -> ObserveResult:
+        """Ingest one chronological observation; returns what changed.
+
+        `active_until` is the wall-clock time the user was last known to be at the
+        keyboard (sources.idle). It defaults to `timestamp` — i.e. "present now" —
+        which is the right assumption for any caller without an input signal.
+        """
         key = self._key(application, project_id)
         switching = key != self._current_key
 
@@ -118,8 +155,7 @@ class SessionManager:
             # begins, giving it a final, non-overlapping span.
             if self._current_event is not None:
                 closed_event = self._current_event
-                closed_event.span_end = timestamp
-                closed_event.span_seconds = round(closed_event.span_end - closed_event.span_start, 3)
+                self._close_event(closed_event, timestamp)
 
             event = Event(
                 event_id=self._new_event_id(session.session_id, timestamp),
@@ -137,6 +173,12 @@ class SessionManager:
                 self._current_event.span_end - self._current_event.span_start, 3)
             if summary and not self._current_event.summary:
                 self._current_event.summary = summary
+
+        # Remember the newest evidence that the user was present during this
+        # event; it is what caps the event's end if a long gap follows.
+        presence = timestamp if active_until is None else float(active_until)
+        eid = self._current_event.event_id
+        self._active_until[eid] = max(self._active_until.get(eid, presence), presence)
 
         session.end = timestamp
         self._current_key = key
@@ -180,12 +222,11 @@ class SessionManager:
 
         # Re-assert tiling (no-op if already tiled) then extend the last event
         # (whose span_end is currently the last observation timestamp) by a tail.
+        # Both go through _close_event so the idle cap is applied here too —
+        # re-tiling blindly would hand every unattended gap straight back.
         for k in range(len(evs) - 1):
-            evs[k].span_end = evs[k + 1].span_start
-        evs[-1].span_end = evs[-1].span_end + tail_seconds
-
-        for e in evs:
-            e.span_seconds = round(e.span_end - e.span_start, 3)
+            self._close_event(evs[k], evs[k + 1].span_start)
+        self._close_event(evs[-1], evs[-1].span_end + tail_seconds)
 
         for s in self.sessions.values():
             self._rollup(s)

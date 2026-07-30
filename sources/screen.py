@@ -24,6 +24,7 @@ from sources.capture_settings import (
     expected_frame_count,
     validate_capture_profile,
 )
+from sources.idle import InputIdleGate
 
 # Windows-only PID lookup for the active window (Step 1: process_name capture).
 try:
@@ -57,7 +58,7 @@ def _process_for_hwnd(hwnd):
 class RealtimeScreenCapture:
     def __init__(self, video_source,model_name_vlm, window_size=60, fps=1.0, monitor_index=1, target_resolution=None,
                  activity_logger=None, insight_callback=None, start_capture=True, pipeline=None,
-                 clip_store=None):
+                 clip_store=None, idle_gate=None):
         """
         Args:
             video_source: screen (not used)
@@ -66,6 +67,8 @@ class RealtimeScreenCapture:
             monitor_index: the index of the monitor to capture (default 1 for primary)
             target_resolution: a tuple of (width, height) for resizing, or None to keep original resolution
             activity_logger: an instance of ActivityLogger to log each minute of activity
+            idle_gate: an InputIdleGate; minutes with no keyboard/mouse activity
+                for longer than its timeout are not captured at all
         """
         self.video_source = video_source
         self.fps, self.window_size = validate_capture_profile(
@@ -111,6 +114,13 @@ class RealtimeScreenCapture:
         # static reading/watching is still remembered. 0 disables. Default 3.
         self.heartbeat_minutes = int(os.getenv("HEARTBEAT_MINUTES", "3"))
         self._idle_minutes = 0
+        # Keyboard/mouse presence. A static screen is not the same as an absent
+        # user — the heartbeat above exists precisely to remember static reading —
+        # so what counts as "away" is input, not pixels. Minutes past the cut-off
+        # are dropped entirely: nothing captured, nothing timed, nothing to
+        # attribute to whichever window happened to be in front.
+        self.idle_gate = idle_gate if idle_gate is not None else InputIdleGate()
+        self._away_minutes = 0
         # Only record the active window if its center is inside the captured
         # monitor. Off by default: on multi-monitor / DPI-scaled setups the
         # coordinate systems mismatch and this drops valid titles, collapsing
@@ -338,9 +348,11 @@ Create a retrievable memory record that preserves what matters most for future r
 
         return base64_video
 
-    def _enqueue_batch(self, frames, timestamp, window_titles, process_names):
+    def _enqueue_batch(self, frames, timestamp, window_titles, process_names,
+                       last_input_at=None):
         """Put a batch in the 1-slot mailbox, coalescing (dropping) any pending one."""
-        payload = (frames, timestamp, list(window_titles), list(process_names))
+        payload = (frames, timestamp, list(window_titles), list(process_names),
+                   last_input_at)
         with self._mailbox_lock:
             if self._mailbox is not None:
                 self._dropped_batches += 1
@@ -364,7 +376,8 @@ Create a retrievable memory record that preserves what matters most for future r
             except Exception as exc:
                 logger.exception("batch processing failed: %s", exc)
 
-    def _process_batch(self, imgs, timestamp, window_titles, process_names):
+    def _process_batch(self, imgs, timestamp, window_titles, process_names,
+                       last_input_at=None):
         """Extract + (live) feed the memory pipeline for one batch."""
         logger.debug('Screen buffer %s processing started', timestamp)
         do_structured = self.structured_extraction or self.pipeline is not None
@@ -408,6 +421,7 @@ Create a retrievable memory record that preserves what matters most for future r
                     "process_names": list(process_names),
                     "repr_frame": imgs[-1] if imgs else None,
                     "clip_id": clip_id,
+                    "last_input_at": last_input_at,
                     "extraction": {**result.model_dump(), "selected_profile": profile_name},
                 })
                 if clip_id and self.clip_store is not None:
@@ -560,6 +574,36 @@ Create a retrievable memory record that preserves what matters most for future r
                         self.frame_buffer.clear()
                         self.frame_buffer.extend(overlap_frames)
 
+                    idle_state = self.idle_gate.state()
+                    if idle_state.idle:
+                        # Away: drop the minute. The per-minute window state goes
+                        # too, so the first minute back opens a fresh event rather
+                        # than extending the one the user walked away from.
+                        self._away_minutes += 1
+                        if self._away_minutes == 1:
+                            logger.info(
+                                "No keyboard/mouse input for %.0fs (> %.0fs) — "
+                                "capture paused until the user is back.",
+                                idle_state.idle_seconds,
+                                self.idle_gate.timeout_seconds)
+                        self.current_minute_apps = list()
+                        self.current_minute_processes = list()
+                        self._idle_minutes = 0
+                        last_frame = None
+                        with self.lock:
+                            # Drop the overlap frames as well — they are from
+                            # before the user left and would leak into the first
+                            # batch after they return.
+                            self.frame_buffer.clear()
+                        next_batch_at = time.monotonic() + self.window_size
+                        self._profile_changed.wait(1.0 / self.fps)
+                        self._profile_changed.clear()
+                        continue
+                    if self._away_minutes:
+                        logger.info("User back after %d away minute(s) — resuming capture.",
+                                    self._away_minutes)
+                        self._away_minutes = 0
+
                     enough_activity = len(frames) > 2
                     active_window = bool(self.current_minute_apps)
                     if enough_activity:
@@ -589,7 +633,8 @@ Create a retrievable memory record that preserves what matters most for future r
                             self.recorder.record_batch(frames_to_process, batch_ts, titles, procs)
                         # Live processing via the coalescing mailbox (worker drains it).
                         if self._need_process:
-                            self._enqueue_batch(frames_to_process, batch_ts, titles, procs)
+                            self._enqueue_batch(frames_to_process, batch_ts, titles,
+                                                procs, idle_state.last_input_at)
                         # Reset for the next minute, keeping the last title/process
                         # as carryover (the worker uses the snapshot above).
                         self.current_minute_apps = self.current_minute_apps[-1:]
@@ -666,7 +711,13 @@ Create a retrievable memory record that preserves what matters most for future r
 
     def status(self):
         alive = self.capture_thread is not None and self.capture_thread.is_alive()
+        idle_state = self.idle_gate.state()
         return {
+            "input_idle_seconds": (None if idle_state.idle_seconds is None
+                                   else round(idle_state.idle_seconds, 1)),
+            "input_idle_timeout_seconds": self.idle_gate.timeout_seconds,
+            "user_away": idle_state.idle,
+            "away_minutes": self._away_minutes,
             "configured": True,
             "healthy": self.healthy and alive and not self.paused,
             "running": self.running,
