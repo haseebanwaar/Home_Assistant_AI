@@ -727,7 +727,11 @@ class Neo4jStore:
                 "MATCH (r:Room) RETURN r.room_id AS room_id, r.name AS name, "
                 "r.kind AS kind, r.auto AS auto, r.matcher_json AS matcher_json, "
                 "r.description AS description, r.color AS color, r.icon AS icon, "
-                "r.instructions AS instructions, "
+                "r.instructions AS instructions, r.assistant_mode AS assistant_mode, "
+                "r.agent_tools_json AS agent_tools_json, "
+                "r.agent_workspace AS agent_workspace, "
+                "r.agent_request_limit AS agent_request_limit, "
+                "r.agent_tool_calls_limit AS agent_tool_calls_limit, "
                 "r.archived AS archived, r.pinned AS pinned, r.position AS position, "
                 "r.created_at AS created_at, r.updated_at AS updated_at"):
             matcher = RoomMatcher()
@@ -736,11 +740,22 @@ class Neo4jStore:
                     matcher = RoomMatcher(**_json.loads(r["matcher_json"]))
                 except Exception:
                     pass
+            try:
+                agent_tools = _json.loads(r.get("agent_tools_json") or "[]")
+            except (TypeError, ValueError):
+                agent_tools = []
             rooms.append(Room(room_id=r["room_id"], name=r.get("name") or r["room_id"],
                                kind=r.get("kind") or "topic",
                                auto=bool(r.get("auto")), matcher=matcher,
                                description=r.get("description") or "",
                                instructions=r.get("instructions") or "",
+                               assistant_mode=r.get("assistant_mode") or "chat",
+                               agent_tools=agent_tools,
+                               agent_workspace=r.get("agent_workspace") or "",
+                               agent_request_limit=int(
+                                   r.get("agent_request_limit") or 0),
+                               agent_tool_calls_limit=int(
+                                   r.get("agent_tool_calls_limit") or 0),
                                color=r.get("color") or "#8B7CF6",
                                icon=r.get("icon") or "forum",
                                archived=bool(r.get("archived")),
@@ -776,6 +791,9 @@ class Neo4jStore:
                 auto=True, description=agent.description,
                 instructions=agent.instructions, color=agent.color,
                 icon=agent.icon, pinned=True, position=position,
+                assistant_mode=agent.assistant_mode,
+                agent_tools=list(agent.agent_tools),
+                agent_workspace=agent.workspace,
             )
             self.run(_MERGE_ROOM_CYPHER, **_room_params(room, _json))
             rooms.append(self.get_room(room.room_id))
@@ -791,23 +809,32 @@ class Neo4jStore:
         if self.get_room(room.room_id):
             raise ValueError("room_id already exists")
         rows = self.run(_CREATE_ROOM_CYPHER, **_room_params(room, _json))
-        return dict(rows[0]) if rows else None
+        return self.get_room(room.room_id) if rows else None
 
     def update_room(self, room_id, changes):
         """Update room metadata/matcher. The Daily identity and kind are protected."""
         import json as _json
+        from memory.models.room import Room
+
         room = next((r for r in self._load_rooms() if r.room_id == room_id), None)
         if room is None:
             return None
-        allowed = {"name", "description", "instructions", "color", "icon", "archived", "pinned",
-                   "position", "matcher"}
+        allowed = {
+            "name", "description", "instructions", "assistant_mode",
+            "agent_tools", "agent_workspace", "color", "icon", "archived", "pinned",
+            "agent_request_limit", "agent_tool_calls_limit",
+            "position", "matcher",
+        }
         for key, value in changes.items():
             if key in allowed:
                 setattr(room, key, value)
+        # Revalidate after applying a partial patch: `setattr` alone bypasses
+        # Pydantic's Literal/list validation.
+        room = Room.model_validate(room.model_dump())
         if room_id == "daily":
             room.name, room.kind, room.archived = "Daily", "daily", False
         rows = self.run(_UPDATE_ROOM_CYPHER, **_room_params(room, _json))
-        return dict(rows[0]) if rows else None
+        return self.get_room(room_id) if rows else None
 
     def delete_room(self, room_id):
         """Delete a room and its private notes/messages; events remain intact."""
@@ -906,14 +933,35 @@ class Neo4jStore:
                 "rooms_archived": archived, "rooms_deleted": deleted}
 
     def list_rooms(self, include_archived=False):
-        return [dict(r) for r in self.run(
+        import json as _json
+        rooms = [dict(r) for r in self.run(
             _LIST_ROOMS_CYPHER, include_archived=include_archived)]
+        for room in rooms:
+            raw_tools = room.pop("agent_tools_json", None)
+            room["agent_workspace"] = room.get("agent_workspace") or ""
+            room["agent_request_limit"] = int(
+                room.get("agent_request_limit") or 0)
+            room["agent_tool_calls_limit"] = int(
+                room.get("agent_tool_calls_limit") or 0)
+            if raw_tools is None:
+                room["agent_tools"] = None
+                continue
+            try:
+                room["agent_tools"] = _json.loads(raw_tools)
+            except (TypeError, ValueError):
+                room["agent_tools"] = []
+        return rooms
 
     def get_room(self, room_id):
         rows = self.run("MATCH (r:Room {room_id: $room_id}) "
                         "RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind, "
                         "r.auto AS auto, r.description AS description, r.color AS color, "
                         "r.instructions AS instructions, "
+                        "r.assistant_mode AS assistant_mode, "
+                        "r.agent_tools_json AS agent_tools_json, "
+                        "r.agent_workspace AS agent_workspace, "
+                        "r.agent_request_limit AS agent_request_limit, "
+                        "r.agent_tool_calls_limit AS agent_tool_calls_limit, "
                         "r.icon AS icon, r.archived AS archived, r.pinned AS pinned, "
                         "r.position AS position, r.matcher_json AS matcher_json",
                         room_id=room_id)
@@ -925,6 +973,17 @@ class Neo4jStore:
             out["matcher"] = _json.loads(out.pop("matcher_json") or "{}")
         except (TypeError, ValueError):
             out["matcher"] = {}
+        out["agent_workspace"] = out.get("agent_workspace") or ""
+        out["agent_request_limit"] = int(
+            out.get("agent_request_limit") or 0)
+        out["agent_tool_calls_limit"] = int(
+            out.get("agent_tool_calls_limit") or 0)
+        raw_tools = out.pop("agent_tools_json", None)
+        if raw_tools is not None:
+            try:
+                out["agent_tools"] = _json.loads(raw_tools)
+            except (TypeError, ValueError):
+                out["agent_tools"] = []
         return out
 
     def set_event_room(self, event_id, room_id, mode="primary"):
@@ -1321,6 +1380,11 @@ def _room_params(room, json_module):
         "matcher_json": json_module.dumps(matcher),
         "description": room.description,
         "instructions": room.instructions,
+        "assistant_mode": room.assistant_mode,
+        "agent_tools_json": json_module.dumps(room.agent_tools),
+        "agent_workspace": room.agent_workspace,
+        "agent_request_limit": room.agent_request_limit,
+        "agent_tool_calls_limit": room.agent_tool_calls_limit,
         "color": room.color,
         "icon": room.icon,
         "archived": room.archived,
@@ -2200,13 +2264,25 @@ _MERGE_ROOM_CYPHER = """
 MERGE (r:Room {room_id: $room_id})
   ON CREATE SET r.name = $name, r.kind = $kind, r.auto = $auto,
                 r.matcher_json = $matcher_json, r.description = $description,
-                r.instructions = $instructions,
+                 r.instructions = $instructions,
+                 r.assistant_mode = $assistant_mode,
+                 r.agent_tools_json = $agent_tools_json,
+                 r.agent_workspace = $agent_workspace,
+                 r.agent_request_limit = $agent_request_limit,
+                 r.agent_tool_calls_limit = $agent_tool_calls_limit,
                 r.color = $color, r.icon = $icon, r.archived = $archived,
                 r.pinned = $pinned, r.position = $position,
                 r.created_at = timestamp(), r.updated_at = timestamp()
   ON MATCH SET r.name = coalesce(r.name, $name), r.kind = coalesce(r.kind, $kind),
-               r.description = coalesce(r.description, $description),
-               r.instructions = coalesce(r.instructions, $instructions),
+                r.description = coalesce(r.description, $description),
+                r.instructions = coalesce(r.instructions, $instructions),
+                r.assistant_mode = coalesce(r.assistant_mode, $assistant_mode),
+                r.agent_tools_json = coalesce(r.agent_tools_json, $agent_tools_json),
+                r.agent_workspace = coalesce(r.agent_workspace, $agent_workspace),
+                r.agent_request_limit = coalesce(
+                    r.agent_request_limit, $agent_request_limit),
+                r.agent_tool_calls_limit = coalesce(
+                    r.agent_tool_calls_limit, $agent_tool_calls_limit),
                r.color = coalesce(r.color, $color), r.icon = coalesce(r.icon, $icon),
                r.archived = coalesce(r.archived, false),
                r.pinned = coalesce(r.pinned, $pinned),
@@ -2227,6 +2303,11 @@ OPTIONAL MATCH (r)-[:CONTAINS]->(e:Event)
 RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind,
        r.auto AS auto, r.description AS description, r.color AS color,
        r.instructions AS instructions,
+       r.assistant_mode AS assistant_mode,
+       r.agent_tools_json AS agent_tools_json,
+       r.agent_workspace AS agent_workspace,
+       coalesce(r.agent_request_limit, 0) AS agent_request_limit,
+       coalesce(r.agent_tool_calls_limit, 0) AS agent_tool_calls_limit,
        r.icon AS icon, coalesce(r.archived, false) AS archived,
        coalesce(r.pinned, false) AS pinned, coalesce(r.position, 0) AS position,
        count(e) AS events, max(e.span_end) AS last_active
@@ -2368,25 +2449,41 @@ _CREATE_ROOM_CYPHER = """
 CREATE (r:Room {
   room_id: $room_id, name: $name, kind: $kind, auto: $auto,
   matcher_json: $matcher_json, description: $description, color: $color,
-  instructions: $instructions,
+  instructions: $instructions, assistant_mode: $assistant_mode,
+  agent_tools_json: $agent_tools_json,
+  agent_workspace: $agent_workspace,
+  agent_request_limit: $agent_request_limit,
+  agent_tool_calls_limit: $agent_tool_calls_limit,
   icon: $icon, archived: $archived, pinned: $pinned, position: $position,
   created_at: timestamp(), updated_at: timestamp()
 })
 RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind,
        r.description AS description, r.color AS color, r.icon AS icon,
-       r.instructions AS instructions,
+       r.instructions AS instructions, r.assistant_mode AS assistant_mode,
+       r.agent_tools_json AS agent_tools_json,
+       r.agent_workspace AS agent_workspace,
+       r.agent_request_limit AS agent_request_limit,
+       r.agent_tool_calls_limit AS agent_tool_calls_limit,
        r.archived AS archived, r.pinned AS pinned, r.position AS position
 """
 
 _UPDATE_ROOM_CYPHER = """
 MATCH (r:Room {room_id: $room_id})
 SET r.name = $name, r.description = $description, r.instructions = $instructions, r.color = $color,
+    r.assistant_mode = $assistant_mode, r.agent_tools_json = $agent_tools_json,
+    r.agent_workspace = $agent_workspace,
+    r.agent_request_limit = $agent_request_limit,
+    r.agent_tool_calls_limit = $agent_tool_calls_limit,
     r.icon = $icon, r.archived = $archived, r.pinned = $pinned,
     r.position = $position, r.matcher_json = $matcher_json,
     r.updated_at = timestamp()
 RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind,
        r.description AS description, r.color AS color, r.icon AS icon,
-       r.instructions AS instructions,
+       r.instructions AS instructions, r.assistant_mode AS assistant_mode,
+       r.agent_tools_json AS agent_tools_json,
+       r.agent_workspace AS agent_workspace,
+       r.agent_request_limit AS agent_request_limit,
+       r.agent_tool_calls_limit AS agent_tool_calls_limit,
        r.archived AS archived, r.pinned AS pinned, r.position AS position
 """
 

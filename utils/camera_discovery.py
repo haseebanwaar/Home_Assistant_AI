@@ -49,6 +49,33 @@ ONVIF_TIMEOUT = 5
 HTTP_TIMEOUT = 3
 
 
+def redact_url_credentials(url):
+    """Return a URL that is safe to write to logs."""
+    if not url:
+        return url
+    parsed = urlparse(url)
+    if parsed.username is None:
+        return url
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return parsed._replace(netloc=f"***:***@{host}").geturl()
+
+
+def redact_device(device):
+    """Remove secrets from a discovery result before printing it."""
+    safe = dict(device)
+    credentials = safe.get("credentials")
+    if credentials:
+        safe["credentials"] = {
+            "user": credentials.get("user"),
+            "password": "***",
+        }
+    if safe.get("rtsp_url"):
+        safe["rtsp_url"] = redact_url_credentials(safe["rtsp_url"])
+    return safe
+
+
 def parse_xaddrs(xaddrs_text):
     if not xaddrs_text:
         return []
@@ -163,14 +190,14 @@ def discover_onvif_and_identify():
                 if "manufacturer" in info and info.get("manufacturer"):
                     device["onvif_info"] = info
                     device["credentials"] = {"user": user, "password": pwd}
-                    print(f"  [+] ONVIF Auth success: {user}/{pwd}")
+                    print(f"  [+] ONVIF Auth success: {user}/***")
 
                     # Try ONVIF stream URI
                     rtsp = try_onvif_stream_uri(host, port, user, pwd)
                     if not rtsp:
                         rtsp = guess_rtsp_url(host, user, pwd)
                     if rtsp:
-                        print(f"  [RTSP] {rtsp}")
+                        print(f"  [RTSP] {redact_url_credentials(rtsp)}")
                         device["rtsp_url"] = rtsp
                     else:
                         print("  [!] RTSP stream not found")
@@ -186,4 +213,4 @@ if __name__ == "__main__":
     devices = discover_onvif_and_identify()
     print("\n=== SUMMARY ===")
     for d in devices:
-        print(d)
+        print(redact_device(d))

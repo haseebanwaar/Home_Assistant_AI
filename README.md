@@ -71,13 +71,17 @@ drops the router arguments FastAPI 0.118 passes, so `requirements-agent.txt`
 pins Starlette to a compatible range — installing it unpinned breaks `app.py`
 at import time.
 
-Then opt in exact rooms:
+Enable the runtime; each room then persists Chat/Agent mode and its own toolset
+allowlist in Room settings. The ID/kind variables remain a fallback for rooms
+created before those settings existed:
 
 ```dotenv
 AGENT_RUNTIME_ENABLED=true
-AGENT_ROOM_IDS=agent:tomorrow-planner,agent:phd-helper
+AGENT_ROOM_IDS=
 MCP_CONFIG_PATH=./mcp.config.json
-MCP_FILESYSTEM_ROOT=C:/d/project/home_assistant_AI
+AGENT_WORKSPACE_ROOT=C:/d/agent_workspaces
+RESEARCH_AGENT_REQUEST_LIMIT=32
+RESEARCH_AGENT_TOOL_CALLS_LIMIT=64
 ```
 
 #### Tools
@@ -89,9 +93,16 @@ Agent rooms see two kinds of tool:
   server under `mcpServers`. URL entries use Streamable HTTP (or SSE when the
   URL ends in `/sse`); command/args entries use stdio, and `${VAR}` /
   `${VAR:-default}` are expanded from the environment. The file is trusted
-  configuration because stdio entries launch local processes, so it is
-  git-ignored. The bundled browser entry expects Playwright MCP on
-  `MCP_BROWSER_URL`: `npx @playwright/mcp@latest --port 8931`.
+  configuration because stdio entries launch local processes. The shipped
+  filesystem and headless Playwright entries self-start over stdio on Windows.
+  `MCP_INIT_TIMEOUT_SECONDS` gives `npx` enough time for its MCP handshake.
+  `${AGENT_WORKSPACE}` is resolved separately for every room at run time. In
+  Room settings, leave **Agent workspace folder** blank for an automatic private
+  folder, enter a relative name under `AGENT_WORKSPACE_ROOT`, or enter an
+  absolute path. The built-in Research agent defaults to `research/` and creates
+  `papers/`, `downloads/`, `protocol/`, `screening/`, `extraction/`, and
+  `reports/`. The Playwright MCP output directory is also placed under that
+  workspace so downloaded papers remain available to its filesystem tools.
 * **The activity graph** (`agents/graph_tools.py`) — the one native toolset,
   because this application's own memory has no MCP server. It exposes
   `graph_search_memory`, `graph_recent_activity`, `graph_event_detail`,
@@ -105,10 +116,18 @@ this needs a subprocess-capable event loop, which is what uvicorn installs.
 
 Direct room chat responses retain their existing shape. Agent responses add
 `execution: agent` plus the PydanticAI run IDs and the tool call/output trace.
+The built-in Research room defaults to Agent mode with graph, browser MCP, and
+filesystem MCP access, and carries a reproducible SLR/PRISMA workflow prompt.
+Research uses its own larger request/tool budget because a review may require
+many search, download, read, and write turns. Agent chat uses the NDJSON endpoint
+to show live activity: selected toolsets, tool calls with redacted argument
+summaries, tool completion, drafting, and periodic still-working heartbeats.
+Each Agent room can override **Model request limit** and **Tool call limit** in
+Room settings; blank values inherit the normal or Research defaults.
 Streaming room chat retains NDJSON; after the tool loop completes it emits the
 final text and tool trace. `GET /agent-runtime/status` reports routing, limits,
-native toolset count and configured MCP server names without connecting to any
-of them.
+native toolset count, configured MCP server names, and the selectable room tool
+catalog without connecting to any server.
 
 #### Structured outputs
 
@@ -127,8 +146,9 @@ run's budget.
 
 `tests/test_agent_runtime.py`, `tests/test_graph_tools.py` and
 `tests/test_mcp_config.py` cover routing, toolset composition, config loading
-and both structured-output paths. The live MCP test actually spawns the
-filesystem server over stdio and is opt-in:
+and both structured-output paths. The live MCP tests spawn the filesystem and
+Playwright servers over stdio and verify the Research room dependencies; they
+are opt-in:
 
 ```powershell
 $env:MCP_LIVE_TEST=1; python -m pytest tests/test_mcp_config.py

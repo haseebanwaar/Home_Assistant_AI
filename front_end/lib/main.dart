@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 // C:\Users\haseeb\AppData\Local\Android\Sdk\platform-tools/adb pair 192.168.1.17:38535
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 // Only the initialiser is needed here; the full export collides with
 // audioplayers' PlayerState.
 import 'package:media_kit/media_kit.dart' show MediaKit;
@@ -56,8 +57,10 @@ class HomeMindApp extends StatelessWidget {
         inputDecorationTheme: InputDecorationTheme(
           filled: true,
           fillColor: const Color(0xFF111827),
-          contentPadding:
-              const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 16,
+            vertical: 14,
+          ),
           border: OutlineInputBorder(
             borderRadius: BorderRadius.circular(16),
             borderSide: BorderSide.none,
@@ -136,10 +139,11 @@ class MyApp extends StatefulWidget {
 class _MyAppState extends State<MyApp> {
   static const _homeHubPreferenceKey = 'home_hub_url';
   static const _reflectShortcutPreferenceKey = 'reflect_shortcut';
-  static const _sourceReflectShortcutPreferenceKey =
-      'source_reflect_shortcut';
-  static const _promptShortcutPreferencePrefix =
-      'reflection_prompt_shortcut_';
+  static const _sourceReflectShortcutPreferenceKey = 'source_reflect_shortcut';
+  static const _clipboardAnswerShortcutPreferenceKey =
+      'clipboard_answer_shortcut';
+  static const _clipboardAnswerPromptPreferenceKey = 'clipboard_answer_prompt';
+  static const _promptShortcutPreferencePrefix = 'reflection_prompt_shortcut_';
   static const _promptTextPreferencePrefix = 'reflection_prompt_text_';
   static const _disabledShortcutValue = 'disabled';
   static const _defaultHomeHub = String.fromEnvironment(
@@ -209,10 +213,12 @@ class _MyAppState extends State<MyApp> {
   static const int _reflectFrames = 10;
   bool _reflecting = false;
   bool _choosingReflectionSource = false;
-  AppShortcutBinding? _reflectShortcut =
-      AppShortcutBinding.reflectionDefault;
+  AppShortcutBinding? _reflectShortcut = AppShortcutBinding.reflectionDefault;
   AppShortcutBinding? _sourceReflectShortcut =
       AppShortcutBinding.sourceReflectionDefault;
+  AppShortcutBinding? _clipboardAnswerShortcut =
+      AppShortcutBinding.clipboardAnswerDefault;
+  String _clipboardAnswerPrompt = defaultClipboardAnswerPrompt;
   Map<String, AppShortcutBinding?> _promptShortcuts = {
     for (final preset in reflectionPromptPresets)
       preset.id: preset.defaultBinding,
@@ -225,7 +231,11 @@ class _MyAppState extends State<MyApp> {
 
   // Add these lines for the context selection
   final List<String> _contextOptions = ['talker', 'screen', 'camera'];
-  final List<bool> _selectedContexts = [true, false, false]; // 'talker' is selected by default
+  final List<bool> _selectedContexts = [
+    true,
+    false,
+    false,
+  ]; // 'talker' is selected by default
   String _currentContext = 'talker';
 
   // For sequential audio playback
@@ -250,6 +260,7 @@ class _MyAppState extends State<MyApp> {
     _loadDeliveryPreferences();
     _loadShortcutPreferences();
     _loadPromptTexts();
+    _loadClipboardAnswerPrompt();
     _captureSub = _capture.status.listen((s) {
       if (mounted) setState(() => _captureStatus = s);
     });
@@ -391,9 +402,7 @@ class _MyAppState extends State<MyApp> {
     }
   }
 
-  List<CaptureSourceSetting> _decodeCaptureSources(
-    Map<String, dynamic> data,
-  ) {
+  List<CaptureSourceSetting> _decodeCaptureSources(Map<String, dynamic> data) {
     return (data['sources'] as List? ?? const [])
         .whereType<Map>()
         .map(
@@ -401,14 +410,11 @@ class _MyAppState extends State<MyApp> {
             id: '${source['id'] ?? ''}',
             label: '${source['label'] ?? source['id'] ?? ''}',
             kind: '${source['kind'] ?? ''}',
-            sampleFps:
-                (source['sample_fps'] as num?)?.toDouble() ?? 1.0,
+            sampleFps: (source['sample_fps'] as num?)?.toDouble() ?? 1.0,
             inferenceIntervalSeconds:
                 (source['inference_interval_seconds'] as num?)?.toInt() ?? 60,
-            expectedFrames:
-                (source['expected_frames'] as num?)?.toInt() ?? 0,
-            bufferedFrames:
-                (source['buffered_frames'] as num?)?.toInt() ?? 0,
+            expectedFrames: (source['expected_frames'] as num?)?.toInt() ?? 0,
+            bufferedFrames: (source['buffered_frames'] as num?)?.toInt() ?? 0,
             available: source['available'] == true,
           ),
         )
@@ -497,8 +503,7 @@ class _MyAppState extends State<MyApp> {
     if (!mounted) return;
     setState(() {
       _proactiveEnabled = prefs.getBool('proactive_enabled') ?? true;
-      _proactiveVoiceEnabled =
-          prefs.getBool('proactive_voice_enabled') ?? true;
+      _proactiveVoiceEnabled = prefs.getBool('proactive_voice_enabled') ?? true;
       _proactiveFeedEnabled = prefs.getBool('proactive_feed_enabled') ?? true;
       _proactiveNotificationsEnabled =
           prefs.getBool('proactive_notifications_enabled') ?? false;
@@ -516,9 +521,7 @@ class _MyAppState extends State<MyApp> {
       prefs.getString(_reflectShortcutPreferenceKey),
       AppShortcutBinding.reflectionDefault,
     );
-    final usedBindings = <AppShortcutBinding>{
-      if (shortcut != null) shortcut,
-    };
+    final usedBindings = <AppShortcutBinding>{if (shortcut != null) shortcut};
     var sourceShortcut = _shortcutFromPreference(
       prefs.getString(_sourceReflectShortcutPreferenceKey),
       AppShortcutBinding.sourceReflectionDefault,
@@ -538,18 +541,29 @@ class _MyAppState extends State<MyApp> {
         preset.defaultBinding,
       );
       if (binding != null && usedBindings.contains(binding)) {
-        binding =
-            usedBindings.contains(preset.defaultBinding)
-                ? null
-                : preset.defaultBinding;
+        binding = usedBindings.contains(preset.defaultBinding)
+            ? null
+            : preset.defaultBinding;
       }
       promptShortcuts[preset.id] = binding;
       if (binding != null) usedBindings.add(binding);
+    }
+
+    // Existing user-configured prompt shortcuts win if one already uses the
+    // new action's default. In that rare case the clipboard action starts
+    // disabled instead of silently taking another action's binding.
+    var clipboardShortcut = _shortcutFromPreference(
+      prefs.getString(_clipboardAnswerShortcutPreferenceKey),
+      AppShortcutBinding.clipboardAnswerDefault,
+    );
+    if (clipboardShortcut != null && usedBindings.contains(clipboardShortcut)) {
+      clipboardShortcut = null;
     }
     if (!mounted) return;
     setState(() {
       _reflectShortcut = shortcut;
       _sourceReflectShortcut = sourceShortcut;
+      _clipboardAnswerShortcut = clipboardShortcut;
       _promptShortcuts = promptShortcuts;
     });
     await _syncGlobalHotkeys();
@@ -565,13 +579,24 @@ class _MyAppState extends State<MyApp> {
     final prefs = await SharedPreferences.getInstance();
     final texts = <String, String>{};
     for (final preset in reflectionPromptPresets) {
-      final saved = prefs.getString(_promptTextPreferenceKey(preset.id))?.trim();
+      final saved =
+          prefs.getString(_promptTextPreferenceKey(preset.id))?.trim();
       if (saved != null && saved.isNotEmpty && saved != preset.prompt) {
         texts[preset.id] = saved;
       }
     }
     if (!mounted) return;
     setState(() => _promptTexts = texts);
+  }
+
+  Future<void> _loadClipboardAnswerPrompt() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_clipboardAnswerPromptPreferenceKey)?.trim();
+    if (!mounted) return;
+    setState(() {
+      _clipboardAnswerPrompt =
+          saved == null || saved.isEmpty ? defaultClipboardAnswerPrompt : saved;
+    });
   }
 
   /// The wording a preset sends: the user's edit when there is one, else the
@@ -608,31 +633,62 @@ class _MyAppState extends State<MyApp> {
   }
 
   AppShortcutBinding? _shortcutFromPreference(
-      String? saved, AppShortcutBinding fallback) {
+    String? saved,
+    AppShortcutBinding fallback,
+  ) {
     if (saved == _disabledShortcutValue) return null;
     return AppShortcutBinding.tryDecode(saved) ?? fallback;
   }
 
   void _updateReflectShortcut(AppShortcutBinding? shortcut) {
     setState(() => _reflectShortcut = shortcut);
-    unawaited(_persistShortcutPreference(
-        _reflectShortcutPreferenceKey, shortcut));
+    unawaited(
+      _persistShortcutPreference(_reflectShortcutPreferenceKey, shortcut),
+    );
   }
 
   void _updateSourceReflectShortcut(AppShortcutBinding? shortcut) {
     setState(() => _sourceReflectShortcut = shortcut);
-    unawaited(_persistShortcutPreference(
-        _sourceReflectShortcutPreferenceKey, shortcut));
+    unawaited(
+      _persistShortcutPreference(_sourceReflectShortcutPreferenceKey, shortcut),
+    );
   }
 
-  void _updatePromptShortcut(
-    String presetId,
-    AppShortcutBinding? shortcut,
-  ) {
+  void _updateClipboardAnswerShortcut(AppShortcutBinding? shortcut) {
+    setState(() => _clipboardAnswerShortcut = shortcut);
+    unawaited(
+      _persistShortcutPreference(
+        _clipboardAnswerShortcutPreferenceKey,
+        shortcut,
+      ),
+    );
+  }
+
+  void _updateClipboardAnswerPrompt(String? prompt) {
+    final trimmed = prompt?.trim();
     setState(() {
-      _promptShortcuts = Map<String, AppShortcutBinding?>.from(
-        _promptShortcuts,
-      )..[presetId] = shortcut;
+      _clipboardAnswerPrompt = trimmed == null || trimmed.isEmpty
+          ? defaultClipboardAnswerPrompt
+          : trimmed;
+    });
+    unawaited(_persistClipboardAnswerPrompt(trimmed));
+  }
+
+  Future<void> _persistClipboardAnswerPrompt(String? prompt) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (prompt == null ||
+        prompt.isEmpty ||
+        prompt == defaultClipboardAnswerPrompt) {
+      await prefs.remove(_clipboardAnswerPromptPreferenceKey);
+    } else {
+      await prefs.setString(_clipboardAnswerPromptPreferenceKey, prompt);
+    }
+  }
+
+  void _updatePromptShortcut(String presetId, AppShortcutBinding? shortcut) {
+    setState(() {
+      _promptShortcuts = Map<String, AppShortcutBinding?>.from(_promptShortcuts)
+        ..[presetId] = shortcut;
     });
     unawaited(
       _persistShortcutPreference(
@@ -643,12 +699,11 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _persistShortcutPreference(
-      String key, AppShortcutBinding? shortcut) async {
+    String key,
+    AppShortcutBinding? shortcut,
+  ) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-      key,
-      shortcut?.encode() ?? _disabledShortcutValue,
-    );
+    await prefs.setString(key, shortcut?.encode() ?? _disabledShortcutValue);
     await _syncGlobalHotkeys();
   }
 
@@ -664,17 +719,21 @@ class _MyAppState extends State<MyApp> {
         GlobalHotkeyRegistration(
           name: 'Reflect from source',
           binding: shortcut,
-          onPressed: () =>
-              unawaited(_runGlobalReflection(chooseSource: true)),
+          onPressed: () => unawaited(_runGlobalReflection(chooseSource: true)),
+        ),
+      if (_clipboardAnswerShortcut case final shortcut?)
+        GlobalHotkeyRegistration(
+          name: 'Answer clipboard',
+          binding: shortcut,
+          onPressed: () => unawaited(_answerClipboard(background: true)),
         ),
       for (final preset in reflectionPromptPresets)
         if (_promptShortcuts[preset.id] case final shortcut?)
           GlobalHotkeyRegistration(
             name: preset.title,
             binding: shortcut,
-            onPressed: () => unawaited(
-              _runGlobalReflection(promptPreset: preset),
-            ),
+            onPressed: () =>
+                unawaited(_runGlobalReflection(promptPreset: preset)),
           ),
     ];
     final error = await _globalHotkeys.sync(registrations);
@@ -688,7 +747,9 @@ class _MyAppState extends State<MyApp> {
       prefs.setBool('proactive_voice_enabled', _proactiveVoiceEnabled),
       prefs.setBool('proactive_feed_enabled', _proactiveFeedEnabled),
       prefs.setBool(
-          'proactive_notifications_enabled', _proactiveNotificationsEnabled),
+        'proactive_notifications_enabled',
+        _proactiveNotificationsEnabled,
+      ),
       prefs.setBool('event_notifications_enabled', _eventNotificationsEnabled),
       prefs.setBool('notifications_muted', _notificationsMuted),
     ]);
@@ -728,8 +789,9 @@ class _MyAppState extends State<MyApp> {
   }
 
   void _setupAudioPlayerListener() {
-    _playerStateSubscription =
-        _audioPlayer.onPlayerStateChanged.listen((state) {
+    _playerStateSubscription = _audioPlayer.onPlayerStateChanged.listen((
+      state,
+    ) {
       if (state == PlayerState.completed) {
         _isAudioPlaying = false;
         // When one audio chunk finishes, play the next one in the queue
@@ -848,7 +910,10 @@ class _MyAppState extends State<MyApp> {
     // Update data sub-chunk size (just the audio data size)
     headerView.setUint32(40, fullAudioData.length, Endian.little);
 
-    return (BytesBuilder()..add(header)..add(fullAudioData)).toBytes();
+    return (BytesBuilder()
+          ..add(header)
+          ..add(fullAudioData))
+        .toBytes();
   }
 
   /// Send one conversation turn — spoken (`audio`) or typed (`text`).
@@ -856,11 +921,18 @@ class _MyAppState extends State<MyApp> {
   /// Both go to `/chat/audio`, which skips ASR when text is supplied, so live
   /// frames, memory tools and spoken replies work the same either way. The
   /// user's words come back on the `query` line, so neither path echoes locally.
-  Future<void> _sendTurn({Uint8List? audio, String? text}) async {
+  Future<void> _sendTurn({
+    Uint8List? audio,
+    String? text,
+    String? contextOverride,
+    bool includeImage = true,
+  }) async {
     try {
       if (mounted) {
-        setState(() => _backendActivity =
-            text != null ? 'Sending message' : 'Uploading audio');
+        setState(
+          () => _backendActivity =
+              text != null ? 'Sending message' : 'Uploading audio',
+        );
       }
       // Clear the audio queue for the new response
       // and stop any ongoing playback from a previous turn.
@@ -873,17 +945,18 @@ class _MyAppState extends State<MyApp> {
       final Map<String, dynamic> requestBody = {
         'data': audio,
         'text': text,
-        'image': _fileImage != null ? base64.encode(_fileImage!) : null,
+        'image': includeImage && _fileImage != null
+            ? base64.encode(_fileImage!)
+            : null,
         'talking': _isTalking,
-        'context': _currentContext, // Add the new context value
+        'context': contextOverride ?? _currentContext,
         'live': _isLive, // Add this line
         'memory': _useMemory, // Add this line
       };
 
-      final request =
-          http.Request('POST', url)
-            ..headers['Content-Type'] = 'application/json'
-            ..body = json.encode(requestBody);
+      final request = http.Request('POST', url)
+        ..headers['Content-Type'] = 'application/json'
+        ..body = json.encode(requestBody);
 
       final streamedResponse = await request.send();
 
@@ -891,8 +964,11 @@ class _MyAppState extends State<MyApp> {
         print('Request failed with status: ${streamedResponse.statusCode}');
         final body = await streamedResponse.stream.bytesToString();
         print('Response body: $body');
-        if (mounted) setState(() =>
-            _backendActivity = 'Backend error (${streamedResponse.statusCode})');
+        if (mounted)
+          setState(
+            () => _backendActivity =
+                'Backend error (${streamedResponse.statusCode})',
+          );
         return;
       }
 
@@ -911,15 +987,22 @@ class _MyAppState extends State<MyApp> {
           final type = jsonResponse['type'];
 
           if (type == 'query') {
-            if (mounted) setState(() => _backendActivity = 'Generating response');
+            if (mounted)
+              setState(() => _backendActivity = 'Generating response');
             final queryText = jsonResponse['text'];
             if (mounted) {
               setState(() {
-                _chatHistory.add(ChatMessage(
-                    sender: MessageSender.user, text: "User: $queryText"));
+                _chatHistory.add(
+                  ChatMessage(
+                    sender: MessageSender.user,
+                    text: "User: $queryText",
+                  ),
+                );
                 // Add a placeholder for the assistant's response
                 currentAssistantMessage = ChatMessage(
-                    sender: MessageSender.assistant, text: "Assistant: ");
+                  sender: MessageSender.assistant,
+                  text: "Assistant: ",
+                );
                 _chatHistory.add(currentAssistantMessage!);
               });
             }
@@ -941,14 +1024,21 @@ class _MyAppState extends State<MyApp> {
               _playNextInQueue();
             }
           } else if (type == 'debug') {
-            if (mounted) setState(() =>
-                _backendActivity = 'Backend: ${jsonResponse['stage']}');
+            if (mounted)
+              setState(
+                () => _backendActivity = 'Backend: ${jsonResponse['stage']}',
+              );
           } else if (type == 'error') {
-            if (mounted) setState(() =>
-                _backendActivity = 'Error: ${jsonResponse['message']}');
+            if (mounted)
+              setState(
+                () => _backendActivity = 'Error: ${jsonResponse['message']}',
+              );
           } else if (type == 'done') {
-            if (mounted) setState(() =>
-                _backendActivity = 'Ready (${jsonResponse['total_ms']} ms)');
+            if (mounted)
+              setState(
+                () =>
+                    _backendActivity = 'Ready (${jsonResponse['total_ms']} ms)',
+              );
           }
         } catch (e) {
           print("Error processing stream line: $e. Line: '$line'");
@@ -956,7 +1046,9 @@ class _MyAppState extends State<MyApp> {
       }
       // Once the stream is finished, save the complete audio to the message
       if (currentAssistantMessage != null) {
-        currentAssistantMessage!.fullAudio = _mergeWavBytes(assistantAudioChunks);
+        currentAssistantMessage!.fullAudio = _mergeWavBytes(
+          assistantAudioChunks,
+        );
       }
     } catch (error) {
       if (kDebugMode) {
@@ -964,7 +1056,7 @@ class _MyAppState extends State<MyApp> {
       }
       if (mounted) setState(() => _backendActivity = 'Connection failed');
     }
-    }
+  }
 
   Future<void> _sendTypedMessage() async {
     final text = _composerController.text.trim();
@@ -977,6 +1069,48 @@ class _MyAppState extends State<MyApp> {
     setState(() => _isProcessing = true);
     try {
       await _sendTurn(text: text);
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  Future<void> _answerClipboard({bool background = false}) async {
+    Future<void> report(String message) async {
+      _showSnack(message);
+      if (background) await showDesktopAlert('Answer clipboard', message);
+    }
+
+    if (_isProcessing || _isRecording) {
+      await report('HomeMind is already handling another request');
+      return;
+    }
+    if (_apiBase.isEmpty) {
+      await report('Connect to the home hub first');
+      return;
+    }
+
+    final clipboard = await Clipboard.getData(Clipboard.kTextPlain);
+    final clipboardText = clipboard?.text;
+    if (clipboardText == null || clipboardText.trim().isEmpty) {
+      await report('The clipboard does not contain any text');
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _isProcessing = true;
+        _workspaceIndex = 0;
+      });
+    }
+    try {
+      await _sendTurn(
+        text: buildClipboardAnswerRequest(
+          _clipboardAnswerPrompt,
+          clipboardText,
+        ),
+        contextOverride: 'talker',
+        includeImage: false,
+      );
     } finally {
       if (mounted) setState(() => _isProcessing = false);
     }
@@ -1010,20 +1144,27 @@ class _MyAppState extends State<MyApp> {
           .get(Uri.parse('$apiBase/status'))
           .timeout(const Duration(seconds: 4));
       if (response.statusCode != 200) {
-        throw Exception('backend health request returned ${response.statusCode}');
+        throw Exception(
+          'backend health request returned ${response.statusCode}',
+        );
       }
       final value = decodeJsonResponse(response) as Map<String, dynamic>;
       if (_apiBase != apiBase) return;
       _consecutiveStatusFailures = 0;
-      if (mounted) setState(() {
-        _backendConnected = true;
-        _backendStatus = value;
-        final pipeline = value['pipeline'] as Map?;
-        if (pipeline != null) {
-          final stage = '${pipeline['stage'] ?? 'ready'}'.replaceAll('_', ' ');
-          _backendActivity = pipeline['active'] == true ? 'Backend: $stage' : stage;
-        }
-      });
+      if (mounted)
+        setState(() {
+          _backendConnected = true;
+          _backendStatus = value;
+          final pipeline = value['pipeline'] as Map?;
+          if (pipeline != null) {
+            final stage = '${pipeline['stage'] ?? 'ready'}'.replaceAll(
+              '_',
+              ' ',
+            );
+            _backendActivity =
+                pipeline['active'] == true ? 'Backend: $stage' : stage;
+          }
+        });
       await _syncNotificationMonitoring();
       if (_kokoroVoices.isEmpty) {
         unawaited(_loadTtsSettings());
@@ -1034,17 +1175,20 @@ class _MyAppState extends State<MyApp> {
         // Tailscale can briefly pause while Android changes radio or network.
         // Require three failed probes before declaring the hub offline.
         if (_consecutiveStatusFailures >= 3) {
-          if (mounted) setState(() {
-            _backendConnected = false;
-            if (!_isProcessing) _backendActivity = 'Backend offline';
-          });
+          if (mounted)
+            setState(() {
+              _backendConnected = false;
+              if (!_isProcessing) _backendActivity = 'Backend offline';
+            });
           // Re-sync proactive ids on the next successful connect (the server
           // may have restarted and reset its counter).
           _proactiveSynced = false;
         }
         if (kDebugMode) {
-          print('Home hub status probe failed '
-              '($_consecutiveStatusFailures/3): $error');
+          print(
+            'Home hub status probe failed '
+            '($_consecutiveStatusFailures/3): $error',
+          );
         }
       }
     } finally {
@@ -1054,7 +1198,8 @@ class _MyAppState extends State<MyApp> {
 
   Future<void> _clearChatHistory() async {
     try {
-      final response = await http.post(Uri.parse('$_apiBase/history/clear'))
+      final response = await http
+          .post(Uri.parse('$_apiBase/history/clear'))
           .timeout(const Duration(seconds: 5));
       if (response.statusCode != 200) {
         throw Exception(decodeUtf8Response(response));
@@ -1069,13 +1214,15 @@ class _MyAppState extends State<MyApp> {
 
   Future<void> _clearMemory() async {
     try {
-      final response = await http.post(Uri.parse('$_apiBase/memory/clear'))
+      final response = await http
+          .post(Uri.parse('$_apiBase/memory/clear'))
           .timeout(const Duration(seconds: 15));
       if (response.statusCode != 200) {
         throw Exception(decodeUtf8Response(response));
       }
       final result = decodeJsonResponse(response) as Map<String, dynamic>;
-      if (result['cleared'] != true) throw Exception(result['error'] ?? 'unknown error');
+      if (result['cleared'] != true)
+        throw Exception(result['error'] ?? 'unknown error');
       _showSnack('Long-term activity memory cleared');
     } catch (e) {
       _showSnack('Could not clear activity memory: $e');
@@ -1120,14 +1267,18 @@ class _MyAppState extends State<MyApp> {
         final clip = map['clip'] as Map<String, dynamic>?;
         if (mounted && _proactiveFeedEnabled) {
           setState(() {
-            _chatHistory.add(ChatMessage(
-              sender: MessageSender.assistant,
-              text: 'Insight: ${map['text'] ?? ''}',
-              fullAudio: audio,
-              clipId: map['can_ask'] == true ? map['clip_id']?.toString() : null,
-              clipCoversSeconds: (clip?['covers_seconds'] as num?)?.toDouble(),
-              clipPlaysSeconds: (clip?['plays_seconds'] as num?)?.toDouble(),
-            ));
+            _chatHistory.add(
+              ChatMessage(
+                sender: MessageSender.assistant,
+                text: 'Insight: ${map['text'] ?? ''}',
+                fullAudio: audio,
+                clipId:
+                    map['can_ask'] == true ? map['clip_id']?.toString() : null,
+                clipCoversSeconds:
+                    (clip?['covers_seconds'] as num?)?.toDouble(),
+                clipPlaysSeconds: (clip?['plays_seconds'] as num?)?.toDouble(),
+              ),
+            );
           });
         }
 
@@ -1155,8 +1306,10 @@ class _MyAppState extends State<MyApp> {
         await _globalHotkeys.bringAppToFront();
       } catch (error) {
         if (mounted) {
-          setState(() => _globalHotkeyError =
-              'The shortcut fired, but HomeMind could not come forward: $error');
+          setState(
+            () => _globalHotkeyError =
+                'The shortcut fired, but HomeMind could not come forward: $error',
+          );
         }
       }
     }
@@ -1165,8 +1318,7 @@ class _MyAppState extends State<MyApp> {
       await _showReflectionSourcePicker();
     } else {
       await _reflectOnScreen(
-        question:
-            promptPreset == null ? null : _promptTextFor(promptPreset),
+        question: promptPreset == null ? null : _promptTextFor(promptPreset),
         actionLabel: promptPreset?.title,
         background: true,
       );
@@ -1183,8 +1335,10 @@ class _MyAppState extends State<MyApp> {
     final data = decodeJsonResponse(response) as Map<String, dynamic>;
     return ((data['sources'] as List?) ?? const [])
         .whereType<Map>()
-        .map((item) => _ReflectionSourceOption.fromJson(
-            Map<String, dynamic>.from(item)))
+        .map(
+          (item) =>
+              _ReflectionSourceOption.fromJson(Map<String, dynamic>.from(item)),
+        )
         .where((source) => source.id.isNotEmpty)
         .toList();
   }
@@ -1240,9 +1394,13 @@ class _MyAppState extends State<MyApp> {
                   ),
                 ),
                 const SizedBox(height: 18),
-                const Text('Reflect from source',
-                    style:
-                        TextStyle(fontSize: 19, fontWeight: FontWeight.w800)),
+                const Text(
+                  'Reflect from source',
+                  style: TextStyle(
+                    fontSize: 19,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
                 const SizedBox(height: 5),
                 const Text(
                   'Choose the exact live frames HomeMind should attach.',
@@ -1253,8 +1411,10 @@ class _MyAppState extends State<MyApp> {
                   const Padding(
                     padding: EdgeInsets.symmetric(vertical: 22),
                     child: Center(
-                      child: Text('No reflection sources are configured.',
-                          style: TextStyle(color: _muted)),
+                      child: Text(
+                        'No reflection sources are configured.',
+                        style: TextStyle(color: _muted),
+                      ),
                     ),
                   )
                 else
@@ -1275,21 +1435,38 @@ class _MyAppState extends State<MyApp> {
                         child: ListTile(
                           enabled: source.available,
                           shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14)),
-                          leading: Icon(icon,
-                              color: source.available ? _mint : _muted),
-                          title: Text(source.label,
-                              style: const TextStyle(
-                                  fontSize: 13, fontWeight: FontWeight.w700)),
-                          subtitle: Text(source.detail,
-                              style:
-                                  const TextStyle(color: _muted, fontSize: 10)),
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          leading: Icon(
+                            icon,
+                            color: source.available ? _mint : _muted,
+                          ),
+                          title: Text(
+                            source.label,
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          subtitle: Text(
+                            source.detail,
+                            style: const TextStyle(
+                              color: _muted,
+                              fontSize: 10,
+                            ),
+                          ),
                           trailing: source.available
-                              ? const Icon(Icons.chevron_right_rounded,
-                                  color: _muted)
-                              : const Text('Unavailable',
-                                  style:
-                                      TextStyle(color: _muted, fontSize: 9.5)),
+                              ? const Icon(
+                                  Icons.chevron_right_rounded,
+                                  color: _muted,
+                                )
+                              : const Text(
+                                  'Unavailable',
+                                  style: TextStyle(
+                                    color: _muted,
+                                    fontSize: 9.5,
+                                  ),
+                                ),
                           onTap: source.available
                               ? () => Navigator.pop(sheetContext, source)
                               : null,
@@ -1371,8 +1548,10 @@ class _MyAppState extends State<MyApp> {
                     const SizedBox(height: 18),
                     const Text(
                       'Guided reflection',
-                      style:
-                          TextStyle(fontSize: 19, fontWeight: FontWeight.w800),
+                      style: TextStyle(
+                        fontSize: 19,
+                        fontWeight: FontWeight.w800,
+                      ),
                     ),
                     const SizedBox(height: 5),
                     const Text(
@@ -1413,15 +1592,16 @@ class _MyAppState extends State<MyApp> {
                             subtitle: Text(
                               '${_promptShortcuts[preset.id]?.label ?? 'Shortcut disabled'}'
                               ' • ${preset.description}',
-                              style:
-                                  const TextStyle(color: _muted, fontSize: 10),
+                              style: const TextStyle(
+                                color: _muted,
+                                fontSize: 10,
+                              ),
                             ),
                             trailing: const Icon(
                               Icons.chevron_right_rounded,
                               color: _muted,
                             ),
-                            onTap:
-                                () => Navigator.pop(sheetContext, preset),
+                            onTap: () => Navigator.pop(sheetContext, preset),
                           ),
                         ),
                       ),
@@ -1503,7 +1683,8 @@ class _MyAppState extends State<MyApp> {
       final data = decodeJsonResponse(response) as Map<String, dynamic>;
       if (response.statusCode != 200) {
         await report(
-            'Reflection failed: ${data['error'] ?? response.statusCode}');
+          'Reflection failed: ${data['error'] ?? response.statusCode}',
+        );
         return;
       }
       final audioB64 = data['audio'];
@@ -1513,14 +1694,16 @@ class _MyAppState extends State<MyApp> {
       final clip = data['clip'] as Map<String, dynamic>?;
       if (!mounted) return;
       setState(() {
-        _chatHistory.add(ChatMessage(
-          sender: MessageSender.assistant,
-          text: 'Reflection: ${data['text'] ?? ''}',
-          fullAudio: audio,
-          clipId: data['clip_id']?.toString(),
-          clipCoversSeconds: (clip?['covers_seconds'] as num?)?.toDouble(),
-          clipPlaysSeconds: (clip?['plays_seconds'] as num?)?.toDouble(),
-        ));
+        _chatHistory.add(
+          ChatMessage(
+            sender: MessageSender.assistant,
+            text: 'Reflection: ${data['text'] ?? ''}',
+            fullAudio: audio,
+            clipId: data['clip_id']?.toString(),
+            clipCoversSeconds: (clip?['covers_seconds'] as num?)?.toDouble(),
+            clipPlaysSeconds: (clip?['plays_seconds'] as num?)?.toDouble(),
+          ),
+        );
       });
       if (_proactiveVoiceEnabled && audio != null) {
         _audioQueue.add(audio);
@@ -1537,16 +1720,18 @@ class _MyAppState extends State<MyApp> {
     if (_apiBase.isEmpty) return;
     try {
       final response = await http
-          .get(Uri.parse(
-              '$_apiBase/notifications?since=$_lastNotificationSequence&limit=50'))
+          .get(
+            Uri.parse(
+              '$_apiBase/notifications?since=$_lastNotificationSequence&limit=50',
+            ),
+          )
           .timeout(const Duration(seconds: 3));
       if (response.statusCode != 200) return;
       final data = decodeJsonResponse(response) as Map<String, dynamic>;
       final latest = (data['latest_sequence'] as num?)?.toInt() ?? 0;
       if (mounted) {
         setState(() {
-          _unreadNotifications =
-              (data['unread_count'] as num?)?.toInt() ?? 0;
+          _unreadNotifications = (data['unread_count'] as num?)?.toInt() ?? 0;
         });
       }
       // The native foreground monitor owns system notifications. Flutter only
@@ -1582,8 +1767,8 @@ class _MyAppState extends State<MyApp> {
             _notificationsMuted
                 ? Icons.notifications_off_outlined
                 : _unreadNotifications > 0
-                ? Icons.notifications_active_outlined
-                : Icons.notifications_none_outlined,
+                    ? Icons.notifications_active_outlined
+                    : Icons.notifications_none_outlined,
             size: 20,
           ),
         ),
@@ -1602,9 +1787,10 @@ class _MyAppState extends State<MyApp> {
               child: Text(
                 _unreadNotifications > 99 ? '99+' : '$_unreadNotifications',
                 style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 8,
-                    fontWeight: FontWeight.w800),
+                  color: Colors.white,
+                  fontSize: 8,
+                  fontWeight: FontWeight.w800,
+                ),
               ),
             ),
           ),
@@ -1613,12 +1799,16 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _setBackendCapture(bool start) async {
-    final response = await http.post(
-      Uri.parse('$_apiBase/capture/control'),
-      headers: {'Content-Type': 'application/json'},
-      body: json.encode({'action': start ? 'start' : 'stop',
-                         'source': _captureSource.name}),
-    ).timeout(const Duration(seconds: 5));
+    final response = await http
+        .post(
+          Uri.parse('$_apiBase/capture/control'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({
+            'action': start ? 'start' : 'stop',
+            'source': _captureSource.name,
+          }),
+        )
+        .timeout(const Duration(seconds: 5));
     if (response.statusCode != 200) {
       throw Exception(
         'backend returned ${response.statusCode}: '
@@ -1631,11 +1821,13 @@ class _MyAppState extends State<MyApp> {
   /// Pause/resume the desktop screen capture on the backend.
   Future<void> _toggleScreen(bool pause) async {
     try {
-      final response = await http.post(
-        Uri.parse('$_apiBase/screen/control'),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode({'action': pause ? 'pause' : 'resume'}),
-      ).timeout(const Duration(seconds: 5));
+      final response = await http
+          .post(
+            Uri.parse('$_apiBase/screen/control'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode({'action': pause ? 'pause' : 'resume'}),
+          )
+          .timeout(const Duration(seconds: 5));
       if (response.statusCode != 200) {
         throw Exception(decodeUtf8Response(response));
       }
@@ -1648,11 +1840,13 @@ class _MyAppState extends State<MyApp> {
   /// Pause/resume a single camera worker on the backend.
   Future<void> _toggleCamera(String cameraId, bool pause) async {
     try {
-      final response = await http.post(
-        Uri.parse('$_apiBase/cameras/$cameraId/control'),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode({'action': pause ? 'pause' : 'resume'}),
-      ).timeout(const Duration(seconds: 5));
+      final response = await http
+          .post(
+            Uri.parse('$_apiBase/cameras/$cameraId/control'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode({'action': pause ? 'pause' : 'resume'}),
+          )
+          .timeout(const Duration(seconds: 5));
       if (response.statusCode != 200) {
         throw Exception(decodeUtf8Response(response));
       }
@@ -1686,16 +1880,19 @@ class _MyAppState extends State<MyApp> {
         frontCamera: _frontCamera,
       );
       final index = _captureSource == CaptureSource.camera ? 2 : 1;
-      if (mounted) setState(() {
-        _currentContext = _contextOptions[index];
-        for (var i = 0; i < _selectedContexts.length; i++) {
-          _selectedContexts[i] = i == index;
-        }
-        _isLive = true;
-        _backendActivity = 'Waiting for ${_captureSource.name} frames';
-      });
+      if (mounted)
+        setState(() {
+          _currentContext = _contextOptions[index];
+          for (var i = 0; i < _selectedContexts.length; i++) {
+            _selectedContexts[i] = i == index;
+          }
+          _isLive = true;
+          _backendActivity = 'Waiting for ${_captureSource.name} frames';
+        });
     } catch (e) {
-      try { await _setBackendCapture(false); } catch (_) {}
+      try {
+        await _setBackendCapture(false);
+      } catch (_) {}
       _showSnack('Failed to start capture: $e');
     }
   }
@@ -1704,10 +1901,11 @@ class _MyAppState extends State<MyApp> {
     await _capture.stop();
     try {
       await _setBackendCapture(false);
-      if (mounted) setState(() {
-        _isLive = false;
-        _backendActivity = 'Capture stopped';
-      });
+      if (mounted)
+        setState(() {
+          _isLive = false;
+          _backendActivity = 'Capture stopped';
+        });
     } catch (e) {
       _showSnack('Capture stopped locally, but backend stop failed: $e');
     }
@@ -1732,13 +1930,16 @@ class _MyAppState extends State<MyApp> {
     final asr = (_backendStatus['asr'] as Map?) ?? const {};
     final asrReady = asr['ready'] == true;
     Widget indicator(Color color, String text) => Padding(
-      padding: const EdgeInsets.only(right: 12, bottom: 4),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Icon(Icons.circle, size: 11, color: color),
-        const SizedBox(width: 5),
-        Text(text, style: const TextStyle(fontSize: 12)),
-      ]),
-    );
+          padding: const EdgeInsets.only(right: 12, bottom: 4),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.circle, size: 11, color: color),
+              const SizedBox(width: 5),
+              Text(text, style: const TextStyle(fontSize: 12)),
+            ],
+          ),
+        );
     return Container(
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
@@ -1746,15 +1947,28 @@ class _MyAppState extends State<MyApp> {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: _line),
       ),
-      child: Wrap(children: [
-        indicator(_backendConnected ? Colors.green : Colors.red,
-            _backendConnected ? 'Backend connected' : 'Backend offline'),
-        indicator(asrReady ? Colors.green : Colors.red,
-            asrReady ? 'Parakeet ready' : 'Parakeet unavailable'),
-        indicator(active ? (healthy ? Colors.green : Colors.orange) : Colors.grey,
-            active ? '${mobile['source']} active ($frames frames)' : 'Vision stopped'),
-        indicator(_isProcessing ? Colors.blue : Colors.grey, _backendActivity),
-      ]),
+      child: Wrap(
+        children: [
+          indicator(
+            _backendConnected ? Colors.green : Colors.red,
+            _backendConnected ? 'Backend connected' : 'Backend offline',
+          ),
+          indicator(
+            asrReady ? Colors.green : Colors.red,
+            asrReady ? 'Parakeet ready' : 'Parakeet unavailable',
+          ),
+          indicator(
+            active ? (healthy ? Colors.green : Colors.orange) : Colors.grey,
+            active
+                ? '${mobile['source']} active ($frames frames)'
+                : 'Vision stopped',
+          ),
+          indicator(
+            _isProcessing ? Colors.blue : Colors.grey,
+            _backendActivity,
+          ),
+        ],
+      ),
     );
   }
 
@@ -1780,13 +1994,19 @@ class _MyAppState extends State<MyApp> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(label,
-                    style: const TextStyle(
-                        fontSize: 13, fontWeight: FontWeight.w600)),
-                Text(statusText,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                Text(
+                  label,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                Text(
+                  statusText,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11, color: Colors.white54),
+                ),
               ],
             ),
           ),
@@ -1795,8 +2015,10 @@ class _MyAppState extends State<MyApp> {
               tooltip: paused ? 'Resume' : 'Pause',
               visualDensity: VisualDensity.compact,
               iconSize: 20,
-              icon: Icon(paused ? Icons.play_circle_fill : Icons.pause_circle_filled,
-                  color: paused ? Colors.greenAccent : Colors.amber),
+              icon: Icon(
+                paused ? Icons.play_circle_fill : Icons.pause_circle_filled,
+                color: paused ? Colors.greenAccent : Colors.amber,
+              ),
               onPressed: onToggle,
             )
           else
@@ -1817,21 +2039,23 @@ class _MyAppState extends State<MyApp> {
 
     final rows = <Widget>[];
     if (screenConfigured) {
-      rows.add(_captureSourceRow(
-        icon: Icons.desktop_windows,
-        label: 'Desktop screen',
-        statusText: screenPaused
-            ? 'Paused'
-            : (screenHealthy
-                ? 'Recording · ${screen['frames'] ?? 0} frames'
-                : 'Starting…'),
-        dotColor: screenPaused
-            ? Colors.amber
-            : (screenHealthy ? Colors.green : Colors.grey),
-        paused: screenPaused,
-        available: true,
-        onToggle: () => _toggleScreen(!screenPaused),
-      ));
+      rows.add(
+        _captureSourceRow(
+          icon: Icons.desktop_windows,
+          label: 'Desktop screen',
+          statusText: screenPaused
+              ? 'Paused'
+              : (screenHealthy
+                  ? 'Recording · ${screen['frames'] ?? 0} frames'
+                  : 'Starting…'),
+          dotColor: screenPaused
+              ? Colors.amber
+              : (screenHealthy ? Colors.green : Colors.grey),
+          paused: screenPaused,
+          available: true,
+          onToggle: () => _toggleScreen(!screenPaused),
+        ),
+      );
     }
     for (final c in cameras) {
       final cam = (c as Map);
@@ -1844,30 +2068,37 @@ class _MyAppState extends State<MyApp> {
       final idle = motion != null &&
           motion['warming'] != true &&
           (motion['motion_frames'] ?? 0) == 0;
-      rows.add(_captureSourceRow(
-        icon: Icons.videocam,
-        label: '${cam['name'] ?? id}',
-        statusText: !connected
-            ? 'Offline${cam['error'] != null ? ' · ${cam['error']}' : ''}'
-            : paused
-                ? 'Paused · $events events'
-                : idle
-                    ? 'Idle · watching for motion · $events events'
-                    : (summary.isNotEmpty ? summary : 'Watching · $events events'),
-        dotColor: !connected
-            ? Colors.red
-            : (paused ? Colors.amber : Colors.green),
-        paused: paused,
-        available: connected,
-        onToggle: () => _toggleCamera(id, !paused),
-      ));
+      rows.add(
+        _captureSourceRow(
+          icon: Icons.videocam,
+          label: '${cam['name'] ?? id}',
+          statusText: !connected
+              ? 'Offline${cam['error'] != null ? ' · ${cam['error']}' : ''}'
+              : paused
+                  ? 'Paused · $events events'
+                  : idle
+                      ? 'Idle · watching for motion · $events events'
+                      : (summary.isNotEmpty
+                          ? summary
+                          : 'Watching · $events events'),
+          dotColor:
+              !connected ? Colors.red : (paused ? Colors.amber : Colors.green),
+          paused: paused,
+          available: connected,
+          onToggle: () => _toggleCamera(id, !paused),
+        ),
+      );
     }
     if (rows.isEmpty) {
-      rows.add(const Padding(
-        padding: EdgeInsets.symmetric(vertical: 6),
-        child: Text('No capture sources active',
-            style: TextStyle(fontSize: 12, color: Colors.white54)),
-      ));
+      rows.add(
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 6),
+          child: Text(
+            'No capture sources active',
+            style: TextStyle(fontSize: 12, color: Colors.white54),
+          ),
+        ),
+      );
     }
 
     return Container(
@@ -1883,12 +2114,15 @@ class _MyAppState extends State<MyApp> {
         children: [
           const Padding(
             padding: EdgeInsets.only(bottom: 4),
-            child: Text('CAPTURE SOURCES',
-                style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 1.2,
-                    color: Colors.white60)),
+            child: Text(
+              'CAPTURE SOURCES',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.2,
+                color: Colors.white60,
+              ),
+            ),
           ),
           ...rows,
         ],
@@ -1922,14 +2156,18 @@ class _MyAppState extends State<MyApp> {
                 selected: _captureSource == CaptureSource.camera,
                 onSelected: running
                     ? null
-                    : (_) => setState(() => _captureSource = CaptureSource.camera),
+                    : (_) => setState(
+                          () => _captureSource = CaptureSource.camera,
+                        ),
               ),
               ChoiceChip(
                 label: const Text('Screen'),
                 selected: _captureSource == CaptureSource.screen,
                 onSelected: running
                     ? null
-                    : (_) => setState(() => _captureSource = CaptureSource.screen),
+                    : (_) => setState(
+                          () => _captureSource = CaptureSource.screen,
+                        ),
               ),
             ],
           ),
@@ -1947,8 +2185,7 @@ class _MyAppState extends State<MyApp> {
                 ),
               ),
               const SizedBox(width: 8),
-              if (running)
-                _buttonsProcessing('Set FPS', 60, _applyFps),
+              if (running) _buttonsProcessing('Set FPS', 60, _applyFps),
               if (_captureSource == CaptureSource.camera && !running) ...[
                 const SizedBox(width: 12),
                 const Text('Front', style: TextStyle(fontSize: 14)),
@@ -2046,10 +2283,9 @@ class _MyAppState extends State<MyApp> {
   }
 
   Widget _buildTapToSpeakButton() {
-    Color color =
-        _isProcessing
-            ? _muted
-            : (_isRecording ? const Color(0xFFFF607C) : _mint);
+    Color color = _isProcessing
+        ? _muted
+        : (_isRecording ? const Color(0xFFFF607C) : _mint);
 
     return GestureDetector(
       onTapDown: _isProcessing ? null : (_) => _start(),
@@ -2108,8 +2344,10 @@ class _MyAppState extends State<MyApp> {
                       ? 'Listening…'
                       : 'Type a message to HomeMind',
                   hintStyle: const TextStyle(color: _muted, fontSize: 13),
-                  contentPadding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 12,
+                  ),
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(14),
                     borderSide: const BorderSide(color: _line),
@@ -2139,10 +2377,15 @@ class _MyAppState extends State<MyApp> {
                       width: 18,
                       height: 18,
                       child: CircularProgressIndicator(
-                          strokeWidth: 2, color: _mint),
+                        strokeWidth: 2,
+                        color: _mint,
+                      ),
                     )
-                  : Icon(Icons.send_rounded,
-                      size: 20, color: canSend ? _ink : _muted),
+                  : Icon(
+                      Icons.send_rounded,
+                      size: 20,
+                      color: canSend ? _ink : _muted,
+                    ),
             ),
           ],
         );
@@ -2158,9 +2401,10 @@ class _MyAppState extends State<MyApp> {
         itemBuilder: (context, index) {
           final message = _chatHistory[index];
           return MessageBubble(
-              message: message,
-              audioPlayer: _audioPlayer,
-              apiBase: _apiBase);
+            message: message,
+            audioPlayer: _audioPlayer,
+            apiBase: _apiBase,
+          );
         },
       ),
     );
@@ -2181,16 +2425,21 @@ class _MyAppState extends State<MyApp> {
     return SettingsScreen(
       reflectionShortcut: _reflectShortcut,
       sourceReflectionShortcut: _sourceReflectShortcut,
+      clipboardAnswerShortcut: _clipboardAnswerShortcut,
       reflectFrames: _reflectFrames,
       onReflectionShortcutChanged: _updateReflectShortcut,
       onSourceReflectionShortcutChanged: _updateSourceReflectShortcut,
+      onClipboardAnswerShortcutChanged: _updateClipboardAnswerShortcut,
       onReflectNow: _reflectOnScreen,
       onChooseReflectionSource: _showReflectionSourcePicker,
+      onAnswerClipboard: _answerClipboard,
       promptShortcuts: _promptShortcuts,
       onPromptShortcutChanged: _updatePromptShortcut,
       promptTexts: _promptTexts,
       onPromptTextChanged: _updatePromptText,
       onRunPrompt: _runPromptPreset,
+      clipboardAnswerPrompt: _clipboardAnswerPrompt,
+      onClipboardAnswerPromptChanged: _updateClipboardAnswerPrompt,
       globalHotkeysSupported: _globalHotkeys.isSupported,
       globalHotkeyError: _globalHotkeyError,
       kokoroVoice: _kokoroVoice,
@@ -2232,22 +2481,29 @@ class _MyAppState extends State<MyApp> {
                 Icon(icon, size: 19, color: selected ? _mint : _muted),
                 const SizedBox(width: 11),
                 Expanded(
-                  child: Text(label,
-                      style: TextStyle(
-                          color: selected ? Colors.white : Colors.white70,
-                          fontSize: 13,
-                          fontWeight:
-                              selected ? FontWeight.w700 : FontWeight.w500)),
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                      color: selected ? Colors.white : Colors.white70,
+                      fontSize: 13,
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                    ),
+                  ),
                 ),
                 if (badge != null)
                   Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 2,
+                    ),
                     decoration: BoxDecoration(
-                        color: _panelRaised,
-                        borderRadius: BorderRadius.circular(10)),
-                    child: Text(badge,
-                        style: const TextStyle(color: _muted, fontSize: 10)),
+                      color: _panelRaised,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      badge,
+                      style: const TextStyle(color: _muted, fontSize: 10),
+                    ),
                   ),
               ],
             ),
@@ -2276,19 +2532,28 @@ class _MyAppState extends State<MyApp> {
                       gradient: const LinearGradient(colors: [_mint, _violet]),
                       borderRadius: BorderRadius.circular(12),
                     ),
-                    child:
-                        const Icon(Icons.auto_awesome, color: _ink, size: 20),
+                    child: const Icon(
+                      Icons.auto_awesome,
+                      color: _ink,
+                      size: 20,
+                    ),
                   ),
                   const SizedBox(width: 11),
                   const Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text('HomeMind',
-                            style: TextStyle(
-                                fontSize: 17, fontWeight: FontWeight.w800)),
-                        Text('Personal workspace',
-                            style: TextStyle(color: _muted, fontSize: 10)),
+                        Text(
+                          'HomeMind',
+                          style: TextStyle(
+                            fontSize: 17,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        Text(
+                          'Personal workspace',
+                          style: TextStyle(color: _muted, fontSize: 10),
+                        ),
                       ],
                     ),
                   ),
@@ -2301,16 +2566,17 @@ class _MyAppState extends State<MyApp> {
               ),
             ),
             _workspaceNavItem(
-                icon: Icons.home_rounded,
-                label: 'Home',
-                selected: _workspaceIndex == 0,
-                onTap: () {
-                  if (drawer) {
-                    Navigator.pop(context);
-                  } else {
-                    setState(() => _workspaceIndex = 0);
-                  }
-                }),
+              icon: Icons.home_rounded,
+              label: 'Home',
+              selected: _workspaceIndex == 0,
+              onTap: () {
+                if (drawer) {
+                  Navigator.pop(context);
+                } else {
+                  setState(() => _workspaceIndex = 0);
+                }
+              },
+            ),
             _workspaceNavItem(
               icon: Icons.auto_awesome,
               label: 'Assistant',
@@ -2329,25 +2595,29 @@ class _MyAppState extends State<MyApp> {
               icon: Icons.manage_search,
               label: 'Memory',
               selected: _workspaceIndex == 3,
-              onTap: () =>
-                  _openWorkspace(3, MemoryTimelineScreen(apiBase: _apiBase)),
+              onTap: () => _openWorkspace(
+                3,
+                MemoryTimelineScreen(apiBase: _apiBase),
+              ),
             ),
             _workspaceNavItem(
               icon: Icons.notifications_none_outlined,
               label: 'Notifications',
-              badge:
-                  _unreadNotifications > 0 ? '$_unreadNotifications' : null,
+              badge: _unreadNotifications > 0 ? '$_unreadNotifications' : null,
               selected: _workspaceIndex == 4,
               onTap: _openNotifications,
             ),
             const Padding(
               padding: EdgeInsets.fromLTRB(21, 22, 20, 7),
-              child: Text('SYSTEM',
-                  style: TextStyle(
-                      color: _muted,
-                      fontSize: 9,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 1.4)),
+              child: Text(
+                'SYSTEM',
+                style: TextStyle(
+                  color: _muted,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1.4,
+                ),
+              ),
             ),
             _workspaceNavItem(
               icon: _notificationsMuted
@@ -2388,9 +2658,8 @@ class _MyAppState extends State<MyApp> {
                     width: 9,
                     height: 9,
                     decoration: BoxDecoration(
-                      color: _backendConnected
-                          ? _mint
-                          : const Color(0xFFFF718B),
+                      color:
+                          _backendConnected ? _mint : const Color(0xFFFF718B),
                       shape: BoxShape.circle,
                     ),
                   ),
@@ -2400,16 +2669,20 @@ class _MyAppState extends State<MyApp> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                            _backendConnected
-                                ? 'Home hub online'
-                                : 'Home hub offline',
-                            style: const TextStyle(
-                                fontSize: 11, fontWeight: FontWeight.w700)),
-                        Text(_backendActivity,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style:
-                                const TextStyle(color: _muted, fontSize: 9)),
+                          _backendConnected
+                              ? 'Home hub online'
+                              : 'Home hub offline',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        Text(
+                          _backendActivity,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: _muted, fontSize: 9),
+                        ),
                       ],
                     ),
                   ),
@@ -2429,15 +2702,18 @@ class _MyAppState extends State<MyApp> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('Home',
-                  style: TextStyle(
-                      fontSize: 24,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: -.5)),
-              Text('Your activity, conversation, and home context',
-                  style: TextStyle(
-                      color: _muted,
-                      fontSize: 11)),
+              Text(
+                'Home',
+                style: TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: -.5,
+                ),
+              ),
+              Text(
+                'Your activity, conversation, and home context',
+                style: TextStyle(color: _muted, fontSize: 11),
+              ),
             ],
           ),
         ),
@@ -2478,13 +2754,20 @@ class _MyAppState extends State<MyApp> {
               ),
             ),
             const SizedBox(height: 22),
-            const Text('Home hub',
-                style: TextStyle(fontSize: 19, fontWeight: FontWeight.w700)),
+            const Text(
+              'Home hub',
+              style: TextStyle(fontSize: 19, fontWeight: FontWeight.w700),
+            ),
             const SizedBox(height: 5),
-            const Text('Connect this device to your local assistant.',
-                style: TextStyle(color: _muted, fontSize: 12)),
+            const Text(
+              'Connect this device to your local assistant.',
+              style: TextStyle(color: _muted, fontSize: 12),
+            ),
             const SizedBox(height: 18),
-            SizedBox(width: double.infinity, child: _bodyTextarea(MediaQuery.sizeOf(context))),
+            SizedBox(
+              width: double.infinity,
+              child: _bodyTextarea(MediaQuery.sizeOf(context)),
+            ),
             const SizedBox(height: 14),
             SizedBox(
               width: double.infinity,
@@ -2532,15 +2815,23 @@ class _MyAppState extends State<MyApp> {
           }) {
             return SwitchListTile.adaptive(
               contentPadding: const EdgeInsets.symmetric(horizontal: 4),
-              secondary: Icon(icon,
-                  color: onChanged == null ? _muted.withValues(alpha: .45) : _mint),
-              title: Text(title,
-                  style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w700,
-                      color: onChanged == null ? _muted : Colors.white)),
-              subtitle: Text(subtitle,
-                  style: const TextStyle(color: _muted, fontSize: 10.5)),
+              secondary: Icon(
+                icon,
+                color:
+                    onChanged == null ? _muted.withValues(alpha: .45) : _mint,
+              ),
+              title: Text(
+                title,
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                  color: onChanged == null ? _muted : Colors.white,
+                ),
+              ),
+              subtitle: Text(
+                subtitle,
+                style: const TextStyle(color: _muted, fontSize: 10.5),
+              ),
               value: value,
               activeTrackColor: _mint,
               onChanged: onChanged,
@@ -2567,9 +2858,13 @@ class _MyAppState extends State<MyApp> {
                     ),
                   ),
                   const SizedBox(height: 18),
-                  const Text('Initiative & alerts',
-                      style:
-                          TextStyle(fontSize: 19, fontWeight: FontWeight.w800)),
+                  const Text(
+                    'Initiative & alerts',
+                    style: TextStyle(
+                      fontSize: 19,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
                   const SizedBox(height: 5),
                   const Text(
                     'Choose how HomeMind reaches you. These are delivery controls; '
@@ -2602,7 +2897,8 @@ class _MyAppState extends State<MyApp> {
                           value: _proactiveVoiceEnabled,
                           onChanged: proactiveControlsEnabled
                               ? (value) => update(
-                                  () => _proactiveVoiceEnabled = value)
+                                    () => _proactiveVoiceEnabled = value,
+                                  )
                               : null,
                         ),
                         toggle(
@@ -2612,8 +2908,9 @@ class _MyAppState extends State<MyApp> {
                               'Add proactive insights to the Home conversation feed.',
                           value: _proactiveFeedEnabled,
                           onChanged: proactiveControlsEnabled
-                              ? (value) =>
-                                  update(() => _proactiveFeedEnabled = value)
+                              ? (value) => update(
+                                    () => _proactiveFeedEnabled = value,
+                                  )
                               : null,
                         ),
                         toggle(
@@ -2622,11 +2919,13 @@ class _MyAppState extends State<MyApp> {
                           subtitle:
                               'Deliver insights as Android system notifications, including in the background.',
                           value: _proactiveNotificationsEnabled,
-                          onChanged:
-                              proactiveControlsEnabled && notificationControlsEnabled
-                                  ? (value) => update(() =>
-                                      _proactiveNotificationsEnabled = value)
-                                  : null,
+                          onChanged: proactiveControlsEnabled &&
+                                  notificationControlsEnabled
+                              ? (value) => update(
+                                    () =>
+                                        _proactiveNotificationsEnabled = value,
+                                  )
+                              : null,
                         ),
                       ],
                     ),
@@ -2634,12 +2933,15 @@ class _MyAppState extends State<MyApp> {
                   const SizedBox(height: 14),
                   const Padding(
                     padding: EdgeInsets.only(left: 4, bottom: 7),
-                    child: Text('NOTIFICATIONS',
-                        style: TextStyle(
-                            color: _muted,
-                            fontSize: 9,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: 1.3)),
+                    child: Text(
+                      'NOTIFICATIONS',
+                      style: TextStyle(
+                        color: _muted,
+                        fontSize: 9,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 1.3,
+                      ),
+                    ),
                   ),
                   Container(
                     decoration: BoxDecoration(
@@ -2657,7 +2959,8 @@ class _MyAppState extends State<MyApp> {
                           value: _eventNotificationsEnabled,
                           onChanged: notificationControlsEnabled
                               ? (value) => update(
-                                  () => _eventNotificationsEnabled = value)
+                                    () => _eventNotificationsEnabled = value,
+                                  )
                               : null,
                         ),
                         const Divider(height: 1, color: _line),
@@ -2714,10 +3017,14 @@ class _MyAppState extends State<MyApp> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('HomeMind',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
-              Text('Your home, in sync',
-                  style: TextStyle(color: _muted, fontSize: 10)),
+              Text(
+                'HomeMind',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+              ),
+              Text(
+                'Your home, in sync',
+                style: TextStyle(color: _muted, fontSize: 10),
+              ),
             ],
           ),
         ),
@@ -2744,12 +3051,16 @@ class _MyAppState extends State<MyApp> {
       ),
       child: Row(
         children: [
-          Icon(Icons.circle,
-              size: 8, color: ready ? _mint : const Color(0xFFFF718B)),
+          Icon(
+            Icons.circle,
+            size: 8,
+            color: ready ? _mint : const Color(0xFFFF718B),
+          ),
           const SizedBox(width: 8),
-          Text(ready ? 'Home hub online' : 'Home hub offline',
-              style:
-                  const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)),
+          Text(
+            ready ? 'Home hub online' : 'Home hub offline',
+            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+          ),
           const Spacer(),
           Flexible(
             child: Text(
@@ -2813,7 +3124,11 @@ class _MyAppState extends State<MyApp> {
         borderRadius: BorderRadius.circular(24),
         border: Border.all(color: _line),
         boxShadow: const [
-          BoxShadow(color: Color(0x33000000), blurRadius: 30, offset: Offset(0, 14)),
+          BoxShadow(
+            color: Color(0x33000000),
+            blurRadius: 30,
+            offset: Offset(0, 14),
+          ),
         ],
       ),
       child: Column(
@@ -2824,15 +3139,19 @@ class _MyAppState extends State<MyApp> {
               children: [
                 const Icon(Icons.forum_outlined, color: _mint, size: 19),
                 const SizedBox(width: 9),
-                const Text('Conversation',
-                    style:
-                        TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+                const Text(
+                  'Conversation',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+                ),
                 const Spacer(),
                 IconButton(
                   tooltip: 'Clear conversation',
                   onPressed: _clearChatHistory,
-                  icon: const Icon(Icons.delete_sweep_outlined,
-                      color: _muted, size: 20),
+                  icon: const Icon(
+                    Icons.delete_sweep_outlined,
+                    color: _muted,
+                    size: 20,
+                  ),
                 ),
               ],
             ),
@@ -2846,12 +3165,18 @@ class _MyAppState extends State<MyApp> {
                   children: [
                     Icon(Icons.waves_rounded, color: _mint, size: 42),
                     SizedBox(height: 14),
-                    Text('Your home is listening',
-                        style: TextStyle(
-                            fontSize: 17, fontWeight: FontWeight.w700)),
+                    Text(
+                      'Your home is listening',
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
                     SizedBox(height: 6),
-                    Text('Hold the microphone, or type a message',
-                        style: TextStyle(color: _muted, fontSize: 12)),
+                    Text(
+                      'Hold the microphone, or type a message',
+                      style: TextStyle(color: _muted, fontSize: 12),
+                    ),
                   ],
                 ),
               ),
@@ -2882,15 +3207,19 @@ class _MyAppState extends State<MyApp> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(_isRecording ? 'Listening…' : 'Hold to speak',
-                              style: const TextStyle(
-                                  fontSize: 13, fontWeight: FontWeight.w700)),
                           Text(
-                              _isProcessing
-                                  ? 'HomeMind is thinking'
-                                  : 'Release when you are finished',
-                              style:
-                                  const TextStyle(color: _muted, fontSize: 10)),
+                            _isRecording ? 'Listening…' : 'Hold to speak',
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          Text(
+                            _isProcessing
+                                ? 'HomeMind is thinking'
+                                : 'Release when you are finished',
+                            style: const TextStyle(color: _muted, fontSize: 10),
+                          ),
                         ],
                       ),
                     ),
@@ -2918,11 +3247,17 @@ class _MyAppState extends State<MyApp> {
   }
 
   Widget _buildContextSelector() {
-    const icons = [Icons.mic_none, Icons.monitor_outlined, Icons.camera_alt_outlined];
+    const icons = [
+      Icons.mic_none,
+      Icons.monitor_outlined,
+      Icons.camera_alt_outlined,
+    ];
     return Container(
       padding: const EdgeInsets.all(5),
       decoration: BoxDecoration(
-          color: _ink, borderRadius: BorderRadius.circular(15)),
+        color: _ink,
+        borderRadius: BorderRadius.circular(15),
+      ),
       child: Row(
         children: List.generate(_contextOptions.length, (index) {
           final selected = _selectedContexts[index];
@@ -2947,15 +3282,21 @@ class _MyAppState extends State<MyApp> {
                 ),
                 child: Column(
                   children: [
-                    Icon(icons[index],
-                        size: 18, color: selected ? _mint : _muted),
+                    Icon(
+                      icons[index],
+                      size: 18,
+                      color: selected ? _mint : _muted,
+                    ),
                     const SizedBox(height: 4),
-                    Text(_contextOptions[index].toUpperCase(),
-                        style: TextStyle(
-                            color: selected ? Colors.white : _muted,
-                            fontSize: 9,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: .6)),
+                    Text(
+                      _contextOptions[index].toUpperCase(),
+                      style: TextStyle(
+                        color: selected ? Colors.white : _muted,
+                        fontSize: 9,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: .6,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -2977,12 +3318,15 @@ class _MyAppState extends State<MyApp> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('PERCEPTION MODE',
-              style: TextStyle(
-                  color: _muted,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 1.4)),
+          const Text(
+            'PERCEPTION MODE',
+            style: TextStyle(
+              color: _muted,
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.4,
+            ),
+          ),
           const SizedBox(height: 10),
           _buildContextSelector(),
           const SizedBox(height: 16),
@@ -2994,8 +3338,11 @@ class _MyAppState extends State<MyApp> {
             spacing: 8,
             runSpacing: 8,
             children: [
-              _buildToggleSwitch('Conversation', _isTalking,
-                  (v) => setState(() => _isTalking = v)),
+              _buildToggleSwitch(
+                'Conversation',
+                _isTalking,
+                (v) => setState(() => _isTalking = v),
+              ),
               _buildToggleSwitch('Live', _isLive, (v) {
                 if (v && _currentContext == 'talker') {
                   _showSnack('Choose Screen or Camera before enabling Live');
@@ -3003,8 +3350,11 @@ class _MyAppState extends State<MyApp> {
                 }
                 setState(() => _isLive = v);
               }),
-              _buildToggleSwitch('Memory', _useMemory,
-                  (v) => setState(() => _useMemory = v)),
+              _buildToggleSwitch(
+                'Memory',
+                _useMemory,
+                (v) => setState(() => _useMemory = v),
+              ),
             ],
           ),
           const SizedBox(height: 12),
@@ -3053,13 +3403,18 @@ class _MyAppState extends State<MyApp> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(title,
-                          style: const TextStyle(
-                              fontSize: 12, fontWeight: FontWeight.w700)),
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
                       const SizedBox(height: 2),
-                      Text(subtitle,
-                          style:
-                              const TextStyle(color: _muted, fontSize: 9.5)),
+                      Text(
+                        subtitle,
+                        style: const TextStyle(color: _muted, fontSize: 9.5),
+                      ),
                     ],
                   ),
                 ),
@@ -3081,20 +3436,22 @@ class _MyAppState extends State<MyApp> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('QUICK ACCESS',
-              style: TextStyle(
-                  color: _muted,
-                  fontSize: 9,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 1.3)),
+          const Text(
+            'QUICK ACCESS',
+            style: TextStyle(
+              color: _muted,
+              fontSize: 9,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.3,
+            ),
+          ),
           const SizedBox(height: 10),
           action(
             icon: Icons.auto_awesome,
             title: 'Grounded assistant',
             subtitle: 'Ask with citations from memory',
             color: _mint,
-            onTap: () =>
-                _openWorkspace(1, AssistantScreen(apiBase: _apiBase)),
+            onTap: () => _openWorkspace(1, AssistantScreen(apiBase: _apiBase)),
           ),
           const SizedBox(height: 7),
           action(
@@ -3102,8 +3459,7 @@ class _MyAppState extends State<MyApp> {
             title: 'Rooms',
             subtitle: 'Continue a project or topic',
             color: _violet,
-            onTap: () =>
-                _openWorkspace(2, RoomsListScreen(apiBase: _apiBase)),
+            onTap: () => _openWorkspace(2, RoomsListScreen(apiBase: _apiBase)),
           ),
           const SizedBox(height: 7),
           action(
@@ -3163,8 +3519,11 @@ class _MyAppState extends State<MyApp> {
           Row(
             children: [
               Expanded(
-                child: _buildToggleSwitch('Talk', _isTalking,
-                    (v) => setState(() => _isTalking = v)),
+                child: _buildToggleSwitch(
+                  'Talk',
+                  _isTalking,
+                  (v) => setState(() => _isTalking = v),
+                ),
               ),
               const SizedBox(width: 6),
               Expanded(
@@ -3178,8 +3537,11 @@ class _MyAppState extends State<MyApp> {
               ),
               const SizedBox(width: 6),
               Expanded(
-                child: _buildToggleSwitch('Memory', _useMemory,
-                    (v) => setState(() => _useMemory = v)),
+                child: _buildToggleSwitch(
+                  'Memory',
+                  _useMemory,
+                  (v) => setState(() => _useMemory = v),
+                ),
               ),
             ],
           ),
@@ -3190,18 +3552,18 @@ class _MyAppState extends State<MyApp> {
                 child: FilledButton.tonalIcon(
                   onPressed: _reflecting ? null : _reflectOnScreen,
                   icon: Icon(
-                      _reflecting
-                          ? Icons.hourglass_top
-                          : Icons.psychology_outlined,
-                      size: 17),
+                    _reflecting
+                        ? Icons.hourglass_top
+                        : Icons.psychology_outlined,
+                    size: 17,
+                  ),
                   label: Text(_reflecting ? 'Working…' : 'Reflect'),
                 ),
               ),
               const SizedBox(width: 6),
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed:
-                      _reflecting ? null : _showReflectionSourcePicker,
+                  onPressed: _reflecting ? null : _showReflectionSourcePicker,
                   icon: const Icon(Icons.add_to_photos_outlined, size: 17),
                   label: const Text('Source'),
                 ),
@@ -3221,14 +3583,24 @@ class _MyAppState extends State<MyApp> {
             dense: true,
             contentPadding: const EdgeInsets.fromLTRB(4, 4, 4, 0),
             onTap: _showCaptureSheet,
-            leading:
-                const Icon(Icons.center_focus_strong, color: _muted, size: 19),
-            title: const Text('Capture & privacy',
-                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
-            subtitle: const Text('Camera, screen and stored memory',
-                style: TextStyle(color: _muted, fontSize: 10)),
-            trailing:
-                const Icon(Icons.chevron_right_rounded, color: _muted, size: 20),
+            leading: const Icon(
+              Icons.center_focus_strong,
+              color: _muted,
+              size: 19,
+            ),
+            title: const Text(
+              'Capture & privacy',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+            ),
+            subtitle: const Text(
+              'Camera, screen and stored memory',
+              style: TextStyle(color: _muted, fontSize: 10),
+            ),
+            trailing: const Icon(
+              Icons.chevron_right_rounded,
+              color: _muted,
+              size: 20,
+            ),
           ),
         ],
       ),
@@ -3247,6 +3619,10 @@ class _MyAppState extends State<MyApp> {
     if (sourceReflectShortcut != null) {
       shortcutBindings[sourceReflectShortcut.activator] =
           _showReflectionSourcePicker;
+    }
+    final clipboardAnswerShortcut = _clipboardAnswerShortcut;
+    if (clipboardAnswerShortcut != null) {
+      shortcutBindings[clipboardAnswerShortcut.activator] = _answerClipboard;
     }
     for (final preset in reflectionPromptPresets) {
       final shortcut = _promptShortcuts[preset.id];
@@ -3273,115 +3649,127 @@ class _MyAppState extends State<MyApp> {
           child: _buildWorkspaceSidebar(drawer: true),
         ),
       ),
-      body: LayoutBuilder(builder: (context, constraints) {
-        final desktop = constraints.maxWidth >= 960;
-        final home = Container(
-          decoration: const BoxDecoration(
-            gradient: RadialGradient(
-              center: Alignment(-.8, -1),
-              radius: 1.25,
-              colors: [Color(0xFF132235), _ink],
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final desktop = constraints.maxWidth >= 960;
+          final home = Container(
+            decoration: const BoxDecoration(
+              gradient: RadialGradient(
+                center: Alignment(-.8, -1),
+                radius: 1.25,
+                colors: [Color(0xFF132235), _ink],
+              ),
             ),
-          ),
-          child: SafeArea(
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 1380),
-                child: Padding(
-                  padding: EdgeInsets.fromLTRB(
-                      desktop ? 22 : 14, 14, desktop ? 22 : 14, 14),
-                  child: desktop
-                      ? Column(
-                          children: [
-                            _buildHeader(s),
-                            const SizedBox(height: 14),
-                            Align(
+            child: SafeArea(
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 1380),
+                  child: Padding(
+                    padding: EdgeInsets.fromLTRB(
+                      desktop ? 22 : 14,
+                      14,
+                      desktop ? 22 : 14,
+                      14,
+                    ),
+                    child: desktop
+                        ? Column(
+                            children: [
+                              _buildHeader(s),
+                              const SizedBox(height: 14),
+                              Align(
                                 alignment: Alignment.centerLeft,
-                                child: _buildBackendIndicators()),
-                            const SizedBox(height: 14),
-                            Expanded(
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [
-                                  Expanded(
+                                child: _buildBackendIndicators(),
+                              ),
+                              const SizedBox(height: 14),
+                              Expanded(
+                                child: Row(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.stretch,
+                                  children: [
+                                    Expanded(
                                       flex: 5,
-                                      child: _buildConversationCard()),
-                                  const SizedBox(width: 14),
-                                  SizedBox(
-                                    width: 348,
-                                    child: SingleChildScrollView(
-                                      child: Column(
-                                        children: [
-                                          _buildQuickAccessPanel(),
-                                          const SizedBox(height: 12),
-                                          _buildControlPanel(),
-                                        ],
+                                      child: _buildConversationCard(),
+                                    ),
+                                    const SizedBox(width: 14),
+                                    SizedBox(
+                                      width: 348,
+                                      child: SingleChildScrollView(
+                                        child: Column(
+                                          children: [
+                                            _buildQuickAccessPanel(),
+                                            const SizedBox(height: 12),
+                                            _buildControlPanel(),
+                                          ],
+                                        ),
                                       ),
                                     ),
-                                  ),
-                                ],
+                                  ],
+                                ),
                               ),
-                            ),
-                          ],
-                        )
-                      : Column(
-                          children: [
-                            _buildMobileHeader(),
-                            const SizedBox(height: 10),
-                            _buildMobileStatus(),
-                            const SizedBox(height: 10),
-                            Expanded(child: _buildConversationCard()),
-                            const SizedBox(height: 10),
-                            _buildMobileControls(),
-                          ],
-                        ),
+                            ],
+                          )
+                        : Column(
+                            children: [
+                              _buildMobileHeader(),
+                              const SizedBox(height: 10),
+                              _buildMobileStatus(),
+                              const SizedBox(height: 10),
+                              Expanded(child: _buildConversationCard()),
+                              const SizedBox(height: 10),
+                              _buildMobileControls(),
+                            ],
+                          ),
+                  ),
                 ),
               ),
             ),
-          ),
-        );
-        if (!desktop) return home;
-        final Widget workspace;
-        switch (_workspaceIndex) {
-          case 1:
-            workspace = AssistantScreen(apiBase: _apiBase);
-            break;
-          case 2:
-            workspace = RoomsListScreen(apiBase: _apiBase);
-            break;
-          case 3:
-            workspace = MemoryTimelineScreen(apiBase: _apiBase);
-            break;
-          case 4:
-            workspace = NotificationsScreen(
-              apiBase: _apiBase,
-              onUnreadChanged: (count) {
-                if (mounted) {
-                  setState(() => _unreadNotifications = count);
-                }
-              },
-            );
-            break;
-          case 5:
-            workspace = _settingsScreen();
-            break;
-          default:
-            workspace = home;
-        }
-        return Row(
-          children: [
-            _buildWorkspaceSidebar(),
-            const VerticalDivider(width: 1, thickness: 1, color: _line),
-            Expanded(child: workspace),
-          ],
-        );
-      }),
+          );
+          if (!desktop) return home;
+          final Widget workspace;
+          switch (_workspaceIndex) {
+            case 1:
+              workspace = AssistantScreen(apiBase: _apiBase);
+              break;
+            case 2:
+              workspace = RoomsListScreen(apiBase: _apiBase);
+              break;
+            case 3:
+              workspace = MemoryTimelineScreen(apiBase: _apiBase);
+              break;
+            case 4:
+              workspace = NotificationsScreen(
+                apiBase: _apiBase,
+                onUnreadChanged: (count) {
+                  if (mounted) {
+                    setState(() => _unreadNotifications = count);
+                  }
+                },
+              );
+              break;
+            case 5:
+              workspace = _settingsScreen();
+              break;
+            default:
+              workspace = home;
+          }
+          return Row(
+            children: [
+              _buildWorkspaceSidebar(),
+              const VerticalDivider(width: 1, thickness: 1, color: _line),
+              Expanded(child: workspace),
+            ],
+          );
+        },
+      ),
     );
   }
 
   // Helper method to reduce code duplication for switches
   Widget _buildToggleSwitch(
-      String title, bool value, ValueChanged<bool> onChanged) {
+    String title,
+    bool value,
+    ValueChanged<bool> onChanged,
+  ) {
     return FilterChip(
       selected: value,
       onSelected: onChanged,
@@ -3404,12 +3792,12 @@ class MessageBubble extends StatelessWidget {
   final AudioPlayer audioPlayer;
   final String apiBase;
 
-  const MessageBubble(
-      {Key? key,
-      required this.message,
-      required this.audioPlayer,
-      this.apiBase = ''})
-      : super(key: key);
+  const MessageBubble({
+    Key? key,
+    required this.message,
+    required this.audioPlayer,
+    this.apiBase = '',
+  }) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
@@ -3449,7 +3837,10 @@ class MessageBubble extends StatelessWidget {
                   child: Text(
                     message.text,
                     style: const TextStyle(
-                        fontSize: 14, color: Color(0xFFE9EEF7), height: 1.45),
+                      fontSize: 14,
+                      color: Color(0xFFE9EEF7),
+                      height: 1.45,
+                    ),
                   ),
                 ),
                 if (!isUserMessage &&
@@ -3484,9 +3875,14 @@ class MessageBubble extends StatelessWidget {
         playsSeconds: message.clipPlaysSeconds,
       ),
       icon: Icon(Icons.play_circle_outline, size: 15, color: accent),
-      label: Text('Watch what I saw',
-          style: TextStyle(
-              fontSize: 11, color: accent, fontWeight: FontWeight.w700)),
+      label: Text(
+        'Watch what I saw',
+        style: TextStyle(
+          fontSize: 11,
+          color: accent,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
     );
   }
 

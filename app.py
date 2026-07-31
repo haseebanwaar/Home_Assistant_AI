@@ -9,6 +9,7 @@ import datetime
 import time
 import uuid
 import wave
+from pathlib import Path
 from threading import Lock
 
 import nest_asyncio
@@ -33,7 +34,7 @@ from providers.tts.kokoro.kokoro_tts import (
 )
 from vector_store.activity_logger import ActivityLogger
 from sources.screen import RealtimeScreenCapture
-from sources.idle import InputIdleGate
+from sources.idle import PresenceGate
 from sources.camera_manager import CameraManager
 from sources.clips import ClipStore, parse_range, valid_clip_id
 from sources.frame_budget import fit_frames, frames_as_video
@@ -375,13 +376,17 @@ async def startup_event():
     else:
         logger.info("Proactive narrator disabled.")
 
-    # Keyboard/mouse presence, shared by the capture loop (which stops capturing
-    # while the user is away) and the timeline (which stops crediting time).
+    # Presence, shared by the capture loop (which stops capturing when nobody is
+    # there) and the timeline (which stops crediting time). Keyboard/mouse is the
+    # primary signal; a repainting screen covers watching, which has no input.
     # INPUT_IDLE_TIMEOUT_SECONDS=0 opts out of both.
-    screen_idle_gate = InputIdleGate()
-    logger.info("Input idle cut-off: %s",
-                f"{screen_idle_gate.timeout_seconds:.0f}s"
-                if screen_idle_gate.enabled else "disabled")
+    screen_presence_gate = PresenceGate()
+    logger.info("Presence: input cut-off %s, watching allowed while >%.1f%% of "
+                "the screen repaints, for up to %.0f min without input.",
+                f"{screen_presence_gate.input.timeout_seconds:.0f}s"
+                if screen_presence_gate.input.enabled else "disabled",
+                screen_presence_gate.change_fraction * 100.0,
+                screen_presence_gate.max_playback_minutes)
 
     # Step-a: optional live memory pipeline (sessions/events/knowledge + stores).
     # Fully opt-in — unset LIVE_MEMORY leaves the legacy per-minute path unchanged.
@@ -409,7 +414,7 @@ async def startup_event():
             # Screen time is the user's time: an event ends no later than the
             # keyboard/mouse cut-off after they last touched the machine, so a
             # window left in the foreground can't collect the hours they were away.
-            idle_grace_seconds=screen_idle_gate.timeout_seconds or None,
+            idle_grace_seconds=screen_presence_gate.input.timeout_seconds or None,
         )
         logger.info("LIVE_MEMORY enabled (graph=%s).", neo4j_store is not None)
     else:
@@ -446,7 +451,7 @@ async def startup_event():
             insight_callback=insight_callback,
             pipeline=memory_pipeline,
             clip_store=clip_store,
-            idle_gate=screen_idle_gate,
+            presence_gate=screen_presence_gate,
         )
         logger.info("Screen capture enabled (monitor=%d).", screen_stream.monitor_index)
     else:
@@ -1154,6 +1159,55 @@ async def agent_runtime_status():
     return agent_runtime.status()
 
 
+def _validate_room_agent_settings(data):
+    """Normalize persisted room execution settings from create/patch payloads."""
+    if "assistant_mode" in data:
+        mode = str(data.get("assistant_mode") or "").strip().lower()
+        if mode not in {"chat", "agent"}:
+            raise ValueError("assistant_mode must be 'chat' or 'agent'")
+        data["assistant_mode"] = mode
+    if "agent_tools" in data:
+        raw = data.get("agent_tools")
+        if not isinstance(raw, list):
+            raise ValueError("agent_tools must be a list")
+        available = {
+            tool["id"] for tool in agent_runtime.status().get("available_tools", [])
+        }
+        selected = list(dict.fromkeys(str(item).strip() for item in raw if str(item).strip()))
+        unknown = [item for item in selected if item not in available]
+        if unknown:
+            raise ValueError("unknown agent tools: " + ", ".join(unknown))
+        data["agent_tools"] = selected
+    if "agent_workspace" in data:
+        workspace = str(data.get("agent_workspace") or "").strip()
+        # Resolve here as validation, but only create it when an agent actually
+        # runs. This catches relative traversal before it reaches persistence.
+        if workspace:
+            root = Path(agent_runtime.config.workspace_root).expanduser().resolve()
+            requested = Path(workspace).expanduser()
+            if not requested.is_absolute():
+                resolved = (root / requested).resolve()
+                if not resolved.is_relative_to(root):
+                    raise ValueError(
+                        "relative agent_workspace must stay inside "
+                        "AGENT_WORKSPACE_ROOT")
+        data["agent_workspace"] = workspace
+    for field, maximum in (
+        ("agent_request_limit", 256),
+        ("agent_tool_calls_limit", 1024),
+    ):
+        if field not in data:
+            continue
+        try:
+            value = int(data.get(field) or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be an integer") from exc
+        if value < 0 or value > maximum:
+            raise ValueError(f"{field} must be between 0 and {maximum}")
+        data[field] = value
+    return data
+
+
 @app.post("/rooms")
 async def rooms_create(request: Request):
     """Create a user-managed topic room with optional routing matchers."""
@@ -1163,6 +1217,7 @@ async def rooms_create(request: Request):
         data = await request.json()
         if not isinstance(data, dict):
             raise ValueError("body must be an object")
+        _validate_room_agent_settings(data)
         name = str(data.get("name") or "").strip()
         if not name:
             raise ValueError("name is required")
@@ -1174,6 +1229,11 @@ async def rooms_create(request: Request):
             room_id=room_id, name=name, kind="topic", auto=False, matcher=matcher,
             description=str(data.get("description") or "").strip(),
             instructions=str(data.get("instructions") or "").strip(),
+            assistant_mode=data.get("assistant_mode", "chat"),
+            agent_tools=data.get("agent_tools") or [],
+            agent_workspace=data.get("agent_workspace") or "",
+            agent_request_limit=data.get("agent_request_limit") or 0,
+            agent_tool_calls_limit=data.get("agent_tool_calls_limit") or 0,
             color=str(data.get("color") or "#8B7CF6"),
             icon=str(data.get("icon") or "forum"),
             pinned=bool(data.get("pinned", False)),
@@ -1228,6 +1288,7 @@ async def room_update(room_id: str, request: Request):
         data = await request.json()
         if not isinstance(data, dict):
             raise ValueError("body must be an object")
+        _validate_room_agent_settings(data)
         if "name" in data and not str(data["name"]).strip():
             raise ValueError("name cannot be empty")
         if "matcher" in data:
@@ -2526,17 +2587,61 @@ async def _stream_agent_reply(
     """
     yield json.dumps({"type": "citations", "citations": citations,
                       "execution": "agent", **(meta or {})}) + "\n"
+    selected = list((room or {}).get("agent_tools") or [])
+    request_limit, tool_limit = agent_runtime.limits_for(
+        room_id,
+        (room or {}).get("agent_request_limit"),
+        (room or {}).get("agent_tool_calls_limit"),
+    )
+    yield json.dumps({
+        "type": "agent_progress",
+        "phase": "starting",
+        "message": (
+            "Starting agent"
+            + (f" with {', '.join(selected)}" if selected else "")
+        ),
+        "request_limit": request_limit,
+        "tool_calls_limit": tool_limit,
+    }) + "\n"
+
+    updates = asyncio.Queue()
+
+    async def report(update):
+        await updates.put(update)
+
+    task = asyncio.create_task(conversation_manager.complete(
+        room_id=room_id,
+        room=room,
+        messages=messages,
+        max_tokens=max_tokens,
+        progress=report,
+    ))
+    last_update = time.monotonic()
     try:
-        result = await conversation_manager.complete(
-            room_id=room_id,
-            room=room,
-            messages=messages,
-            max_tokens=max_tokens,
-        )
+        while not task.done() or not updates.empty():
+            try:
+                update = await asyncio.wait_for(updates.get(), timeout=1.0)
+                last_update = time.monotonic()
+                yield json.dumps({
+                    "type": "agent_progress",
+                    **update,
+                }) + "\n"
+            except asyncio.TimeoutError:
+                if time.monotonic() - last_update >= 12:
+                    last_update = time.monotonic()
+                    yield json.dumps({
+                        "type": "agent_progress",
+                        "phase": "working",
+                        "message": "Agent is still working",
+                    }) + "\n"
+        result = await task
     except Exception as exc:
         logger.warning("streaming room agent failed: %s", exc)
         yield json.dumps({"type": "error", "error": str(exc)}) + "\n"
         return
+    finally:
+        if not task.done():
+            task.cancel()
 
     reply = result.reply
     if reply:

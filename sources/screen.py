@@ -24,7 +24,8 @@ from sources.capture_settings import (
     expected_frame_count,
     validate_capture_profile,
 )
-from sources.idle import InputIdleGate
+from sources.idle import PresenceGate
+from sources.video_writer import open_mp4_writer
 
 # Windows-only PID lookup for the active window (Step 1: process_name capture).
 try:
@@ -58,7 +59,7 @@ def _process_for_hwnd(hwnd):
 class RealtimeScreenCapture:
     def __init__(self, video_source,model_name_vlm, window_size=60, fps=1.0, monitor_index=1, target_resolution=None,
                  activity_logger=None, insight_callback=None, start_capture=True, pipeline=None,
-                 clip_store=None, idle_gate=None):
+                 clip_store=None, presence_gate=None):
         """
         Args:
             video_source: screen (not used)
@@ -67,8 +68,8 @@ class RealtimeScreenCapture:
             monitor_index: the index of the monitor to capture (default 1 for primary)
             target_resolution: a tuple of (width, height) for resizing, or None to keep original resolution
             activity_logger: an instance of ActivityLogger to log each minute of activity
-            idle_gate: an InputIdleGate; minutes with no keyboard/mouse activity
-                for longer than its timeout are not captured at all
+            presence_gate: a PresenceGate; minutes where the user is neither at
+                the keyboard nor watching a repainting screen are not captured
         """
         self.video_source = video_source
         self.fps, self.window_size = validate_capture_profile(
@@ -114,13 +115,16 @@ class RealtimeScreenCapture:
         # static reading/watching is still remembered. 0 disables. Default 3.
         self.heartbeat_minutes = int(os.getenv("HEARTBEAT_MINUTES", "3"))
         self._idle_minutes = 0
-        # Keyboard/mouse presence. A static screen is not the same as an absent
-        # user — the heartbeat above exists precisely to remember static reading —
-        # so what counts as "away" is input, not pixels. Minutes past the cut-off
-        # are dropped entirely: nothing captured, nothing timed, nothing to
-        # attribute to whichever window happened to be in front.
-        self.idle_gate = idle_gate if idle_gate is not None else InputIdleGate()
+        # Is the user there? Keyboard/mouse says yes for anything interactive; a
+        # large share of the screen repainting says yes for watching, which has no
+        # input at all (sources.idle.PresenceGate). Minutes with neither are
+        # dropped entirely: nothing captured, nothing timed, nothing to attribute
+        # to whichever window happened to be in front.
+        self.presence_gate = (presence_gate if presence_gate is not None
+                              else PresenceGate())
         self._away_minutes = 0
+        # Per-second repaint samples for the current window, consumed by the gate.
+        self._minute_changes = []
         # Only record the active window if its center is inside the captured
         # monitor. Off by default: on multi-monitor / DPI-scaled setups the
         # coordinate systems mismatch and this drops valid titles, collapsing
@@ -322,9 +326,11 @@ Create a retrievable memory record that preserves what matters most for future r
 
         try:
             # 3. Write Frames to MP4
-            # 'mp4v' is widely supported. 'avc1' (H.264) is better if available.
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(temp_filename, fourcc, fps, (width, height))
+            # H.264 where the build has it, mp4v otherwise — see video_writer.
+            out = open_mp4_writer(temp_filename, fps, (width, height))
+            if out is None:
+                logger.warning("Could not open a video writer for screen frames.")
+                return None
 
             for frame in frames:
                 # MSS captures BGRA/RGB, OpenCV expects BGR
@@ -440,12 +446,15 @@ Create a retrievable memory record that preserves what matters most for future r
                 logger.warning("insight_callback failed: %s", exc)
         logger.debug('Screen buffer %s processing ended', timestamp)
 
-    def _are_images_similar(self, img1, img2, threshold=0.999):
-        """
-        Compares two images and returns True if their similarity is above the threshold.
+    def _changed_fraction(self, img1, img2):
+        """Share of pixels that differ between two frames, or None if incomparable.
+
+        Also the presence signal for watching: a video repaints most of this every
+        second, while an abandoned desktop's clock or graph repaints a fraction of
+        a percent (sources.idle.PresenceGate).
         """
         if img1 is None or img2 is None:
-            return False
+            return None
 
         # Convert to grayscale for faster and more robust comparison
         gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
@@ -455,9 +464,16 @@ Create a retrievable memory record that preserves what matters most for future r
         diff = cv2.absdiff(gray1, gray2)
 
         # Count non-zero pixels (pixels that are different)
-        non_zero_count = np.count_nonzero(diff)
-        total_pixels = diff.size
-        similarity = (total_pixels - non_zero_count) / total_pixels
+        return np.count_nonzero(diff) / diff.size
+
+    def _are_images_similar(self, img1, img2, threshold=0.999):
+        """
+        Compares two images and returns True if their similarity is above the threshold.
+        """
+        changed = self._changed_fraction(img1, img2)
+        if changed is None:
+            return False
+        similarity = 1.0 - changed
         logger.debug('Screen similarity: %.6f', similarity)
         return similarity > threshold
 
@@ -522,12 +538,16 @@ Create a retrievable memory record that preserves what matters most for future r
             profile_version = self._profile_version
             next_batch_at = time.monotonic() + self.window_size
             last_frame = None
+            # The previous grab, kept only to measure how much repaints per
+            # second — separate from last_frame, which is the last frame kept.
+            previous_grab = None
 
             while self.running:
                 if profile_version != self._profile_version:
                     profile_version = self._profile_version
                     next_batch_at = time.monotonic() + self.window_size
                     last_frame = None
+                    previous_grab = None
                 # Paused: hold the thread but capture/process nothing. Reset the
                 # per-minute state so we don't emit a stale batch on resume.
                 if self.paused:
@@ -537,6 +557,8 @@ Create a retrievable memory record that preserves what matters most for future r
                         self.current_minute_apps = list()
                         self.current_minute_processes = list()
                         last_frame = None
+                        previous_grab = None
+                        self._minute_changes = []
                     self._profile_changed.wait(0.3)
                     self._profile_changed.clear()
                     continue
@@ -558,6 +580,15 @@ Create a retrievable memory record that preserves what matters most for future r
                 if self.target_resolution:
                     img = cv2.resize(img, self.target_resolution, interpolation=cv2.INTER_AREA)
 
+                # How much of the screen repainted since the *previous grab* —
+                # measured against every frame, not just the last kept one, so a
+                # slowly drifting picture can't accumulate into false motion.
+                # This is what tells watching apart from an abandoned desk.
+                change = self._changed_fraction(previous_grab, img)
+                if change is not None:
+                    self._minute_changes.append(change)
+                previous_grab = img
+
                 # Only add frame if it's different enough from the last one
                 if not self._are_images_similar(last_frame, img):
                     with self.lock:
@@ -574,22 +605,29 @@ Create a retrievable memory record that preserves what matters most for future r
                         self.frame_buffer.clear()
                         self.frame_buffer.extend(overlap_frames)
 
-                    idle_state = self.idle_gate.state()
-                    if idle_state.idle:
+                    presence = self.presence_gate.evaluate(self._minute_changes)
+                    self._minute_changes = []
+                    logger.debug("Presence: %s (idle %.0fs, screen repaint %s)",
+                                 presence.reason, presence.idle_seconds or 0.0,
+                                 "n/a" if presence.change_level is None
+                                 else f"{presence.change_level * 100:.2f}%")
+                    if not presence.present:
                         # Away: drop the minute. The per-minute window state goes
                         # too, so the first minute back opens a fresh event rather
                         # than extending the one the user walked away from.
                         self._away_minutes += 1
                         if self._away_minutes == 1:
                             logger.info(
-                                "No keyboard/mouse input for %.0fs (> %.0fs) — "
-                                "capture paused until the user is back.",
-                                idle_state.idle_seconds,
-                                self.idle_gate.timeout_seconds)
+                                "No keyboard/mouse input for %.0fs (> %.0fs) and "
+                                "the screen is not playing anything — capture "
+                                "paused until the user is back.",
+                                presence.idle_seconds or 0.0,
+                                self.presence_gate.input.timeout_seconds)
                         self.current_minute_apps = list()
                         self.current_minute_processes = list()
                         self._idle_minutes = 0
                         last_frame = None
+                        previous_grab = None
                         with self.lock:
                             # Drop the overlap frames as well — they are from
                             # before the user left and would leak into the first
@@ -603,6 +641,12 @@ Create a retrievable memory record that preserves what matters most for future r
                         logger.info("User back after %d away minute(s) — resuming capture.",
                                     self._away_minutes)
                         self._away_minutes = 0
+                    if presence.watching and self.presence_gate.playback_minutes == 1:
+                        logger.info(
+                            "No input for %.0fs but %.1f%% of the screen is "
+                            "repainting each second — counting this as watching.",
+                            presence.idle_seconds or 0.0,
+                            (presence.change_level or 0.0) * 100.0)
 
                     enough_activity = len(frames) > 2
                     active_window = bool(self.current_minute_apps)
@@ -634,7 +678,7 @@ Create a retrievable memory record that preserves what matters most for future r
                         # Live processing via the coalescing mailbox (worker drains it).
                         if self._need_process:
                             self._enqueue_batch(frames_to_process, batch_ts, titles,
-                                                procs, idle_state.last_input_at)
+                                                procs, presence.active_until)
                         # Reset for the next minute, keeping the last title/process
                         # as carryover (the worker uses the snapshot above).
                         self.current_minute_apps = self.current_minute_apps[-1:]
@@ -673,6 +717,7 @@ Create a retrievable memory record that preserves what matters most for future r
             )
             self.current_minute_apps = []
             self.current_minute_processes = []
+            self._minute_changes = []
             self._profile_version += 1
         with self._mailbox_lock:
             self._mailbox = None
@@ -711,13 +756,15 @@ Create a retrievable memory record that preserves what matters most for future r
 
     def status(self):
         alive = self.capture_thread is not None and self.capture_thread.is_alive()
-        idle_state = self.idle_gate.state()
+        idle_state = self.presence_gate.input.state()
         return {
             "input_idle_seconds": (None if idle_state.idle_seconds is None
                                    else round(idle_state.idle_seconds, 1)),
-            "input_idle_timeout_seconds": self.idle_gate.timeout_seconds,
-            "user_away": idle_state.idle,
+            "input_idle_timeout_seconds": self.presence_gate.input.timeout_seconds,
+            "user_away": self._away_minutes > 0,
             "away_minutes": self._away_minutes,
+            "watching_minutes": self.presence_gate.playback_minutes,
+            "playback_change_fraction": self.presence_gate.change_fraction,
             "configured": True,
             "healthy": self.healthy and alive and not self.paused,
             "running": self.running,

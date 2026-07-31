@@ -35,6 +35,8 @@ from threading import Event, Thread, Lock
 
 import cv2
 from PIL import Image
+from line_profiler import profile
+
 
 logger = logging.getLogger("home_assistant")
 
@@ -50,6 +52,19 @@ if _RTSP_TRANSPORT and "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ:
 # to stay ahead of a ~15 fps HD stream. 0 restores FFmpeg's own choice.
 # Raise this (and watch `flat_frame_pct`) if a stream starts falling behind.
 _DECODER_THREADS = int(os.getenv("CAMERA_DECODER_THREADS", "2"))
+
+# Decoder acceleration is an open-only OpenCV property, like N_THREADS. On the
+# tested Windows/FFmpeg build, ANY selects a working HEVC hardware path and cuts
+# main-stream decode CPU without sacrificing resolution. "none" forces software.
+_HW_ACCELERATION_NAME = os.getenv(
+    "CAMERA_HW_ACCELERATION", "any").strip().lower()
+_HW_ACCELERATIONS = {
+    "none": getattr(cv2, "VIDEO_ACCELERATION_NONE", 0),
+    "any": getattr(cv2, "VIDEO_ACCELERATION_ANY", 1),
+    "d3d11": getattr(cv2, "VIDEO_ACCELERATION_D3D11", 2),
+    "vaapi": getattr(cv2, "VIDEO_ACCELERATION_VAAPI", 3),
+    "mfx": getattr(cv2, "VIDEO_ACCELERATION_MFX", 4),
+}
 
 # Vendor patterns for "same camera, lighter stream". Anything that matches
 # neither is passed through untouched rather than guessed at.
@@ -87,6 +102,60 @@ def prefer_substream(url):
     return url
 
 
+def _open_capture(video_source):
+    """Open FFmpeg with all open-only decoder options applied correctly.
+
+    CAP_PROP_FOURCC is intentionally not set: an RTSP client's FourCC cannot
+    transcode the camera's HEVC payload. Measured on this build -- `set()`
+    returns False for all of mp4v/MJPG/H264/avc1/HEVC/hvc1/I420/YUY2/X264 and
+    the property keeps reading back `hevc`, with no change in decode cost. On the
+    FFmpeg backend the FourCC only *reports* the stream; it is a device request
+    (MJPG vs YUY2) on webcam backends, which is not what this is.
+
+    The levers that do work, per-frame CPU at 2560x1440, 300 frames:
+
+        accel=none    grab 9.64ms   retrieve  9.90ms
+        accel=any     grab 0.89ms   retrieve 16.56ms
+
+    Acceleration cuts demux+decode ~11x but pays for a GPU->CPU readback on
+    retrieve, so it wins precisely because this loop grabs every frame and
+    retrieves ~1 per second: ~39ms/s of CPU versus ~251ms/s for software.
+    Thread count made no measurable difference at 1/2/4/auto. Select
+    CAMERA_STREAM=sub (~6x cheaper again) when resolution matters less.
+    """
+    params = []
+    if _DECODER_THREADS > 0 and hasattr(cv2, "CAP_PROP_N_THREADS"):
+        params.extend((cv2.CAP_PROP_N_THREADS, _DECODER_THREADS))
+    acceleration = _HW_ACCELERATIONS.get(_HW_ACCELERATION_NAME)
+    if acceleration is None:
+        logger.warning(
+            "Unknown CAMERA_HW_ACCELERATION=%r; using any.",
+            _HW_ACCELERATION_NAME,
+        )
+        acceleration = _HW_ACCELERATIONS["any"]
+    if (
+        _HW_ACCELERATION_NAME != "none"
+        and hasattr(cv2, "CAP_PROP_HW_ACCELERATION")
+    ):
+        params.extend((cv2.CAP_PROP_HW_ACCELERATION, acceleration))
+
+    if params:
+        video = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG, params)
+        if video.isOpened():
+            return video
+        video.release()
+        logger.warning(
+            "Camera rejected FFmpeg decoder options; retrying with defaults.")
+    return cv2.VideoCapture(video_source)
+
+
+def _fourcc_name(value):
+    number = int(value or 0)
+    return "".join(
+        chr((number >> (8 * index)) & 0xFF) for index in range(4)
+    ).rstrip("\x00").lower()
+
+
 class RealtimeCameraStream:
     def __init__(self, video_source, window_size=10, fps=1.0,
                  reconnect_initial_delay=0.25, reconnect_max_delay=5.0):
@@ -117,6 +186,12 @@ class RealtimeCameraStream:
         self.last_error = None
         self.last_frame_at = None
         self.reconnect_count = 0
+        self.codec = None
+        self.frame_width = None
+        self.frame_height = None
+        self.source_fps = None
+        self.decoder_threads = None
+        self.hw_acceleration = None
         self._reconnect_initial_delay = max(float(reconnect_initial_delay), 0.0)
         self._reconnect_max_delay = max(
             float(reconnect_max_delay), self._reconnect_initial_delay)
@@ -128,22 +203,18 @@ class RealtimeCameraStream:
         self.capture_thread.daemon = True
         self.capture_thread.start()
 
+    @profile
     def _capture_frames(self):
         retry_delay = self._reconnect_initial_delay
         connected_once = False
         while self.running and not self._stop.is_set():
             video = None
             try:
-                video = cv2.VideoCapture(self.video_source)
-                if _DECODER_THREADS > 0:
-                    try:
-                        video.set(cv2.CAP_PROP_N_THREADS, _DECODER_THREADS)
-                    except Exception:
-                        logger.debug("decoder thread cap not supported",
-                                     exc_info=True)
+                video = _open_capture(self.video_source)
                 if not video.isOpened():
                     self._mark_disconnected("camera source could not be opened")
                 else:
+                    self._record_decoder(video)
                     connection_had_frame = False
                     next_sample_at = None
                     profile_version = self._profile_version
@@ -232,6 +303,29 @@ class RealtimeCameraStream:
         if std < FLAT_FRAME_STD:
             self.flat_frames += 1
 
+    def _record_decoder(self, video):
+        """Expose the negotiated stream/decoder so CPU choices are observable."""
+        try:
+            self.codec = _fourcc_name(video.get(cv2.CAP_PROP_FOURCC)) or None
+            self.frame_width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
+            self.frame_height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
+            self.source_fps = round(
+                float(video.get(cv2.CAP_PROP_FPS) or 0), 1) or None
+            if hasattr(cv2, "CAP_PROP_N_THREADS"):
+                self.decoder_threads = int(
+                    video.get(cv2.CAP_PROP_N_THREADS) or 0) or None
+            if hasattr(cv2, "CAP_PROP_HW_ACCELERATION"):
+                self.hw_acceleration = int(
+                    video.get(cv2.CAP_PROP_HW_ACCELERATION) or 0)
+            logger.info(
+                "Camera decoder: codec=%s size=%sx%s source_fps=%s "
+                "threads=%s hw=%s",
+                self.codec, self.frame_width, self.frame_height,
+                self.source_fps, self.decoder_threads, self.hw_acceleration,
+            )
+        except Exception:
+            logger.debug("Could not read camera decoder metadata", exc_info=True)
+
     def _mark_disconnected(self, error):
         was_healthy = self.healthy
         self.healthy = False
@@ -275,4 +369,12 @@ class RealtimeCameraStream:
             "last_frame_std": self.last_frame_std,
             "sample_fps": self.fps,
             "buffer_capacity": self.frame_buffer.maxlen,
+            "codec": self.codec,
+            "resolution": (
+                f"{self.frame_width}x{self.frame_height}"
+                if self.frame_width and self.frame_height else None
+            ),
+            "source_fps": self.source_fps,
+            "decoder_threads": self.decoder_threads,
+            "hw_acceleration": self.hw_acceleration,
         }

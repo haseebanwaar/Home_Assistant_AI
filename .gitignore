@@ -51,6 +51,7 @@ build/
 /.temp_media/
 /utils/
 /qdrant_db/
+/agent_workspaces/
 
 # Step 0: recorded captures + replay/debug artifacts
 /data/

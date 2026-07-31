@@ -18,7 +18,7 @@ Note that "camera" also marks the `home` memory domain in the graph queries.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -39,6 +39,17 @@ class Room(BaseModel):
     matcher: RoomMatcher = Field(default_factory=RoomMatcher)
     description: str = ""
     instructions: str = ""
+    # Direct chat makes one model call with the room context. Agent mode enables
+    # the iterative PydanticAI runtime and only the explicitly selected toolsets.
+    assistant_mode: Literal["chat", "agent"] = "chat"
+    agent_tools: List[str] = Field(default_factory=list)
+    # Blank means a stable directory derived from room_id under
+    # AGENT_WORKSPACE_ROOT. Relative paths stay under that root; absolute paths
+    # deliberately grant this room access to a different directory.
+    agent_workspace: str = ""
+    # Zero inherits the runtime default (or Research's larger default).
+    agent_request_limit: int = Field(default=0, ge=0, le=256)
+    agent_tool_calls_limit: int = Field(default=0, ge=0, le=1024)
     color: str = "#8B7CF6"
     icon: str = "forum"
     archived: bool = False

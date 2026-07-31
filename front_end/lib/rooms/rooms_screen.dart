@@ -50,6 +50,8 @@ IconData _kindIcon(String kind, String name, [String? configured]) {
       return Icons.menu_book;
     case 'event_note':
       return Icons.event_note;
+    case 'science':
+      return Icons.science_outlined;
   }
   switch (kind) {
     case 'daily':
@@ -109,8 +111,10 @@ IconData _kindIcon(String kind, String name, [String? configured]) {
 (double?, double?) dayBounds(String date) {
   final day = DateTime.parse(date);
   final start = DateTime(day.year, day.month, day.day);
-  return (start.millisecondsSinceEpoch / 1000.0,
-      start.add(const Duration(days: 1)).millisecondsSinceEpoch / 1000.0);
+  return (
+    start.millisecondsSinceEpoch / 1000.0,
+    start.add(const Duration(days: 1)).millisecondsSinceEpoch / 1000.0,
+  );
 }
 
 String _hm(dynamic ts) {
@@ -147,8 +151,11 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     });
     try {
       final resp = await http
-          .get(Uri.parse(
-              '${widget.apiBase}/rooms?include_archived=$_showArchived'))
+          .get(
+            Uri.parse(
+              '${widget.apiBase}/rooms?include_archived=$_showArchived',
+            ),
+          )
           .timeout(const Duration(seconds: 15));
       if (resp.statusCode == 200) {
         final data = decodeJsonResponse(resp) as Map<String, dynamic>;
@@ -174,101 +181,314 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
           .then((_) => _load());
       return;
     }
-    Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => RoomScreen(
-        apiBase: widget.apiBase,
-        roomId: room['room_id'].toString(),
-        roomName: (room['name'] ?? room['room_id']).toString(),
-        kind: (room['kind'] ?? 'activity').toString(),
-      ),
-    )).then((_) => _load());
+    Navigator.of(context)
+        .push(
+          MaterialPageRoute(
+            builder:
+                (_) => RoomScreen(
+                  apiBase: widget.apiBase,
+                  roomId: room['room_id'].toString(),
+                  roomName: (room['name'] ?? room['room_id']).toString(),
+                  kind: (room['kind'] ?? 'activity').toString(),
+                  assistantMode: (room['assistant_mode'] ?? 'chat').toString(),
+                ),
+          ),
+        )
+        .then((_) => _load());
   }
 
-  List<String> _csv(String value) => value
-      .split(',')
-      .map((v) => v.trim())
-      .where((v) => v.isNotEmpty)
-      .toList();
+  List<String> _csv(String value) =>
+      value.split(',').map((v) => v.trim()).where((v) => v.isNotEmpty).toList();
 
   Future<void> _editRoom([Map<String, dynamic>? summary]) async {
     Map<String, dynamic>? room = summary;
+    List<Map<String, dynamic>> availableTools = [];
+    bool runtimeEnabled = false;
+    var defaultRequestLimit = 8;
+    var defaultToolCallsLimit = 12;
     if (summary != null) {
       try {
         final resp = await http.get(
-            Uri.parse('${widget.apiBase}/rooms/${summary['room_id']}'));
+          Uri.parse('${widget.apiBase}/rooms/${summary['room_id']}'),
+        );
         if (resp.statusCode == 200) {
-          room = (decodeJsonResponse(resp) as Map<String, dynamic>)['room']
-              as Map<String, dynamic>;
+          room =
+              (decodeJsonResponse(resp) as Map<String, dynamic>)['room']
+                  as Map<String, dynamic>;
         }
       } catch (_) {}
     }
+    try {
+      final response = await http.get(
+        Uri.parse('${widget.apiBase}/agent-runtime/status'),
+      );
+      if (response.statusCode == 200) {
+        final status = decodeJsonResponse(response) as Map<String, dynamic>;
+        runtimeEnabled = status['enabled'] == true;
+        final isResearch = room?['room_id'] == 'agent:research';
+        defaultRequestLimit =
+            (status[isResearch ? 'research_request_limit' : 'request_limit']
+                    as num?)
+                ?.toInt() ??
+            defaultRequestLimit;
+        defaultToolCallsLimit =
+            (status[isResearch
+                        ? 'research_tool_calls_limit'
+                        : 'tool_calls_limit']
+                    as num?)
+                ?.toInt() ??
+            defaultToolCallsLimit;
+        availableTools =
+            ((status['available_tools'] as List?) ?? [])
+                .whereType<Map>()
+                .map((item) => item.cast<String, dynamic>())
+                .toList();
+      }
+    } catch (_) {}
     if (!mounted) return;
     final matcher = (room?['matcher'] as Map<String, dynamic>?) ?? {};
     final name = TextEditingController(text: room?['name']?.toString() ?? '');
-    final description =
-        TextEditingController(text: room?['description']?.toString() ?? '');
-    final instructions =
-        TextEditingController(text: room?['instructions']?.toString() ?? '');
-    final color =
-        TextEditingController(text: room?['color']?.toString() ?? '#8B7CF6');
+    final description = TextEditingController(
+      text: room?['description']?.toString() ?? '',
+    );
+    final instructions = TextEditingController(
+      text: room?['instructions']?.toString() ?? '',
+    );
+    final agentWorkspace = TextEditingController(
+      text: room?['agent_workspace']?.toString() ?? '',
+    );
+    final savedRequestLimit =
+        (room?['agent_request_limit'] as num?)?.toInt() ?? 0;
+    final savedToolCallsLimit =
+        (room?['agent_tool_calls_limit'] as num?)?.toInt() ?? 0;
+    final agentRequestLimit = TextEditingController(
+      text: savedRequestLimit > 0 ? savedRequestLimit.toString() : '',
+    );
+    final agentToolCallsLimit = TextEditingController(
+      text: savedToolCallsLimit > 0 ? savedToolCallsLimit.toString() : '',
+    );
+    final color = TextEditingController(
+      text: room?['color']?.toString() ?? '#8B7CF6',
+    );
     final activities = TextEditingController(
-        text: ((matcher['activity_types'] as List?) ?? []).join(', '));
-    final apps =
-        TextEditingController(text: ((matcher['apps'] as List?) ?? []).join(', '));
+      text: ((matcher['activity_types'] as List?) ?? []).join(', '),
+    );
+    final apps = TextEditingController(
+      text: ((matcher['apps'] as List?) ?? []).join(', '),
+    );
     final keywords = TextEditingController(
-        text: ((matcher['title_keywords'] as List?) ?? []).join(', '));
+      text: ((matcher['title_keywords'] as List?) ?? []).join(', '),
+    );
     final projects = TextEditingController(
-        text: ((matcher['project_ids'] as List?) ?? []).join(', '));
+      text: ((matcher['project_ids'] as List?) ?? []).join(', '),
+    );
     final entities = TextEditingController(
-        text: ((matcher['entity_types'] as List?) ?? []).join(', '));
+      text: ((matcher['entity_types'] as List?) ?? []).join(', '),
+    );
+    var assistantMode =
+        (room?['assistant_mode'] ??
+                (room?['kind'] == 'agent' ? 'agent' : 'chat'))
+            .toString();
+    final selectedTools = <String>{
+      ...((room?['agent_tools'] as List?) ?? []).map((item) => item.toString()),
+    };
     final isNew = room == null;
     final result = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: _panel,
-        title: Text(isNew ? 'Create room' : 'Edit room',
-            style: const TextStyle(color: Colors.white)),
-        content: SizedBox(
-          width: 480,
-          child: SingleChildScrollView(
-            child: Column(
-              children: [
-                _dialogField(name, 'Name'),
-                _dialogField(description, 'Description', lines: 2),
-                _dialogField(instructions, 'Assistant instructions', lines: 3),
-                _dialogField(color, 'Color (hex)'),
-                const Padding(
-                  padding: EdgeInsets.only(top: 10, bottom: 6),
-                  child: Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text('Automatic matching (comma-separated)',
-                        style: TextStyle(color: _mint, fontWeight: FontWeight.w700)),
+      builder:
+          (context) => StatefulBuilder(
+            builder:
+                (context, setDialogState) => AlertDialog(
+                  backgroundColor: _panel,
+                  title: Text(
+                    isNew ? 'Create room' : 'Edit room',
+                    style: const TextStyle(color: Colors.white),
                   ),
+                  content: SizedBox(
+                    width: 480,
+                    child: SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          _dialogField(name, 'Name'),
+                          _dialogField(description, 'Description', lines: 2),
+                          _dialogField(
+                            instructions,
+                            'Assistant instructions',
+                            lines: 3,
+                          ),
+                          const Padding(
+                            padding: EdgeInsets.only(top: 6, bottom: 7),
+                            child: Text(
+                              'Conversation mode',
+                              style: TextStyle(
+                                color: _mint,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                          SegmentedButton<String>(
+                            segments: const [
+                              ButtonSegment(
+                                value: 'chat',
+                                label: Text('Chat'),
+                                icon: Icon(Icons.chat_bubble_outline),
+                              ),
+                              ButtonSegment(
+                                value: 'agent',
+                                label: Text('Agent'),
+                                icon: Icon(Icons.smart_toy_outlined),
+                              ),
+                            ],
+                            selected: {assistantMode},
+                            showSelectedIcon: false,
+                            onSelectionChanged:
+                                (selection) => setDialogState(() {
+                                  assistantMode = selection.first;
+                                  if (assistantMode == 'agent' &&
+                                      selectedTools.isEmpty &&
+                                      availableTools.any(
+                                        (tool) => tool['id'] == 'graph',
+                                      )) {
+                                    selectedTools.add('graph');
+                                  }
+                                }),
+                          ),
+                          if (assistantMode == 'agent') ...[
+                            const SizedBox(height: 12),
+                            _dialogField(
+                              agentWorkspace,
+                              'Agent workspace folder',
+                            ),
+                            const Text(
+                              'Blank creates a private folder automatically. '
+                              'Use a relative folder under AGENT_WORKSPACE_ROOT, '
+                              'or an absolute path for a deliberate custom location.',
+                              style: TextStyle(color: _muted, fontSize: 11.5),
+                            ),
+                            const SizedBox(height: 12),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: _dialogField(
+                                    agentRequestLimit,
+                                    'Model request limit',
+                                    hint: 'Default: $defaultRequestLimit',
+                                    numeric: true,
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: _dialogField(
+                                    agentToolCallsLimit,
+                                    'Tool call limit',
+                                    hint: 'Default: $defaultToolCallsLimit',
+                                    numeric: true,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const Text(
+                              'Leave blank to inherit the room-type default. '
+                              'Higher limits allow longer runs but use more model time.',
+                              style: TextStyle(color: _muted, fontSize: 11.5),
+                            ),
+                            const SizedBox(height: 12),
+                            const Text(
+                              'Agent tools',
+                              style: TextStyle(
+                                color: _mint,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              runtimeEnabled
+                                  ? 'Only selected toolsets are opened for this room.'
+                                  : 'Agent runtime is disabled on the server; selections will be saved.',
+                              style: const TextStyle(
+                                color: _muted,
+                                fontSize: 11.5,
+                              ),
+                            ),
+                            const SizedBox(height: 7),
+                            if (availableTools.isEmpty)
+                              const Text(
+                                'No agent tools are configured.',
+                                style: TextStyle(color: _muted, fontSize: 12),
+                              )
+                            else
+                              Wrap(
+                                spacing: 7,
+                                runSpacing: 7,
+                                children: [
+                                  for (final tool in availableTools)
+                                    FilterChip(
+                                      selected: selectedTools.contains(
+                                        tool['id'],
+                                      ),
+                                      label: Text(
+                                        (tool['name'] ?? tool['id']).toString(),
+                                      ),
+                                      tooltip:
+                                          (tool['description'] ?? '')
+                                              .toString(),
+                                      onSelected:
+                                          (selected) => setDialogState(() {
+                                            final id = tool['id'].toString();
+                                            selected
+                                                ? selectedTools.add(id)
+                                                : selectedTools.remove(id);
+                                          }),
+                                    ),
+                                ],
+                              ),
+                          ],
+                          const SizedBox(height: 10),
+                          _dialogField(color, 'Color (hex)'),
+                          const Padding(
+                            padding: EdgeInsets.only(top: 10, bottom: 6),
+                            child: Text(
+                              'Automatic matching (comma-separated)',
+                              style: TextStyle(
+                                color: _mint,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                          _dialogField(activities, 'Activities'),
+                          _dialogField(apps, 'Applications'),
+                          _dialogField(keywords, 'Title / summary keywords'),
+                          _dialogField(projects, 'Project IDs'),
+                          _dialogField(entities, 'Entity types'),
+                        ],
+                      ),
+                    ),
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context, false),
+                      child: const Text('Cancel'),
+                    ),
+                    FilledButton(
+                      onPressed: () => Navigator.pop(context, true),
+                      child: const Text('Save'),
+                    ),
+                  ],
                 ),
-                _dialogField(activities, 'Activities'),
-                _dialogField(apps, 'Applications'),
-                _dialogField(keywords, 'Title / summary keywords'),
-                _dialogField(projects, 'Project IDs'),
-                _dialogField(entities, 'Entity types'),
-              ],
-            ),
           ),
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Save')),
-        ],
-      ),
     );
     if (result != true || name.text.trim().isEmpty) return;
     final payload = {
       'name': name.text.trim(),
       'description': description.text.trim(),
       'instructions': instructions.text.trim(),
+      'assistant_mode': assistantMode,
+      'agent_tools': selectedTools.toList()..sort(),
+      'agent_workspace': agentWorkspace.text.trim(),
+      'agent_request_limit': int.tryParse(agentRequestLimit.text.trim()) ?? 0,
+      'agent_tool_calls_limit':
+          int.tryParse(agentToolCallsLimit.text.trim()) ?? 0,
       'color': color.text.trim(),
       'matcher': {
         'activity_types': _csv(activities.text),
@@ -279,16 +499,22 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
       },
     };
     try {
-      final uri = isNew
-          ? Uri.parse('${widget.apiBase}/rooms')
-          : Uri.parse('${widget.apiBase}/rooms/${room['room_id']}');
-      final resp = isNew
-          ? await http.post(uri,
-              headers: {'Content-Type': 'application/json'},
-              body: json.encode(payload))
-          : await http.patch(uri,
-              headers: {'Content-Type': 'application/json'},
-              body: json.encode(payload));
+      final uri =
+          isNew
+              ? Uri.parse('${widget.apiBase}/rooms')
+              : Uri.parse('${widget.apiBase}/rooms/${room['room_id']}');
+      final resp =
+          isNew
+              ? await http.post(
+                uri,
+                headers: {'Content-Type': 'application/json'},
+                body: json.encode(payload),
+              )
+              : await http.patch(
+                uri,
+                headers: {'Content-Type': 'application/json'},
+                body: json.encode(payload),
+              );
       if (resp.statusCode == 200 || resp.statusCode == 201) {
         await _load();
       } else {
@@ -299,16 +525,22 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     }
   }
 
-  Widget _dialogField(TextEditingController controller, String label,
-      {int lines = 1}) {
+  Widget _dialogField(
+    TextEditingController controller,
+    String label, {
+    int lines = 1,
+    String? hint,
+    bool numeric = false,
+  }) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 9),
       child: TextField(
         controller: controller,
         minLines: lines,
         maxLines: lines,
+        keyboardType: numeric ? TextInputType.number : null,
         style: const TextStyle(color: Colors.white),
-        decoration: InputDecoration(labelText: label),
+        decoration: InputDecoration(labelText: label, hintText: hint),
       ),
     );
   }
@@ -324,7 +556,8 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
   }
 
   void _snack(String text) {
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+    if (mounted)
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
   Future<void> _roomAction(String action, Map<String, dynamic> room) async {
@@ -332,37 +565,47 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     try {
       if (action == 'edit') return _editRoom(room);
       if (action == 'archive') {
-        await http.patch(Uri.parse('${widget.apiBase}/rooms/$id'),
-            headers: {'Content-Type': 'application/json'},
-            body: json.encode({'archived': !(room['archived'] == true)}));
+        await http.patch(
+          Uri.parse('${widget.apiBase}/rooms/$id'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'archived': !(room['archived'] == true)}),
+        );
       } else if (action == 'pin') {
-        await http.patch(Uri.parse('${widget.apiBase}/rooms/$id'),
-            headers: {'Content-Type': 'application/json'},
-            body: json.encode({'pinned': !(room['pinned'] == true)}));
+        await http.patch(
+          Uri.parse('${widget.apiBase}/rooms/$id'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'pinned': !(room['pinned'] == true)}),
+        );
       } else if (action == 'reroute') {
-        final resp =
-            await http.post(Uri.parse('${widget.apiBase}/rooms/$id/reroute'));
+        final resp = await http.post(
+          Uri.parse('${widget.apiBase}/rooms/$id/reroute'),
+        );
         if (resp.statusCode != 200) _snack(_errorText(resp));
       } else if (action == 'delete') {
         final confirmed = await showDialog<bool>(
           context: context,
-          builder: (context) => AlertDialog(
-            title: Text('Delete ${room['name']}?'),
-            content: const Text(
-                'Its notes and room chat will be deleted. Captured events remain available.'),
-            actions: [
-              TextButton(
-                  onPressed: () => Navigator.pop(context, false),
-                  child: const Text('Cancel')),
-              FilledButton(
-                  onPressed: () => Navigator.pop(context, true),
-                  child: const Text('Delete')),
-            ],
-          ),
+          builder:
+              (context) => AlertDialog(
+                title: Text('Delete ${room['name']}?'),
+                content: const Text(
+                  'Its notes and room chat will be deleted. Captured events remain available.',
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('Cancel'),
+                  ),
+                  FilledButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('Delete'),
+                  ),
+                ],
+              ),
         );
         if (confirmed != true) return;
-        final resp =
-            await http.delete(Uri.parse('${widget.apiBase}/rooms/$id'));
+        final resp = await http.delete(
+          Uri.parse('${widget.apiBase}/rooms/$id'),
+        );
         if (resp.statusCode != 200) _snack(_errorText(resp));
       }
       await _load();
@@ -374,17 +617,17 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
   @override
   Widget build(BuildContext context) {
     // Daily first, then by event count (backend already sorts by count).
-    final rooms = [..._rooms]
-      ..sort((a, b) {
-        if (a['kind'] == 'daily') return -1;
-        if (b['kind'] == 'daily') return 1;
-        if (a['pinned'] == true && b['pinned'] != true) return -1;
-        if (b['pinned'] == true && a['pinned'] != true) return 1;
-        final position = ((a['position'] ?? 0) as num)
-            .compareTo((b['position'] ?? 0) as num);
-        if (position != 0) return position;
-        return ((b['events'] ?? 0) as num).compareTo((a['events'] ?? 0) as num);
-      });
+    final rooms = [..._rooms]..sort((a, b) {
+      if (a['kind'] == 'daily') return -1;
+      if (b['kind'] == 'daily') return 1;
+      if (a['pinned'] == true && b['pinned'] != true) return -1;
+      if (b['pinned'] == true && a['pinned'] != true) return 1;
+      final position = ((a['position'] ?? 0) as num).compareTo(
+        (b['position'] ?? 0) as num,
+      );
+      if (position != 0) return position;
+      return ((b['events'] ?? 0) as num).compareTo((a['events'] ?? 0) as num);
+    });
     return Scaffold(
       backgroundColor: _ink,
       appBar: AppBar(
@@ -393,8 +636,10 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
         actions: [
           IconButton(
             tooltip: _showArchived ? 'Hide archived' : 'Show archived',
-            icon: Icon(_showArchived ? Icons.inventory_2 : Icons.inventory_2_outlined,
-                color: _muted),
+            icon: Icon(
+              _showArchived ? Icons.inventory_2 : Icons.inventory_2_outlined,
+              color: _muted,
+            ),
             onPressed: () {
               setState(() => _showArchived = !_showArchived);
               _load();
@@ -408,18 +653,25 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
       ),
       body: Column(
         children: [
-          if (_loading) const LinearProgressIndicator(minHeight: 2, color: _mint),
+          if (_loading)
+            const LinearProgressIndicator(minHeight: 2, color: _mint),
           Expanded(
-            child: _error != null
-                ? Center(
-                    child: Text('Could not load rooms.\n$_error',
+            child:
+                _error != null
+                    ? Center(
+                      child: Text(
+                        'Could not load rooms.\n$_error',
                         textAlign: TextAlign.center,
-                        style: const TextStyle(color: _muted)))
-                : ListView.builder(
-                    padding: const EdgeInsets.all(12),
-                    itemCount: rooms.length,
-                    itemBuilder: (context, i) => _roomTile(rooms[i] as Map<String, dynamic>),
-                  ),
+                        style: const TextStyle(color: _muted),
+                      ),
+                    )
+                    : ListView.builder(
+                      padding: const EdgeInsets.all(12),
+                      itemCount: rooms.length,
+                      itemBuilder:
+                          (context, i) =>
+                              _roomTile(rooms[i] as Map<String, dynamic>),
+                    ),
           ),
         ],
       ),
@@ -436,6 +688,7 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
   Widget _roomTile(Map<String, dynamic> room) {
     final name = (room['name'] ?? room['room_id']).toString();
     final kind = (room['kind'] ?? 'activity').toString();
+    final assistantMode = (room['assistant_mode'] ?? 'chat').toString();
     final events = (room['events'] ?? 0);
     final accent = _roomColor(room['color'], kind == 'daily' ? _mint : _violet);
     return Container(
@@ -443,15 +696,26 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
       decoration: BoxDecoration(
         color: _panelRaised.withOpacity(.55),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: kind == 'daily' ? _mint.withOpacity(.4) : _line),
+        border: Border.all(
+          color: kind == 'daily' ? _mint.withOpacity(.4) : _line,
+        ),
       ),
       child: ListTile(
-        leading:
-            Icon(_kindIcon(kind, name, room['icon']?.toString()), color: accent),
-        title: Text(name,
-            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700)),
-        subtitle: Text('$kind · $events events',
-            style: const TextStyle(color: _muted, fontSize: 12)),
+        leading: Icon(
+          _kindIcon(kind, name, room['icon']?.toString()),
+          color: accent,
+        ),
+        title: Text(
+          name,
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        subtitle: Text(
+          '$kind · $assistantMode · $events events',
+          style: const TextStyle(color: _muted, fontSize: 12),
+        ),
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -460,21 +724,31 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
             PopupMenuButton<String>(
               icon: const Icon(Icons.more_vert, color: _muted),
               onSelected: (value) => _roomAction(value, room),
-              itemBuilder: (_) => [
-                const PopupMenuItem(value: 'edit', child: Text('Edit')),
-                PopupMenuItem(
-                    value: 'pin',
-                    child: Text(room['pinned'] == true ? 'Unpin' : 'Pin')),
-                if (kind != 'daily' && kind != 'agent')
-                  PopupMenuItem(
-                      value: 'archive',
-                      child: Text(room['archived'] == true ? 'Restore' : 'Archive')),
-                if (kind != 'agent')
-                  const PopupMenuItem(
-                      value: 'reroute', child: Text('Re-route events')),
-                if (kind != 'daily' && kind != 'agent')
-                  const PopupMenuItem(value: 'delete', child: Text('Delete')),
-              ],
+              itemBuilder:
+                  (_) => [
+                    const PopupMenuItem(value: 'edit', child: Text('Edit')),
+                    PopupMenuItem(
+                      value: 'pin',
+                      child: Text(room['pinned'] == true ? 'Unpin' : 'Pin'),
+                    ),
+                    if (kind != 'daily' && kind != 'agent')
+                      PopupMenuItem(
+                        value: 'archive',
+                        child: Text(
+                          room['archived'] == true ? 'Restore' : 'Archive',
+                        ),
+                      ),
+                    if (kind != 'agent')
+                      const PopupMenuItem(
+                        value: 'reroute',
+                        child: Text('Re-route events'),
+                      ),
+                    if (kind != 'daily' && kind != 'agent')
+                      const PopupMenuItem(
+                        value: 'delete',
+                        child: Text('Delete'),
+                      ),
+                  ],
             ),
           ],
         ),
@@ -490,12 +764,14 @@ class RoomScreen extends StatefulWidget {
   final String roomId;
   final String roomName;
   final String kind;
+  final String assistantMode;
   const RoomScreen({
     super.key,
     required this.apiBase,
     required this.roomId,
     required this.roomName,
     required this.kind,
+    required this.assistantMode,
   });
 
   @override
@@ -533,11 +809,9 @@ class _RoomScreenState extends State<RoomScreen> {
 
   bool get _isDaily => widget.kind == 'daily';
   bool get _isAgent => widget.kind == 'agent';
-  bool get _isCreativeCoach =>
-      widget.roomId == 'agent:creative-coach';
+  bool get _isCreativeCoach => widget.roomId == 'agent:creative-coach';
   bool get _isCameraRoom => widget.kind == 'camera';
-  bool get _isSourceRoom =>
-      widget.kind == 'camera' || widget.kind == 'screen';
+  bool get _isSourceRoom => widget.kind == 'camera' || widget.kind == 'screen';
 
   /// The app or camera an event came from, as it should read on the bubble.
   ///
@@ -630,16 +904,20 @@ class _RoomScreenState extends State<RoomScreen> {
           .timeout(const Duration(seconds: 10));
       if (resp.statusCode != 200) return;
       final data = decodeJsonResponse(resp) as Map<String, dynamic>;
-      final sources = ((data['sources'] as List?) ?? [])
-          .cast<Map<String, dynamic>>()
-          .where((s) => (s['application'] ?? '').toString().trim().isNotEmpty)
-          .toList();
+      final sources =
+          ((data['sources'] as List?) ?? [])
+              .cast<Map<String, dynamic>>()
+              .where(
+                (s) => (s['application'] ?? '').toString().trim().isNotEmpty,
+              )
+              .toList();
       if (!mounted) return;
       setState(() {
         _sources = sources;
         // Drop selections for sources that have since disappeared.
-        _selectedSources.retainWhere((raw) =>
-            sources.any((s) => s['application'].toString() == raw));
+        _selectedSources.retainWhere(
+          (raw) => sources.any((s) => s['application'].toString() == raw),
+        );
       });
     } catch (_) {
       // Chips are an affordance, not the content — a failure here is not fatal.
@@ -670,8 +948,7 @@ class _RoomScreenState extends State<RoomScreen> {
       // Append rather than replace: dictation can add to a half-typed thought.
       final existing = _input.text.trimRight();
       _input.text = existing.isEmpty ? text : '$existing $text';
-      _input.selection =
-          TextSelection.collapsed(offset: _input.text.length);
+      _input.selection = TextSelection.collapsed(offset: _input.text.length);
     } catch (e) {
       _snack('Could not transcribe: $e');
     } finally {
@@ -698,11 +975,10 @@ class _RoomScreenState extends State<RoomScreen> {
         if (_search.text.trim().isNotEmpty) 'q': _search.text.trim(),
         if (_kinds.length < 3) 'kinds': _kinds.join(','),
       };
-      final uri = Uri.parse('${widget.apiBase}/rooms/${widget.roomId}/feed')
-          .replace(queryParameters: params);
-      final resp = await http
-          .get(uri)
-          .timeout(const Duration(seconds: 15));
+      final uri = Uri.parse(
+        '${widget.apiBase}/rooms/${widget.roomId}/feed',
+      ).replace(queryParameters: params);
+      final resp = await http.get(uri).timeout(const Duration(seconds: 15));
       if (resp.statusCode == 200) {
         final data = decodeJsonResponse(resp) as Map<String, dynamic>;
         final feed = (data['feed'] as List?) ?? [];
@@ -753,6 +1029,11 @@ class _RoomScreenState extends State<RoomScreen> {
           'ts': now + 0.001,
           '_pending': true,
           '_thinking': true,
+          '_activities': <String>[
+            widget.assistantMode == 'agent'
+                ? 'Starting ${widget.roomName} agent'
+                : 'Thinking',
+          ],
         });
       }
     });
@@ -764,16 +1045,22 @@ class _RoomScreenState extends State<RoomScreen> {
       // selected sources, the active time window, and — with Live on — the
       // current frame buffers. A note is just a note.
       final (start, end) = _timeBounds;
-      final body = isChat
-          ? {
-              'message': text,
-              if (_selectedSources.isNotEmpty)
-                'applications': _selectedSources.toList(),
-              if (start != null) 'start': start,
-              if (end != null) 'end': end,
-              if (_live) 'live': true,
-            }
-          : {'text': text};
+      final body =
+          isChat
+              ? {
+                'message': text,
+                if (_selectedSources.isNotEmpty)
+                  'applications': _selectedSources.toList(),
+                if (start != null) 'start': start,
+                if (end != null) 'end': end,
+                if (_live) 'live': true,
+              }
+              : {'text': text};
+      if (isChat && widget.assistantMode == 'agent') {
+        await _sendAgentStream(body);
+        await _load();
+        return;
+      }
       final resp = await http
           .post(
             Uri.parse('${widget.apiBase}/rooms/${widget.roomId}/$path'),
@@ -806,9 +1093,110 @@ class _RoomScreenState extends State<RoomScreen> {
     }
   }
 
+  Future<void> _sendAgentStream(Map<String, dynamic> body) async {
+    final client = http.Client();
+    try {
+      final request =
+          http.Request(
+              'POST',
+              Uri.parse('${widget.apiBase}/rooms/${widget.roomId}/chat/stream'),
+            )
+            ..headers['Content-Type'] = 'application/json'
+            ..body = json.encode(body);
+      final response = await client
+          .send(request)
+          .timeout(const Duration(seconds: 30));
+      if (response.statusCode != 200) {
+        final responseBody = await response.stream.bytesToString();
+        String reason = 'HTTP ${response.statusCode}';
+        try {
+          final decoded = json.decode(responseBody) as Map<String, dynamic>;
+          reason = decoded['error']?.toString() ?? reason;
+        } catch (_) {}
+        throw Exception(reason);
+      }
+
+      var completed = false;
+      await for (final line in response.stream
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())) {
+        if (line.trim().isEmpty) continue;
+        final event = json.decode(line) as Map<String, dynamic>;
+        switch (event['type']?.toString()) {
+          case 'agent_progress':
+            var message =
+                event['message']?.toString().trim() ?? 'Agent is working';
+            final arguments = event['arguments'];
+            if (arguments != null) {
+              var detail = json.encode(arguments);
+              if (detail.length > 220) {
+                detail = '${detail.substring(0, 220)}...';
+              }
+              if (detail != '{}' && detail != 'null') {
+                message = '$message\n$detail';
+              }
+            }
+            _appendAgentActivity(message);
+          case 'delta':
+            final text = event['text']?.toString() ?? '';
+            if (text.isNotEmpty) _setPendingAgentAnswer(text);
+          case 'error':
+            throw Exception(event['error']?.toString() ?? 'Agent run failed');
+          case 'done':
+            completed = true;
+        }
+      }
+      if (!completed) throw Exception('Agent stream ended before completion');
+    } finally {
+      client.close();
+    }
+  }
+
+  void _appendAgentActivity(String message) {
+    if (!mounted || message.trim().isEmpty) return;
+    setState(() {
+      final pending = _feed.where(
+        (item) =>
+            item is Map &&
+            item['_pending'] == true &&
+            item['_thinking'] == true,
+      );
+      if (pending.isEmpty) return;
+      final bubble = pending.last as Map;
+      final activities = List<String>.from(
+        (bubble['_activities'] as List?) ?? const <String>[],
+      );
+      if (activities.isEmpty || activities.last != message) {
+        activities.add(message);
+      }
+      bubble['_activities'] =
+          activities.length > 8
+              ? activities.sublist(activities.length - 8)
+              : activities;
+    });
+    _jumpToBottom();
+  }
+
+  void _setPendingAgentAnswer(String text) {
+    if (!mounted) return;
+    setState(() {
+      final pending = _feed.where(
+        (item) =>
+            item is Map &&
+            item['_pending'] == true &&
+            item['_thinking'] == true,
+      );
+      if (pending.isEmpty) return;
+      final bubble = pending.last as Map;
+      bubble['text'] = '${bubble['text'] ?? ''}$text';
+    });
+  }
+
   void _dropPending() {
     if (mounted) {
-      setState(() => _feed.removeWhere((it) => it is Map && it['_pending'] == true));
+      setState(
+        () => _feed.removeWhere((it) => it is Map && it['_pending'] == true),
+      );
     }
   }
 
@@ -839,8 +1227,11 @@ class _RoomScreenState extends State<RoomScreen> {
     setState(() => _sending = true);
     try {
       final resp = await http
-          .post(Uri.parse(
-              '${widget.apiBase}/rooms/${widget.roomId}/agent-check-in'))
+          .post(
+            Uri.parse(
+              '${widget.apiBase}/rooms/${widget.roomId}/agent-check-in',
+            ),
+          )
           .timeout(const Duration(seconds: 90));
       if (resp.statusCode == 200) {
         await _load();
@@ -894,17 +1285,21 @@ class _RoomScreenState extends State<RoomScreen> {
           _feedFilters(),
           if (_kinds.contains('event')) _activityOverview(),
           Expanded(
-            child: _error != null
-                ? Center(
-                    child: Text('Could not load feed.\n$_error',
+            child:
+                _error != null
+                    ? Center(
+                      child: Text(
+                        'Could not load feed.\n$_error',
                         textAlign: TextAlign.center,
-                        style: const TextStyle(color: _muted)))
-                : ListView.builder(
-                    controller: _scroll,
-                    padding: const EdgeInsets.all(12),
-                    itemCount: visibleFeed.length,
-                    itemBuilder: (context, i) => _feedItem(visibleFeed[i]),
-                  ),
+                        style: const TextStyle(color: _muted),
+                      ),
+                    )
+                    : ListView.builder(
+                      controller: _scroll,
+                      padding: const EdgeInsets.all(12),
+                      itemCount: visibleFeed.length,
+                      itemBuilder: (context, i) => _feedItem(visibleFeed[i]),
+                    ),
           ),
           _composer(),
         ],
@@ -930,22 +1325,26 @@ class _RoomScreenState extends State<RoomScreen> {
                     isDense: true,
                     prefixIcon: const Icon(Icons.search, size: 18),
                     hintText: 'Search this room',
-                    suffixIcon: _search.text.isEmpty
-                        ? null
-                        : IconButton(
-                            icon: const Icon(Icons.clear, size: 17),
-                            onPressed: () {
-                              _search.clear();
-                              _load();
-                            }),
+                    suffixIcon:
+                        _search.text.isEmpty
+                            ? null
+                            : IconButton(
+                              icon: const Icon(Icons.clear, size: 17),
+                              onPressed: () {
+                                _search.clear();
+                                _load();
+                              },
+                            ),
                   ),
                 ),
               ),
               const SizedBox(width: 7),
               IconButton(
                 tooltip: 'Filter by date',
-                icon: Icon(_date == null ? Icons.event : Icons.event_available,
-                    color: _date == null ? _muted : _mint),
+                icon: Icon(
+                  _date == null ? Icons.event : Icons.event_available,
+                  color: _date == null ? _muted : _mint,
+                ),
                 onPressed: _pickDate,
               ),
             ],
@@ -962,14 +1361,18 @@ class _RoomScreenState extends State<RoomScreen> {
               _filterChip('Chat', 'message'),
               if (_date != null) ...[
                 const Spacer(),
-                Text(_date!, style: const TextStyle(color: _mint, fontSize: 12)),
+                Text(
+                  _date!,
+                  style: const TextStyle(color: _mint, fontSize: 12),
+                ),
                 IconButton(
-                    visualDensity: VisualDensity.compact,
-                    icon: const Icon(Icons.close, size: 16, color: _muted),
-                    onPressed: () {
-                      setState(() => _date = null);
-                      _load();
-                    }),
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.close, size: 16, color: _muted),
+                  onPressed: () {
+                    setState(() => _date = null);
+                    _load();
+                  },
+                ),
               ],
             ],
           ),
@@ -1029,8 +1432,7 @@ class _RoomScreenState extends State<RoomScreen> {
           selected: selected,
           showCheckmark: false,
           label: Text(label),
-          labelStyle:
-              TextStyle(color: selected ? _ink : _muted, fontSize: 11),
+          labelStyle: TextStyle(color: selected ? _ink : _muted, fontSize: 11),
           selectedColor: _mint,
           backgroundColor: _panelRaised,
           side: const BorderSide(color: _line),
@@ -1078,8 +1480,11 @@ class _RoomScreenState extends State<RoomScreen> {
         children: [
           Padding(
             padding: const EdgeInsets.only(right: 8, top: 8),
-            child: Icon(_isCameraRoom ? Icons.videocam : Icons.desktop_windows,
-                size: 15, color: _muted),
+            child: Icon(
+              _isCameraRoom ? Icons.videocam : Icons.desktop_windows,
+              size: 15,
+              color: _muted,
+            ),
           ),
           for (final source in _sources)
             () {
@@ -1092,8 +1497,10 @@ class _RoomScreenState extends State<RoomScreen> {
                   selected: selected,
                   showCheckmark: false,
                   label: Text('${_labelFor(raw)} $events'),
-                  labelStyle:
-                      TextStyle(color: selected ? _ink : _muted, fontSize: 11),
+                  labelStyle: TextStyle(
+                    color: selected ? _ink : _muted,
+                    fontSize: 11,
+                  ),
                   selectedColor:
                       _isCameraRoom ? const Color(0xFFF59E0B) : _violet,
                   backgroundColor: _panelRaised,
@@ -1144,8 +1551,7 @@ class _RoomScreenState extends State<RoomScreen> {
       showCheckmark: false,
       avatar: Icon(icon, size: 14, color: selected ? _ink : _muted),
       label: Text('$label ${_eventCountFor(value)}'),
-      labelStyle:
-          TextStyle(color: selected ? _ink : _muted, fontSize: 11),
+      labelStyle: TextStyle(color: selected ? _ink : _muted, fontSize: 11),
       selectedColor: _mint,
       backgroundColor: _panelRaised,
       side: const BorderSide(color: _line),
@@ -1154,17 +1560,16 @@ class _RoomScreenState extends State<RoomScreen> {
   }
 
   Widget _activityOverview() {
-    final events = _visibleFeed
-        .where((item) => (item['kind'] ?? 'event') == 'event')
-        .toList();
+    final events =
+        _visibleFeed
+            .where((item) => (item['kind'] ?? 'event') == 'event')
+            .toList();
     final seconds = events.fold<double>(0, (sum, item) {
       final start = item['ts'];
       final end = item['span_end'];
       return sum +
           (start is num && end is num
-              ? (end.toDouble() - start.toDouble())
-                  .clamp(0, 86400)
-                  .toDouble()
+              ? (end.toDouble() - start.toDouble()).clamp(0, 86400).toDouble()
               : 0);
     });
     // Which apps/cameras this room's day is made of — same labels as the tags.
@@ -1196,9 +1601,10 @@ class _RoomScreenState extends State<RoomScreen> {
                   '${events.length} events • ${_duration(seconds)}'
                   '${applications.isEmpty ? '' : ' • $applications'}',
                   style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.w600),
+                    color: Colors.white,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
                 if (low > 0 || flagged > 0)
                   Text(
@@ -1230,7 +1636,9 @@ class _RoomScreenState extends State<RoomScreen> {
         _load();
       },
       labelStyle: TextStyle(
-          color: _kinds.contains(kind) ? _ink : _muted, fontSize: 11),
+        color: _kinds.contains(kind) ? _ink : _muted,
+        fontSize: 11,
+      ),
       selectedColor: _mint,
       backgroundColor: _panelRaised,
       side: const BorderSide(color: _line),
@@ -1260,7 +1668,13 @@ class _RoomScreenState extends State<RoomScreen> {
     if (kind == 'note') return _noteCard(it, text);
     if (kind == 'message') {
       final role = (it['role'] ?? 'assistant').toString();
-      if (it['_thinking'] == true) return const _ThinkingBubble();
+      if (it['_thinking'] == true) {
+        return _ThinkingBubble(
+          activities: List<String>.from(
+            (it['_activities'] as List?) ?? const <String>[],
+          ),
+        );
+      }
       if (role == 'coach') return _coachCard(text);
       return _bubble(text, role == 'user');
     }
@@ -1283,27 +1697,48 @@ class _RoomScreenState extends State<RoomScreen> {
               borderRadius: BorderRadius.circular(8),
               border: Border.all(color: _line),
             ),
-            child: Text(_hm(it['ts']),
-                style: const TextStyle(
-                    color: _mint, fontSize: 11, fontWeight: FontWeight.w600)),
+            child: Text(
+              _hm(it['ts']),
+              style: const TextStyle(
+                color: _mint,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
           ),
           const SizedBox(width: 10),
           Expanded(
-            child: Text(text.isEmpty ? '(no summary)' : text,
-                style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.3)),
+            child: Text(
+              text.isEmpty ? '(no summary)' : text,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 13,
+                height: 1.3,
+              ),
+            ),
           ),
           if (it['event_id'] != null)
             PopupMenuButton<String>(
               padding: EdgeInsets.zero,
               iconSize: 18,
               icon: const Icon(Icons.more_horiz, color: _muted),
-              onSelected: (value) =>
-                  _assignEvent(it['event_id'].toString(), value),
-              itemBuilder: (_) => const [
-                PopupMenuItem(value: 'primary', child: Text('Move to room…')),
-                PopupMenuItem(value: 'secondary', child: Text('Add to room…')),
-                PopupMenuItem(value: 'remove', child: Text('Remove from this room')),
-              ],
+              onSelected:
+                  (value) => _assignEvent(it['event_id'].toString(), value),
+              itemBuilder:
+                  (_) => const [
+                    PopupMenuItem(
+                      value: 'primary',
+                      child: Text('Move to room…'),
+                    ),
+                    PopupMenuItem(
+                      value: 'secondary',
+                      child: Text('Add to room…'),
+                    ),
+                    PopupMenuItem(
+                      value: 'remove',
+                      child: Text('Remove from this room'),
+                    ),
+                  ],
             ),
         ],
       ),
@@ -1313,22 +1748,26 @@ class _RoomScreenState extends State<RoomScreen> {
   Widget _eventCard(Map<String, dynamic> it, String text) {
     final priority = (it['priority'] ?? 'normal').toString();
     final flagged = it['flagged'] == true;
-    final priorityColor = priority == 'high'
-        ? const Color(0xFFFFC857)
-        : priority == 'low'
+    final priorityColor =
+        priority == 'high'
+            ? const Color(0xFFFFC857)
+            : priority == 'low'
             ? _muted
             : _mint;
     // Screen and Cameras each hold every source of their kind, so the app or
     // camera an event came from is a tag on the bubble: opera, pycharm64 in
     // Screen; ipc-a22e-g in Cameras.
     final source = _sourceTag(it);
-    final activity =
-        (it['activity_type'] ?? '').toString().replaceAll('_', ' ');
+    final activity = (it['activity_type'] ?? '').toString().replaceAll(
+      '_',
+      ' ',
+    );
     final start = it['ts'];
     final end = it['span_end'];
-    final seconds = start is num && end is num
-        ? (end.toDouble() - start.toDouble()).clamp(0, 86400).toDouble()
-        : 0.0;
+    final seconds =
+        start is num && end is num
+            ? (end.toDouble() - start.toDouble()).clamp(0, 86400).toDouble()
+            : 0.0;
     final time = end is num ? '${_hm(start)}–${_hm(end)}' : _hm(start);
 
     return Container(
@@ -1338,9 +1777,8 @@ class _RoomScreenState extends State<RoomScreen> {
         color: flagged ? const Color(0xFF2A1B27) : _panel,
         borderRadius: BorderRadius.circular(12),
         border: Border.all(
-            color: flagged
-                ? const Color(0xFFFF7A9B).withOpacity(.55)
-                : _line),
+          color: flagged ? const Color(0xFFFF7A9B).withOpacity(.55) : _line,
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1351,10 +1789,10 @@ class _RoomScreenState extends State<RoomScreen> {
                 flagged
                     ? Icons.flag
                     : priority == 'high'
-                        ? Icons.star
-                        : priority == 'low'
-                            ? Icons.low_priority
-                            : Icons.bolt,
+                    ? Icons.star
+                    : priority == 'low'
+                    ? Icons.low_priority
+                    : Icons.bolt,
                 size: 16,
                 color: flagged ? const Color(0xFFFF7A9B) : priorityColor,
               ),
@@ -1364,9 +1802,10 @@ class _RoomScreenState extends State<RoomScreen> {
                   activity.isEmpty ? 'Activity' : activity,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700),
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
               Text(time, style: const TextStyle(color: _muted, fontSize: 11)),
@@ -1376,39 +1815,52 @@ class _RoomScreenState extends State<RoomScreen> {
                   iconSize: 18,
                   icon: const Icon(Icons.more_horiz, color: _muted),
                   onSelected: (value) => _handleEventAction(it, value),
-                  itemBuilder: (_) => [
-                    const PopupMenuItem(
-                        value: 'priority_high',
-                        child: Text('Mark important')),
-                    const PopupMenuItem(
-                        value: 'priority_normal',
-                        child: Text('Normal priority')),
-                    const PopupMenuItem(
-                        value: 'priority_low',
-                        child: Text('Low priority')),
-                    PopupMenuItem(
-                        value: flagged ? 'unflag' : 'flag',
-                        child: Text(flagged
-                            ? 'Return from review'
-                            : 'Flag for review')),
-                    const PopupMenuDivider(),
-                    const PopupMenuItem(
-                        value: 'primary', child: Text('Move to room…')),
-                    const PopupMenuItem(
-                        value: 'secondary', child: Text('Add to room…')),
-                    const PopupMenuItem(
-                        value: 'remove',
-                        child: Text('Remove from this room')),
-                  ],
+                  itemBuilder:
+                      (_) => [
+                        const PopupMenuItem(
+                          value: 'priority_high',
+                          child: Text('Mark important'),
+                        ),
+                        const PopupMenuItem(
+                          value: 'priority_normal',
+                          child: Text('Normal priority'),
+                        ),
+                        const PopupMenuItem(
+                          value: 'priority_low',
+                          child: Text('Low priority'),
+                        ),
+                        PopupMenuItem(
+                          value: flagged ? 'unflag' : 'flag',
+                          child: Text(
+                            flagged ? 'Return from review' : 'Flag for review',
+                          ),
+                        ),
+                        const PopupMenuDivider(),
+                        const PopupMenuItem(
+                          value: 'primary',
+                          child: Text('Move to room…'),
+                        ),
+                        const PopupMenuItem(
+                          value: 'secondary',
+                          child: Text('Add to room…'),
+                        ),
+                        const PopupMenuItem(
+                          value: 'remove',
+                          child: Text('Remove from this room'),
+                        ),
+                      ],
                 ),
             ],
           ),
           const SizedBox(height: 7),
-          Text(text.isEmpty ? 'No useful description was captured.' : text,
-              style: TextStyle(
-                  color: priority == 'low' ? _muted : Colors.white70,
-                  fontSize: 13,
-                  height: 1.38)),
+          Text(
+            text.isEmpty ? 'No useful description was captured.' : text,
+            style: TextStyle(
+              color: priority == 'low' ? _muted : Colors.white70,
+              fontSize: 13,
+              height: 1.38,
+            ),
+          ),
           const SizedBox(height: 8),
           Wrap(
             spacing: 6,
@@ -1416,35 +1868,41 @@ class _RoomScreenState extends State<RoomScreen> {
             children: [
               if (source.isNotEmpty)
                 _eventTag(
-                    source,
-                    _isCameraRoom ? Icons.videocam : Icons.desktop_windows,
-                    _isCameraRoom ? const Color(0xFFF59E0B) : _violet),
+                  source,
+                  _isCameraRoom ? Icons.videocam : Icons.desktop_windows,
+                  _isCameraRoom ? const Color(0xFFF59E0B) : _violet,
+                ),
               _eventTag(_duration(seconds), Icons.schedule, _muted),
               _eventTag(
-                  priority == 'high'
-                      ? 'Important'
-                      : priority == 'low'
-                          ? 'Low priority'
-                          : 'Normal',
-                  priority == 'high'
-                      ? Icons.star_outline
-                      : priority == 'low'
-                          ? Icons.low_priority
-                          : Icons.bolt_outlined,
-                  priorityColor),
+                priority == 'high'
+                    ? 'Important'
+                    : priority == 'low'
+                    ? 'Low priority'
+                    : 'Normal',
+                priority == 'high'
+                    ? Icons.star_outline
+                    : priority == 'low'
+                    ? Icons.low_priority
+                    : Icons.bolt_outlined,
+                priorityColor,
+              ),
               if (it['priority_source'] == 'automatic')
                 _eventTag('AI ranked', Icons.auto_awesome, _violet),
               if (flagged)
-                _eventTag('Review later', Icons.flag_outlined,
-                    const Color(0xFFFF7A9B)),
+                _eventTag(
+                  'Review later',
+                  Icons.flag_outlined,
+                  const Color(0xFFFF7A9B),
+                ),
             ],
           ),
           if (flagged &&
               (it['flag_reason'] ?? '').toString().trim().isNotEmpty) ...[
             const SizedBox(height: 7),
-            Text('Reason: ${it['flag_reason']}',
-                style: const TextStyle(
-                    color: Color(0xFFFFA0B8), fontSize: 11.5)),
+            Text(
+              'Reason: ${it['flag_reason']}',
+              style: const TextStyle(color: Color(0xFFFFA0B8), fontSize: 11.5),
+            ),
           ],
         ],
       ),
@@ -1480,12 +1938,16 @@ class _RoomScreenState extends State<RoomScreen> {
   }
 
   Future<void> _handleEventAction(
-      Map<String, dynamic> item, String action) async {
+    Map<String, dynamic> item,
+    String action,
+  ) async {
     final eventId = item['event_id']?.toString();
     if (eventId == null) return;
     if (action.startsWith('priority_')) {
       await _triageEvent(
-          eventId, priority: action.replaceFirst('priority_', ''));
+        eventId,
+        priority: action.replaceFirst('priority_', ''),
+      );
     } else if (action == 'flag') {
       await _flagEvent(item);
     } else if (action == 'unflag') {
@@ -1501,35 +1963,46 @@ class _RoomScreenState extends State<RoomScreen> {
     final reason = TextEditingController();
     final confirm = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Flag event for review'),
-        content: TextField(
-          controller: reason,
-          autofocus: true,
-          minLines: 2,
-          maxLines: 4,
-          decoration: const InputDecoration(
-              hintText: 'Optional: why should this be reviewed?'),
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Flag')),
-        ],
-      ),
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Flag event for review'),
+            content: TextField(
+              controller: reason,
+              autofocus: true,
+              minLines: 2,
+              maxLines: 4,
+              decoration: const InputDecoration(
+                hintText: 'Optional: why should this be reviewed?',
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Flag'),
+              ),
+            ],
+          ),
     );
     if (confirm == true) {
       await _triageEvent(
-          eventId, flagged: true, flagReason: reason.text.trim());
+        eventId,
+        flagged: true,
+        flagReason: reason.text.trim(),
+      );
     }
     reason.dispose();
   }
 
-  Future<void> _triageEvent(String eventId,
-      {String? priority, bool? flagged, String? flagReason}) async {
+  Future<void> _triageEvent(
+    String eventId, {
+    String? priority,
+    bool? flagged,
+    String? flagReason,
+  }) async {
     try {
       final body = <String, dynamic>{
         if (priority != null) 'priority': priority,
@@ -1568,19 +2041,27 @@ class _RoomScreenState extends State<RoomScreen> {
           const Icon(Icons.push_pin, size: 15, color: _violet),
           const SizedBox(width: 8),
           Expanded(
-            child: Text(text,
-                style: const TextStyle(color: Colors.white, fontSize: 13, height: 1.3)),
+            child: Text(
+              text,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                height: 1.3,
+              ),
+            ),
           ),
           PopupMenuButton<String>(
             padding: EdgeInsets.zero,
             iconSize: 18,
             icon: const Icon(Icons.more_vert, color: _muted),
-            onSelected: (value) =>
-                value == 'edit' ? _editNote(it, text) : _deleteNote(it),
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'edit', child: Text('Edit note')),
-              PopupMenuItem(value: 'delete', child: Text('Delete note')),
-            ],
+            onSelected:
+                (value) =>
+                    value == 'edit' ? _editNote(it, text) : _deleteNote(it),
+            itemBuilder:
+                (_) => const [
+                  PopupMenuItem(value: 'edit', child: Text('Edit note')),
+                  PopupMenuItem(value: 'delete', child: Text('Delete note')),
+                ],
           ),
         ],
       ),
@@ -1593,18 +2074,25 @@ class _RoomScreenState extends State<RoomScreen> {
     final controller = TextEditingController(text: current);
     final save = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Edit note'),
-        content: TextField(controller: controller, minLines: 3, maxLines: 8),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Save')),
-        ],
-      ),
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Edit note'),
+            content: TextField(
+              controller: controller,
+              minLines: 3,
+              maxLines: 8,
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Save'),
+              ),
+            ],
+          ),
     );
     if (save != true || controller.text.trim().isEmpty) return;
     final resp = await http.patch(
@@ -1624,22 +2112,26 @@ class _RoomScreenState extends State<RoomScreen> {
     if (id == null) return;
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Delete note?'),
-        content: const Text('This cannot be undone.'),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Delete')),
-        ],
-      ),
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Delete note?'),
+            content: const Text('This cannot be undone.'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Delete'),
+              ),
+            ],
+          ),
     );
     if (confirmed != true) return;
     final resp = await http.delete(
-        Uri.parse('${widget.apiBase}/rooms/${widget.roomId}/notes/$id'));
+      Uri.parse('${widget.apiBase}/rooms/${widget.roomId}/notes/$id'),
+    );
     if (resp.statusCode == 200) {
       _load();
     } else {
@@ -1653,8 +2145,9 @@ class _RoomScreenState extends State<RoomScreen> {
         _snack('Daily membership cannot be removed');
         return;
       }
-      final resp = await http.delete(Uri.parse(
-          '${widget.apiBase}/events/$eventId/rooms/${widget.roomId}'));
+      final resp = await http.delete(
+        Uri.parse('${widget.apiBase}/events/$eventId/rooms/${widget.roomId}'),
+      );
       if (resp.statusCode == 200) {
         _load();
       } else {
@@ -1676,16 +2169,23 @@ class _RoomScreenState extends State<RoomScreen> {
       if (!mounted) return;
       final selected = await showDialog<String>(
         context: context,
-        builder: (context) => SimpleDialog(
-          title: Text(mode == 'primary' ? 'Move to room' : 'Add to room'),
-          children: rooms
-              .map((room) => SimpleDialogOption(
-                    onPressed: () =>
-                        Navigator.pop(context, room['room_id'].toString()),
-                    child: Text(room['name'].toString()),
-                  ))
-              .toList(),
-        ),
+        builder:
+            (context) => SimpleDialog(
+              title: Text(mode == 'primary' ? 'Move to room' : 'Add to room'),
+              children:
+                  rooms
+                      .map(
+                        (room) => SimpleDialogOption(
+                          onPressed:
+                              () => Navigator.pop(
+                                context,
+                                room['room_id'].toString(),
+                              ),
+                          child: Text(room['name'].toString()),
+                        ),
+                      )
+                      .toList(),
+            ),
       );
       if (selected == null) return;
       final update = await http.put(
@@ -1709,13 +2209,22 @@ class _RoomScreenState extends State<RoomScreen> {
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 5),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-        constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * .75),
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * .75,
+        ),
         decoration: BoxDecoration(
           color: isUser ? _mint.withOpacity(.16) : _panelRaised,
           borderRadius: BorderRadius.circular(14),
           border: Border.all(color: isUser ? _mint.withOpacity(.4) : _line),
         ),
-        child: Text(text, style: const TextStyle(color: Colors.white, fontSize: 13, height: 1.3)),
+        child: Text(
+          text,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 13,
+            height: 1.3,
+          ),
+        ),
       ),
     );
   }
@@ -1732,15 +2241,26 @@ class _RoomScreenState extends State<RoomScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Row(children: [
-            Icon(Icons.insights, size: 16, color: _mint),
-            SizedBox(width: 6),
-            Text('Coach', style: TextStyle(color: _mint, fontWeight: FontWeight.w700)),
-          ]),
+          const Row(
+            children: [
+              Icon(Icons.insights, size: 16, color: _mint),
+              SizedBox(width: 6),
+              Text(
+                'Coach',
+                style: TextStyle(color: _mint, fontWeight: FontWeight.w700),
+              ),
+            ],
+          ),
           const SizedBox(height: 8),
-          Text(text,
-              style: const TextStyle(
-                  color: Colors.white70, fontSize: 12.5, height: 1.4, fontFamily: 'monospace')),
+          Text(
+            text,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 12.5,
+              height: 1.4,
+              fontFamily: 'monospace',
+            ),
+          ),
         ],
       ),
     );
@@ -1759,17 +2279,20 @@ class _RoomScreenState extends State<RoomScreen> {
             children: [
               _modeChip('Note', 'note', Icons.push_pin),
               const SizedBox(width: 8),
-              _modeChip('Ask agent', 'chat', Icons.chat_bubble_outline),
+              _modeChip(
+                widget.assistantMode == 'agent' ? 'Ask agent' : 'Chat',
+                'chat',
+                widget.assistantMode == 'agent'
+                    ? Icons.smart_toy_outlined
+                    : Icons.chat_bubble_outline,
+              ),
               if (_mode == 'chat' && _isSourceRoom) ...[
                 const SizedBox(width: 8),
                 _liveChip(),
               ],
             ],
           ),
-          if (_mode == 'chat') ...[
-            const SizedBox(height: 6),
-            _scopeSummary(),
-          ],
+          if (_mode == 'chat') ...[const SizedBox(height: 6), _scopeSummary()],
           const SizedBox(height: 8),
           Row(
             children: [
@@ -1780,13 +2303,16 @@ class _RoomScreenState extends State<RoomScreen> {
                   maxLines: 4,
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
-                    hintText: _listening
-                        ? 'Listening… tap the mic to stop'
-                        : _transcribing
+                    hintText:
+                        _listening
+                            ? 'Listening… tap the mic to stop'
+                            : _transcribing
                             ? 'Transcribing…'
                             : _mode == 'note'
-                                ? 'Write or speak a thought…'
-                                : 'Ask the agent about this room…',
+                            ? 'Write or speak a thought…'
+                            : widget.assistantMode == 'agent'
+                            ? 'Ask the agent about this room…'
+                            : 'Chat about this room…',
                     hintStyle: const TextStyle(color: _muted),
                     isDense: true,
                   ),
@@ -1796,21 +2322,35 @@ class _RoomScreenState extends State<RoomScreen> {
               IconButton(
                 tooltip: _listening ? 'Stop and transcribe' : 'Dictate',
                 onPressed: _transcribing ? null : _toggleDictation,
-                icon: _transcribing
-                    ? const SizedBox(
-                        width: 18, height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: _mint))
-                    : Icon(_listening ? Icons.stop_circle : Icons.mic_none,
-                        color: _listening ? const Color(0xFFFF607C) : _muted),
+                icon:
+                    _transcribing
+                        ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: _mint,
+                          ),
+                        )
+                        : Icon(
+                          _listening ? Icons.stop_circle : Icons.mic_none,
+                          color: _listening ? const Color(0xFFFF607C) : _muted,
+                        ),
               ),
               const SizedBox(width: 4),
               IconButton(
                 style: IconButton.styleFrom(backgroundColor: _mint),
-                icon: _sending
-                    ? const SizedBox(
-                        width: 18, height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: _ink))
-                    : const Icon(Icons.send, color: _ink),
+                icon:
+                    _sending
+                        ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: _ink,
+                          ),
+                        )
+                        : const Icon(Icons.send, color: _ink),
                 onPressed: (_sending || _listening) ? null : _send,
               ),
             ],
@@ -1829,16 +2369,20 @@ class _RoomScreenState extends State<RoomScreen> {
     return FilterChip(
       selected: _live,
       showCheckmark: false,
-      avatar: Icon(_live ? Icons.sensors : Icons.sensors_off,
-          size: 15, color: _live ? _ink : _muted),
+      avatar: Icon(
+        _live ? Icons.sensors : Icons.sensors_off,
+        size: 15,
+        color: _live ? _ink : _muted,
+      ),
       label: const Text('Live'),
       labelStyle: TextStyle(color: _live ? _ink : _muted, fontSize: 12),
       selectedColor: const Color(0xFFFFC857),
       backgroundColor: _panelRaised,
       side: const BorderSide(color: _line),
-      tooltip: _isCameraRoom
-          ? 'Also look at what the cameras are seeing right now'
-          : 'Also look at what is on the screen right now',
+      tooltip:
+          _isCameraRoom
+              ? 'Also look at what the cameras are seeing right now'
+              : 'Also look at what is on the screen right now',
       onSelected: (value) => setState(() => _live = value),
     );
   }
@@ -1867,15 +2411,20 @@ class _RoomScreenState extends State<RoomScreen> {
 
     return Row(
       children: [
-        Icon(_live ? Icons.sensors : Icons.filter_alt_outlined,
-            size: 13, color: _live ? const Color(0xFFFFC857) : _muted),
+        Icon(
+          _live ? Icons.sensors : Icons.filter_alt_outlined,
+          size: 13,
+          color: _live ? const Color(0xFFFFC857) : _muted,
+        ),
         const SizedBox(width: 5),
         Expanded(
           child: Text(
             'Answering from: ${parts.join(' · ')}',
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
-                color: _hasScope || _live ? _mint : _muted, fontSize: 10.5),
+              color: _hasScope || _live ? _mint : _muted,
+              fontSize: 10.5,
+            ),
           ),
         ),
       ],
@@ -1901,7 +2450,8 @@ class _RoomScreenState extends State<RoomScreen> {
 /// A left-aligned assistant bubble with animated dots, shown while the reply
 /// is in flight (the model can take a while — single-sequence vLLM).
 class _ThinkingBubble extends StatefulWidget {
-  const _ThinkingBubble();
+  final List<String> activities;
+  const _ThinkingBubble({this.activities = const []});
 
   @override
   State<_ThinkingBubble> createState() => _ThinkingBubbleState();
@@ -1909,9 +2459,10 @@ class _ThinkingBubble extends StatefulWidget {
 
 class _ThinkingBubbleState extends State<_ThinkingBubble>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _c =
-      AnimationController(vsync: this, duration: const Duration(milliseconds: 1200))
-        ..repeat();
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1200),
+  )..repeat();
 
   @override
   void dispose() {
@@ -1934,26 +2485,49 @@ class _ThinkingBubbleState extends State<_ThinkingBubble>
         child: AnimatedBuilder(
           animation: _c,
           builder: (context, _) {
-            return Row(
+            final activities =
+                widget.activities.isEmpty
+                    ? const ['Agent is working']
+                    : widget.activities;
+            return Column(
               mainAxisSize: MainAxisSize.min,
-              children: List.generate(3, (i) {
-                final t = ((_c.value + i / 3) % 1.0);
-                final opacity = 0.3 + 0.7 * (1 - (2 * t - 1).abs());
-                return Padding(
-                  padding: EdgeInsets.only(right: i < 2 ? 5 : 0),
-                  child: Opacity(
-                    opacity: opacity,
-                    child: Container(
-                      width: 7,
-                      height: 7,
-                      decoration: const BoxDecoration(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    RotationTransition(
+                      turns: _c,
+                      child: const Icon(Icons.sync, size: 15, color: _mint),
+                    ),
+                    const SizedBox(width: 7),
+                    const Text(
+                      'Agent activity',
+                      style: TextStyle(
                         color: _mint,
-                        shape: BoxShape.circle,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 7),
+                for (var i = 0; i < activities.length; i++)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 3),
+                    child: Text(
+                      '${i == activities.length - 1 ? '>' : 'done:'} '
+                      '${activities[i]}',
+                      style: TextStyle(
+                        color:
+                            i == activities.length - 1 ? Colors.white : _muted,
+                        fontSize: 11.5,
+                        height: 1.3,
+                        fontFamily: 'monospace',
                       ),
                     ),
                   ),
-                );
-              }),
+              ],
             );
           },
         ),

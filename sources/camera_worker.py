@@ -28,6 +28,7 @@ import cv2
 import numpy as np
 
 from sources.rtsp import RealtimeCameraStream
+from sources.video_writer import open_mp4_writer
 from sources.motion_gate import MotionGate
 from sources.camera_validation import HEALTH, classify
 from sources.capture_settings import (
@@ -407,8 +408,10 @@ def _encode_frames_to_mp4_base64(frames, fps=1.0):
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         temp_filename = f.name
     try:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(temp_filename, fourcc, max(fps, 1.0), (width, height))
+        out = open_mp4_writer(temp_filename, fps, (width, height))
+        if out is None:
+            logger.warning("Could not open a video writer for camera frames.")
+            return None
         for frame in frames:
             out.write(cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2BGR))
         out.release()
