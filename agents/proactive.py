@@ -102,10 +102,14 @@ def _repeats_opening(text, prior_texts):
 class ProactiveNarrator:
     def __init__(self, vlm_model, client, cooldown_seconds=300,
                  retriever=None, store_getter=None, focus_cooldown_seconds=120,
-                 personal_memory=None):
+                 personal_memory=None, delivery_budget=None):
         self.vlm_model = vlm_model
         self.client = client
         self.cooldown_seconds = cooldown_seconds
+        # Shared with the orchestrator's scheduled agents. Without it the
+        # narrator's own cooldown is the only pacing, and a nudge could land in
+        # the same minute as a check-in because neither knew about the other.
+        self.delivery_budget = delivery_budget
         # Drift from a stated goal is worth catching sooner than a general remark.
         self.focus_cooldown_seconds = focus_cooldown_seconds
         self.retriever = retriever
@@ -141,6 +145,12 @@ class ProactiveNarrator:
             if now - self._last_spoken_at < cooldown:
                 logger.debug("Proactive: within delivery cooldown.")
                 return None
+            # Checked before the VLM call so a nudge that could not be delivered
+            # anyway costs nothing, and claimed again at delivery below.
+            if (self.delivery_budget is not None
+                    and not self.delivery_budget.allows(now)):
+                logger.debug("Proactive: shared delivery budget is spent.")
+                return None
 
             recent_texts = self._recent_nudges()
             evidence = self._recall(description, now, focus=focus, context=context)
@@ -175,6 +185,12 @@ class ProactiveNarrator:
                 return None
             if _repeats_opening(text, recent_texts):
                 logger.debug("Proactive: repeated opening blocked at delivery.")
+                return None
+
+            if (self.delivery_budget is not None
+                    and not self.delivery_budget.claim("proactive", now)):
+                # Something else spoke while the model was drafting.
+                logger.debug("Proactive: lost the delivery slot while drafting.")
                 return None
 
             self._last_spoken_at = now

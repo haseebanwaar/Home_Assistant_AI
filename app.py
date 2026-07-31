@@ -50,12 +50,21 @@ from agents.personal_agents import AGENTS as PERSONAL_AGENTS, get_agent
 from agents.agent_runtime import AgentRuntime, AgentRuntimeUnavailable
 from agents.conversation_manager import ConversationManager
 from agents.graph_tools import graph_toolset_factory
+from agents.orchestrator import (
+    DailyAt,
+    DeliveryBudget,
+    Interval,
+    JobResult,
+    Orchestrator,
+    parse_daily,
+)
 from agents.schemas import PlanEvaluation, PlanProposal
 from agents.tomorrow_planner import (
     TomorrowPlanStore,
     lock_at as tomorrow_plan_lock_at,
     plan_phase as tomorrow_plan_phase,
 )
+from memory.consolidation import Consolidator, DAY as ROLLUP_DAY, rollup_line
 from memory.notifications import NotificationCenter
 from memory.personal import PersonalMemory, learn_from_user_message
 from memory.rooms.scope import RoomScopeError, resolve_camera_scope
@@ -163,9 +172,19 @@ camera_bootstrap_task = None
 source_capture_settings = SourceCaptureSettings()
 proactive = None
 mobile_activity_task = None
-daily_report_task = None  # nightly Coach report scheduler
-tomorrow_planner_task = None
 tomorrow_plan_store = TomorrowPlanStore()
+# One throttle for everything that addresses the user unprompted: scheduled
+# agent check-ins and the proactive narrator both claim from it, so neither can
+# arrive on top of the other.
+delivery_budget = DeliveryBudget(
+    min_gap_seconds=env_int("AGENT_DELIVERY_GAP_SECONDS", 300, minimum=0),
+    max_per_hour=env_int("AGENT_DELIVERIES_PER_HOUR", 6, minimum=1),
+)
+# The single scheduler behind every agent. Jobs are registered during startup;
+# `orchestrator_task` drives the one loop that replaced the per-agent sleepers.
+orchestrator = Orchestrator(
+    store_getter=lambda: neo4j_store, budget=delivery_budget)
+orchestrator_task = None
 memory_pipeline = None   # Step-a: live sessions/events/knowledge pipeline
 neo4j_store = None       # optional graph sink for the live pipeline
 personal_memory = PersonalMemory(
@@ -178,7 +197,6 @@ notification_center = NotificationCenter(
     important_cooldown_seconds=env_int(
         "NOTIFICATION_COOLDOWN_SECONDS", 600, minimum=0),
 )
-clip_retention_task = None
 # Every stored capture window writes a low-res clip; retention (below) keeps only
 # the ones something referenced. See sources/clips.py.
 clip_store = ClipStore(
@@ -338,8 +356,7 @@ def validate_configuration():
 @app.on_event("startup")
 async def startup_event():
     global vlm_model, screen_stream, camera_manager, camera_bootstrap_task
-    global proactive, mobile_activity_task, daily_report_task, clip_retention_task
-    global tomorrow_planner_task
+    global proactive, mobile_activity_task, orchestrator_task
     global memory_pipeline, neo4j_store
 
     validate_configuration()
@@ -370,6 +387,8 @@ async def startup_event():
             # Lazy — the graph is connected further down in this same startup.
             store_getter=lambda: neo4j_store,
             personal_memory=personal_memory,
+            # Paced against the scheduled agents, not just against itself.
+            delivery_budget=delivery_budget,
         )
         insight_callback = handle_screen_description
         logger.info("Proactive narrator enabled (cooldown=%ds).", proactive.cooldown_seconds)
@@ -431,6 +450,9 @@ async def startup_event():
             logger.warning("ensure_source_room(screen) failed: %s", exc)
         try:
             neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
+            # Research supersedes the older PhD Helper room. Preserve its notes,
+            # messages, and linked activity, then keep it out of the active list.
+            neo4j_store.merge_rooms("agent:phd-helper", "agent:research")
         except Exception as exc:
             logger.warning("ensure_agent_rooms failed: %s", exc)
 
@@ -481,69 +503,157 @@ async def startup_event():
     logger.info("Single-user POC pipeline ready.")
     mobile_activity_task = asyncio.create_task(process_mobile_activity())
 
+    register_agent_jobs()
+    orchestrator_task = asyncio.create_task(orchestrator.run_forever(
+        interval=env_int("ORCHESTRATOR_TICK_SECONDS", 30, minimum=5)))
+    logger.info("Orchestrator started with %d job(s): %s",
+                len(orchestrator.jobs),
+                ", ".join(job.job_id for job in orchestrator.jobs))
+
+
+# -- orchestrated agent jobs ------------------------------------------------
+#
+# Everything that used to be its own `while True: sleep` lives here as a job
+# with a declared schedule. One loop runs them, one budget arbitrates which of
+# them may speak, and `/orchestrator/status` reports what each has done.
+
+def register_agent_jobs():
+    """Register every scheduled agent. Called once, after the graph connects."""
     if clip_store.enabled:
-        clip_retention_task = asyncio.create_task(run_clip_retention())
-        logger.info("Clip retention running (unpinned %d min, pinned %d day(s)).",
-                    clip_store.retention_seconds // 60,
-                    clip_store.pinned_retention_seconds // 86400)
+        orchestrator.add(
+            "clip-retention", "Clip retention", _job_clip_retention,
+            Interval(env_int("CLIP_PRUNE_INTERVAL_SECONDS", 900, minimum=30)),
+            priority=90,
+            description="Expire clips nothing referenced.")
 
-    if neo4j_store is not None and env_bool("DAILY_REPORT_SCHEDULED", True):
-        daily_report_task = asyncio.create_task(run_daily_report_scheduler())
-        logger.info("Daily report scheduled for %02d:%02d local.",
-                    env_int("DAILY_REPORT_HOUR", 23, minimum=0),
-                    env_int("DAILY_REPORT_MINUTE", 30, minimum=0))
-    if neo4j_store is not None and env_bool("TOMORROW_PLANNER_ENABLED", True):
-        tomorrow_planner_task = asyncio.create_task(
-            run_tomorrow_planner_scheduler()
-        )
-        logger.info(
-            "Tomorrow planner scheduled (proposal 23:00, tracking 10:30)."
-        )
+    if neo4j_store is None:
+        logger.info("Graph disabled: only maintenance jobs are scheduled.")
+        return
+
+    if env_bool("DAILY_REPORT_SCHEDULED", True):
+        orchestrator.add(
+            "daily-report", "Daily report", _job_daily_report,
+            DailyAt(env_int("DAILY_REPORT_HOUR", 23, minimum=0),
+                    env_int("DAILY_REPORT_MINUTE", 30, minimum=0)),
+            priority=20, speaks=True, needs_activity=True,
+            description="Coach's review of the day, stored on the day rollup.")
+
+    if env_bool("TOMORROW_PLANNER_ENABLED", True):
+        # The planner both proposes and tracks, so it runs on a short interval
+        # and decides internally which phase applies — its own timing rules
+        # (23:00 proposal, 10:30 lock) are finer than a single daily slot.
+        #
+        # Deliberately not budgeted: it writes a running log into its own room
+        # rather than addressing the user, and a per-minute job that claimed a
+        # delivery slot on every tick would starve the ones that do. Holding up
+        # plan tracking because another agent just spoke would also be wrong.
+        orchestrator.add(
+            "tomorrow-planner", "Tomorrow planner", _job_tomorrow_planner,
+            Interval(600), priority=30,
+            description="Propose tomorrow's plan, then track it against activity.")
+
+    if env_bool("MEMORY_CONSOLIDATION_ENABLED", True):
+        orchestrator.add(
+            "memory-consolidation", "Memory consolidation", _job_consolidate,
+            parse_daily(os.getenv("MEMORY_CONSOLIDATION_AT"), DailyAt(3, 15)),
+            priority=80, timeout_seconds=900,
+            description="Roll days into week/month summaries, then decay noise.")
+
+    if not env_bool("AGENT_CHECKINS_ENABLED", True):
+        logger.info("Scheduled agent check-ins disabled.")
+        return
+    overrides = _checkin_overrides()
+    for agent in PERSONAL_AGENTS:
+        schedule = parse_daily(overrides.get(agent.room_id, agent.check_in_at))
+        if schedule is None:
+            continue
+        orchestrator.add(
+            f"check-in:{agent.room_id}", f"{agent.name} check-in",
+            _agent_check_in_job(agent), schedule,
+            priority=50, speaks=True, needs_activity=True,
+            timeout_seconds=env_int("AGENT_CHECKIN_TIMEOUT_SECONDS", 240),
+            description=f"Unprompted review in the {agent.name} room.")
 
 
-async def run_clip_retention():
-    """Expire clips nothing referenced, on a slow loop off the capture threads."""
-    interval = env_int("CLIP_PRUNE_INTERVAL_SECONDS", 300, minimum=30)
-    while True:
-        try:
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            raise
-        try:
-            await asyncio.to_thread(clip_store.prune)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("Clip retention pass failed: %s", exc)
+def _checkin_overrides():
+    """AGENT_CHECKIN_SCHEDULE='agent:wisdom=08:00,agent:roaster=' — '' disables one."""
+    overrides = {}
+    for item in (os.getenv("AGENT_CHECKIN_SCHEDULE") or "").split(","):
+        room_id, sep, when = item.partition("=")
+        if sep and room_id.strip():
+            overrides[room_id.strip()] = when.strip()
+    return overrides
 
 
-async def run_daily_report_scheduler():
-    """Generate and post the Coach's daily report each evening.
+async def _job_clip_retention(ctx):
+    await asyncio.to_thread(clip_store.prune)
+    return JobResult(detail="pruned")
 
-    The report existed but nothing ever called it, so the Daily room only
-    updated when the user remembered to press a button — which makes a
-    "lifelong memory" feel inert. Runs for the day that is ending.
+
+async def _job_daily_report(ctx):
+    """The Coach's nightly review — posted to the room and kept in the graph."""
+    result = await daily_report(date=ctx.today, post=True)
+    if isinstance(result, JSONResponse):
+        raise RuntimeError("daily report unavailable")
+    return JobResult(
+        detail=f"{result.get('date')} posted={result.get('posted')}",
+        delivered=bool(result.get("posted")))
+
+
+async def _job_tomorrow_planner(ctx):
+    """One pass of the plan lifecycle: propose at 23:00, lock and track at 10:30."""
+    now = datetime.datetime.fromtimestamp(ctx.now)
+    actions = []
+    if now.hour >= 23:
+        target = (now.date() + datetime.timedelta(days=1)).isoformat()
+        if tomorrow_plan_store.get(target) is None:
+            await generate_tomorrow_plan(target)
+            actions.append(f"proposed {target}")
+
+    today = now.date().isoformat()
+    plan = tomorrow_plan_store.get(today)
+    if plan and now >= tomorrow_plan_lock_at(today):
+        if not plan.get("finalized_at"):
+            plan = tomorrow_plan_store.finalize(today)
+            neo4j_store.add_message(
+                PLANNER_ROOM, "planner",
+                "The plan is now final. Tracking has started; tasks can be "
+                "checked manually or completed from activity evidence.")
+            actions.append("finalized")
+        evaluation_seconds = env_int(
+            "TOMORROW_PLAN_EVALUATION_SECONDS", 1800, minimum=300)
+        if time.time() - float(plan.get("last_evaluated_at") or 0) >= evaluation_seconds:
+            await evaluate_tomorrow_plan(today)
+            actions.append("evaluated")
+    return JobResult(detail=", ".join(actions) if actions else "nothing due")
+
+
+async def _job_consolidate(ctx):
+    """Compress yesterday into the long-term tier and prune what decayed.
+
+    Runs for the day that just ended: consolidating today at 03:15 would store a
+    three-hour summary as if it were the whole day.
     """
-    hour = min(env_int("DAILY_REPORT_HOUR", 23, minimum=0), 23)
-    minute = min(env_int("DAILY_REPORT_MINUTE", 30, minimum=0), 59)
-    while True:
-        now = datetime.datetime.now()
-        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if target <= now:
-            target += datetime.timedelta(days=1)
-        try:
-            await asyncio.sleep((target - now).total_seconds())
-        except asyncio.CancelledError:
-            raise
-        try:
-            result = await daily_report(date=target.date().isoformat(), post=True)
-            logger.info("Scheduled daily report for %s (posted=%s).",
-                        result.get("date"), result.get("posted"))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # Never let one bad night kill the scheduler.
-            logger.warning("Scheduled daily report failed: %s", exc)
+    yesterday = (datetime.date.fromtimestamp(ctx.now)
+                 - datetime.timedelta(days=1)).isoformat()
+    result = await asyncio.to_thread(_consolidator().run, yesterday)
+    return JobResult(detail=f"{yesterday}: {result.get('decay')}", data=result)
+
+
+def _agent_check_in_job(agent):
+    async def run(ctx):
+        result = await _run_agent_check_in(agent.room_id)
+        return JobResult(detail=f"{len(result['reply'])} chars", delivered=True)
+    return run
+
+
+def _consolidator():
+    if neo4j_store is None:
+        raise RuntimeError("graph not enabled")
+    return Consolidator(
+        neo4j_store,
+        quarantine_days=env_int("MEMORY_QUARANTINE_DAYS", 45, minimum=1),
+        dormant_days=env_int("PROJECT_DORMANT_DAYS", 21, minimum=1))
 
 
 PLANNER_ROOM = "agent:tomorrow-planner"
@@ -757,47 +867,11 @@ Observed activity:
     return updated
 
 
-async def run_tomorrow_planner_scheduler():
-    """Propose at 23:00, lock at 10:30, then reassess every 30 minutes."""
-    evaluation_seconds = env_int(
-        "TOMORROW_PLAN_EVALUATION_SECONDS", 1800, minimum=300
-    )
-    while True:
-        now = datetime.datetime.now()
-        try:
-            if now.hour >= 23:
-                target = (now.date() + datetime.timedelta(days=1)).isoformat()
-                if tomorrow_plan_store.get(target) is None:
-                    await generate_tomorrow_plan(target)
-
-            today = now.date().isoformat()
-            plan = tomorrow_plan_store.get(today)
-            if plan and now >= tomorrow_plan_lock_at(today):
-                if not plan.get("finalized_at"):
-                    plan = tomorrow_plan_store.finalize(today)
-                    neo4j_store.add_message(
-                        "agent:tomorrow-planner",
-                        "planner",
-                        "The plan is now final. Tracking has started; tasks can "
-                        "be checked manually or completed from activity evidence.",
-                    )
-                last = float(plan.get("last_evaluated_at") or 0)
-                if time.time() - last >= evaluation_seconds:
-                    await evaluate_tomorrow_plan(today)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("Tomorrow planner scheduler pass failed: %s", exc)
-        await asyncio.sleep(60)
-
-
 @app.on_event("shutdown")
 async def shutdown_event():
     for task in (
         mobile_activity_task,
-        daily_report_task,
-        tomorrow_planner_task,
-        clip_retention_task,
+        orchestrator_task,
     ):
         if task is None:
             continue
@@ -1153,6 +1227,57 @@ async def rooms_list(include_archived: bool = False):
     return {"rooms": neo4j_store.list_rooms(include_archived=include_archived)}
 
 
+@app.get("/orchestrator/status")
+async def orchestrator_status():
+    """What every agent is scheduled to do, when, and how it last went."""
+    return orchestrator.status()
+
+
+@app.post("/orchestrator/jobs/{job_id:path}/run")
+async def orchestrator_run_job(job_id: str):
+    """Trigger one job now. The schedule is bypassed; the budget is not."""
+    try:
+        return await orchestrator.run_job(job_id)
+    except KeyError:
+        return JSONResponse(status_code=404,
+                            content={"error": f"unknown job: {job_id}"})
+
+
+@app.get("/memory/long-term")
+async def memory_long_term(end_date: str = None, months: int = 3,
+                           weeks: int = 6):
+    """The coarse memory tier: stored period summaries, projects and goals.
+
+    A fixed-size read whatever the history length, which is the point — the
+    event table grows without bound, this does not.
+    """
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    context = neo4j_store.long_term_context(
+        end_date=end_date or _today_iso(),
+        months=max(1, min(months, 24)), weeks=max(1, min(weeks, 52)))
+    context["lines"] = [rollup_line(item) for item
+                        in context.get("months", []) + context.get("weeks", [])]
+    return context
+
+
+@app.post("/memory/consolidate")
+async def memory_consolidate(date: str = None, start_date: str = None,
+                             end_date: str = None):
+    """Run the long-term pass now, or backfill a range of history into it."""
+    if neo4j_store is None:
+        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+    try:
+        if start_date and end_date:
+            return await asyncio.to_thread(
+                _consolidator().backfill, start_date, end_date)
+        return await asyncio.to_thread(
+            _consolidator().run,
+            date or (datetime.date.today() - datetime.timedelta(days=1)).isoformat())
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
 @app.get("/agent-runtime/status")
 async def agent_runtime_status():
     """Report opt-in agent routing without opening any MCP connections."""
@@ -1390,8 +1515,20 @@ async def daily_report(date: str = None, post: bool = True):
         neo4j_store.add_message(
             "agent:creative-coach", "coach", report, ts=eod)
 
+    # A chat message is not memory: it is scoped to one room and no query
+    # reaches it. Storing the same report on the day's rollup is what makes it
+    # answerable months later, next to the metrics it was written about.
+    consolidated = False
+    if metrics.get("events"):
+        try:
+            consolidated = bool(await asyncio.to_thread(
+                _consolidator().attach_narrative, ROLLUP_DAY, ds, report))
+        except Exception as exc:
+            logger.warning("Storing the daily rollup for %s failed: %s", ds, exc)
+
     return {"date": ds, "metrics": metrics, "feedback": feedback,
             "comparison": comparison, "report": report, "posted": posted,
+            "consolidated": consolidated,
             "posted_room_id": "agent:creative-coach" if posted else None}
 
 
@@ -2057,36 +2194,47 @@ async def room_chat(room_id: str, request: Request):
     return response
 
 
-@app.post("/rooms/{room_id}/agent-check-in")
-async def room_agent_check_in(room_id: str):
-    """Generate an on-demand review using an agent's default check-in."""
+async def _run_agent_check_in(room_id):
+    """Run one agent's default check-in and post the reply into its room.
+
+    Shared by the manual endpoint and the orchestrator's scheduled job, so an
+    automatic check-in is exactly the turn the user would have triggered by
+    hand. Raises on failure; each caller decides how to report it.
+    """
     if neo4j_store is None:
-        return JSONResponse(status_code=400, content={"error": "graph not enabled"})
+        raise RuntimeError("graph not enabled")
     agent = get_agent(room_id)
     if agent is None:
-        return JSONResponse(status_code=400, content={"error": "not an agent room"})
+        raise ValueError("not an agent room")
     if neo4j_store.get_room(room_id) is None:
         neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
-    try:
-        messages, citations, meta = _room_chat_turn(
-            room_id, agent.check_in)
-        room = neo4j_store.get_room(room_id)
-        result = await conversation_manager.complete(
-            room_id=room_id, room=room, messages=messages, max_tokens=750)
-        reply = result.reply
-    except AgentRuntimeUnavailable as exc:
-        logger.warning("agent check-in runtime unavailable (%s): %s", room_id, exc)
-        return JSONResponse(status_code=503, content={"error": str(exc)})
-    except Exception as exc:
-        logger.warning("agent check-in failed (%s): %s", room_id, exc)
-        return JSONResponse(
-            status_code=502, content={"error": f"check-in failed: {exc}"})
-    neo4j_store.add_message(room_id, "assistant", reply)
-    response = {"room_id": room_id, "reply": reply,
+    messages, citations, meta = _room_chat_turn(room_id, agent.check_in)
+    result = await conversation_manager.complete(
+        room_id=room_id, room=neo4j_store.get_room(room_id),
+        messages=messages, max_tokens=750)
+    neo4j_store.add_message(room_id, "assistant", result.reply)
+    response = {"room_id": room_id, "reply": result.reply,
                 "citations": citations, **meta}
     if result.execution == "agent":
         response.update({"execution": "agent", "agent": result.agent})
     return response
+
+
+@app.post("/rooms/{room_id}/agent-check-in")
+async def room_agent_check_in(room_id: str):
+    """Generate an on-demand review using an agent's default check-in."""
+    try:
+        return await _run_agent_check_in(room_id)
+    except AgentRuntimeUnavailable as exc:
+        # Checked before RuntimeError below — it is a subclass of it.
+        logger.warning("agent check-in runtime unavailable (%s): %s", room_id, exc)
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    except (RuntimeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except Exception as exc:
+        logger.warning("agent check-in failed (%s): %s", room_id, exc)
+        return JSONResponse(
+            status_code=502, content={"error": f"check-in failed: {exc}"})
 
 
 @app.post("/rooms/{room_id}/chat/stream")

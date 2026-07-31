@@ -52,6 +52,68 @@ The Core Unit acts as a **Dispatcher**, not just a chatbot. uses autogen for cre
 
 ---
 
+### Agent orchestration
+
+Every scheduled agent runs from one loop (`agents/orchestrator.py`) instead of
+its own sleeper: clip retention, the nightly report, the next-day planner
+lifecycle, memory consolidation, and a daily check-in per personal agent. Each
+job declares its schedule, its priority, and whether it addresses the user.
+
+Everything that speaks unprompted — scheduled check-ins and the proactive
+narrator alike — claims from one shared `DeliveryBudget`, so two agents cannot
+arrive in the same minute. A job denied a slot is deferred and delivers when the
+user is no longer being interrupted; a job that claims a slot and then decides
+it has nothing to say hands it back.
+
+```dotenv
+ORCHESTRATOR_TICK_SECONDS=30
+AGENT_DELIVERY_GAP_SECONDS=300     # minimum gap between unprompted messages
+AGENT_DELIVERIES_PER_HOUR=6
+AGENT_CHECKINS_ENABLED=true
+AGENT_CHECKIN_SCHEDULE=            # agent:wisdom=08:00,agent:roaster= (blank disables one)
+AGENT_CHECKIN_TIMEOUT_SECONDS=240
+```
+
+`GET /orchestrator/status` reports every job's schedule, next due time, run,
+failure and deferral counts, last error, and the current budget.
+`POST /orchestrator/jobs/{job_id}/run` triggers one immediately — the schedule
+is bypassed, the delivery budget is not.
+
+### Long-term memory
+
+The episodic graph (`Day → Session → Event`, plus `Entity`/`Claim`) never
+compressed, so a question about last quarter meant scanning every minute ever
+captured. `memory/consolidation.py` adds the coarse tier on top of it:
+
+* **`Rollup`** nodes for each day, ISO week and calendar month, holding the
+  period's metrics, highlights, entities and projects — plus the narrative the
+  Coach wrote for it, so the nightly report becomes durable memory instead of a
+  chat message no query can reach. `SUMMARIZES` links a rollup to its days and
+  `ROLLS_UP_INTO` links each tier to the next, so a coarse answer can always be
+  expanded back down to the events it came from.
+* **`Project`** nodes promoted out of the `project_id` string on sessions, each
+  with a lifespan and an active/dormant status recomputed every pass.
+* **`Goal`** nodes promoted out of focus-session goals, linked to the sessions
+  that pursued them.
+* **Decay** — quarantined entities that never earned corroboration, and claims
+  left without evidence, are pruned once they are old enough to be noise.
+  Entities the user merged or renamed into are exempt at any age.
+
+The pass runs nightly and is idempotent: rollups are recomputed from the base
+events, which stay the source of truth.
+
+```dotenv
+MEMORY_CONSOLIDATION_ENABLED=true
+MEMORY_CONSOLIDATION_AT=03:15
+MEMORY_QUARANTINE_DAYS=45
+PROJECT_DORMANT_DAYS=21
+```
+
+`GET /memory/long-term` returns the coarse tier — a fixed-size read whatever the
+history length. `POST /memory/consolidate` runs the pass now, or backfills
+history with `?start_date=&end_date=`. Agent rooms reach the same tier through
+the `graph_long_term_memory` tool.
+
 ### Optional room agent runtime
 
 The existing `FastAPI -> AsyncOpenAI -> Qwen` path remains the default. An
@@ -106,8 +168,10 @@ Agent rooms see two kinds of tool:
 * **The activity graph** (`agents/graph_tools.py`) — the one native toolset,
   because this application's own memory has no MCP server. It exposes
   `graph_search_memory`, `graph_recent_activity`, `graph_event_detail`,
-  `graph_day_summary` and `graph_room_overview`. All are read-only and trim
-  storage columns and long text before the results reach the model.
+  `graph_day_summary`, `graph_long_term_memory` and `graph_room_overview`. All
+  are read-only and trim storage columns and long text before the results reach
+  the model. `graph_long_term_memory` answers questions spanning weeks or months
+  from the stored period summaries rather than from raw events.
 
 MCP sessions open once per agent run rather than once per tool call. On Windows
 this needs a subprocess-capable event loop, which is what uvicorn installs.
@@ -146,7 +210,10 @@ run's budget.
 
 `tests/test_agent_runtime.py`, `tests/test_graph_tools.py` and
 `tests/test_mcp_config.py` cover routing, toolset composition, config loading
-and both structured-output paths. The live MCP tests spawn the filesystem and
+and both structured-output paths. `tests/test_orchestrator.py` drives the
+scheduler, the delivery budget and the shared context from a fake clock, and
+`tests/test_consolidation.py` covers the long-term tier against a fake store —
+neither needs Neo4j, an MCP server or the VLM. The live MCP tests spawn the filesystem and
 Playwright servers over stdio and verify the Research room dependencies; they
 are opt-in:
 

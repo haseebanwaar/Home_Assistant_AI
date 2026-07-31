@@ -4,6 +4,8 @@ import 'package:http/http.dart' as http;
 
 import '../voice/dictation_controller.dart';
 import '../network/http_json.dart';
+import 'quran_room_screen.dart';
+import 'research_room_screen.dart';
 import 'tomorrow_plan_screen.dart';
 
 const _ink = Color(0xFF070B14);
@@ -171,6 +173,27 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
   }
 
   void _open(Map<String, dynamic> room) {
+    if (room['room_id'] == 'agent:research' ||
+        room['room_id'] == 'agent:phd-helper') {
+      Navigator.of(context)
+          .push(
+            MaterialPageRoute(
+              builder: (_) => ResearchRoomScreen(apiBase: widget.apiBase),
+            ),
+          )
+          .then((_) => _load());
+      return;
+    }
+    if (room['room_id'] == 'agent:islamic-quran') {
+      Navigator.of(context)
+          .push(
+            MaterialPageRoute(
+              builder: (_) => QuranRoomScreen(apiBase: widget.apiBase),
+            ),
+          )
+          .then((_) => _load());
+      return;
+    }
     if (room['room_id'] == 'agent:tomorrow-planner') {
       Navigator.of(context)
           .push(

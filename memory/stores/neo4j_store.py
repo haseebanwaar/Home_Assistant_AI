@@ -35,6 +35,11 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT assistant_message_id IF NOT EXISTS FOR (m:AssistantMessage) REQUIRE m.message_id IS UNIQUE",
     "CREATE CONSTRAINT focus_session_id IF NOT EXISTS FOR (f:FocusSession) REQUIRE f.focus_id IS UNIQUE",
     "CREATE CONSTRAINT nudge_id IF NOT EXISTS FOR (n:Nudge) REQUIRE n.nudge_id IS UNIQUE",
+    # Long-term tier (memory/consolidation.py): compressed periods, plus the
+    # projects and goals that outlive any single day.
+    "CREATE CONSTRAINT rollup_id IF NOT EXISTS FOR (r:Rollup) REQUIRE r.rollup_id IS UNIQUE",
+    "CREATE CONSTRAINT project_key IF NOT EXISTS FOR (p:Project) REQUIRE p.project_key IS UNIQUE",
+    "CREATE CONSTRAINT goal_key IF NOT EXISTS FOR (g:Goal) REQUIRE g.goal_key IS UNIQUE",
 ]
 
 # Secondary indexes for span-aware and lookup queries.
@@ -44,6 +49,11 @@ INDEXES = [
     "CREATE INDEX session_project IF NOT EXISTS FOR (s:Session) ON (s.project_id)",
     "CREATE INDEX entity_name IF NOT EXISTS FOR (n:Entity) ON (n.name)",
     "CREATE INDEX nudge_ts IF NOT EXISTS FOR (n:Nudge) ON (n.ts)",
+    # Rollups are read by period and by recency, which is what the coarse
+    # retrieval tier scans instead of the event table.
+    "CREATE INDEX rollup_kind IF NOT EXISTS FOR (r:Rollup) ON (r.kind)",
+    "CREATE INDEX rollup_end IF NOT EXISTS FOR (r:Rollup) ON (r.end_date)",
+    "CREATE INDEX project_status IF NOT EXISTS FOR (p:Project) ON (p.status)",
 ]
 
 
@@ -1315,6 +1325,112 @@ class Neo4jStore:
             "ORDER BY status")
         return {r["status"]: r["n"] for r in rows}
 
+    # -- Long-term tier: rollups, projects, goals, decay --------------------
+    def save_rollup(self, payload, dates=()):
+        """Upsert one :Rollup and connect it to the days it summarizes.
+
+        Also links the tier below it (days into a week, weeks into a month), so
+        a coarse answer can always be expanded into the finer summaries it was
+        built from, and from there into the events themselves.
+        """
+        from memory.consolidation import DAY, MONTH, WEEK
+
+        rollup_id = payload["rollup_id"]
+        self.run(_SAVE_ROLLUP_CYPHER, rollup_id=rollup_id, props=dict(payload),
+                 dates=[d for d in (dates or ()) if d])
+        child_kind = {WEEK: DAY, MONTH: WEEK}.get(payload.get("kind"))
+        if child_kind:
+            self.run(_LINK_ROLLUP_TIERS_CYPHER, rollup_id=rollup_id,
+                     child_kind=child_kind)
+        return payload
+
+    def get_rollup(self, kind, key):
+        from memory.consolidation import rollup_id as _rid
+        rows = self.run(_GET_ROLLUP_CYPHER, rollup_id=_rid(kind, key))
+        return dict(rows[0]["props"]) if rows else None
+
+    def list_rollups(self, kind=None, start=None, end=None, limit=30):
+        return [dict(row["props"]) for row in self.run(
+            _LIST_ROLLUPS_CYPHER, kind=kind, start=start, end=end,
+            limit=max(1, min(int(limit), 200)))]
+
+    def set_rollup_narrative(self, rollup_id, narrative):
+        rows = self.run(_SET_ROLLUP_NARRATIVE_CYPHER, rollup_id=rollup_id,
+                        narrative=narrative)
+        return bool(rows)
+
+    def sync_projects(self, dormant_before=0.0):
+        """Promote `Session.project_id` strings into :Project nodes with a lifespan.
+
+        A project is dormant, never deleted: months later it is still the answer
+        to "what was I working on then", it just isn't current work.
+        """
+        self.run(_SYNC_PROJECTS_CYPHER, dormant_before=float(dormant_before))
+        self.run(_LINK_PROJECT_SESSIONS_CYPHER)
+        rows = self.run(
+            "MATCH (p:Project) RETURN coalesce(p.status, 'active') AS status, "
+            "count(p) AS n")
+        return {row["status"]: row["n"] for row in rows}
+
+    def list_projects(self, status=None, limit=50):
+        return [dict(row) for row in self.run(
+            _LIST_PROJECTS_CYPHER, status=status,
+            limit=max(1, min(int(limit), 200)))]
+
+    def sync_goals(self):
+        """Promote focus-session goals into :Goal nodes with their pursuit history."""
+        rows = self.run(_SYNC_GOALS_CYPHER)
+        self.run(_LINK_GOAL_SESSIONS_CYPHER)
+        return {"goals": rows[0]["goals"] if rows else 0}
+
+    def list_goals(self, limit=50):
+        return [dict(row) for row in self.run(
+            _LIST_GOALS_CYPHER, limit=max(1, min(int(limit), 200)))]
+
+    def prune_stale_entities(self, before, min_events=2):
+        """Delete quarantined entities that were never corroborated and are old.
+
+        An entity the user merged or renamed into is protected regardless of
+        age: that is a correction they made by hand, not a stale guess.
+        """
+        ids = [row["entity_id"] for row in self.run(
+            _STALE_ENTITY_IDS_CYPHER, before=float(before),
+            min_events=int(min_events))]
+        if ids:
+            self.run(_DELETE_ENTITIES_CYPHER, ids=ids)
+        return len(ids)
+
+    def prune_orphan_claims(self):
+        ids = [row["claim_id"] for row in self.run(_ORPHAN_CLAIM_IDS_CYPHER)]
+        if ids:
+            self.run(_DELETE_CLAIMS_CYPHER, ids=ids)
+        return len(ids)
+
+    def long_term_context(self, end_date=None, months=3, weeks=6, limit=12):
+        """The coarse retrieval tier: compressed periods instead of raw events.
+
+        Answering "how has this project gone since spring" from the event table
+        means scanning every minute of it. This returns the stored summaries and
+        the project lifespans instead, which is a fixed, small read whatever the
+        history length.
+        """
+        from memory.consolidation import MONTH, WEEK
+        end_date = end_date or datetime.date.today().isoformat()
+        return {
+            "end_date": end_date,
+            "months": self.list_rollups(kind=MONTH, end=end_date,
+                                        limit=max(1, int(months))),
+            "weeks": self.list_rollups(kind=WEEK, end=end_date,
+                                       limit=max(1, int(weeks))),
+            "projects": self.list_projects(limit=limit),
+            "goals": self.list_goals(limit=limit),
+        }
+
+    def rollup_counts(self):
+        rows = self.run(
+            "MATCH (r:Rollup) RETURN r.kind AS kind, count(r) AS n ORDER BY kind")
+        return {row["kind"]: row["n"] for row in rows}
+
     def wipe(self):
         """Delete ALL graph data (Day/Session/Event/Entity/Claim + rels)."""
         self.run("MATCH (n) DETACH DELETE n")
@@ -2242,6 +2358,153 @@ SET n.evidence_events = events,
 WITH collect(n.memory_status) AS statuses
 RETURN size([s IN statuses WHERE s = 'active']) AS active,
        size([s IN statuses WHERE s = 'quarantined']) AS quarantined
+"""
+
+# -- Long-term tier ---------------------------------------------------------
+#
+# `r += $props` rather than a listed SET: the rollup property bag is built in
+# memory/consolidation.py, so a new metric there must not require a schema edit
+# here. The Day flag records that a compressed copy exists; the events stay put.
+_SAVE_ROLLUP_CYPHER = """
+MERGE (r:Rollup {rollup_id: $rollup_id})
+SET r += $props, r.updated_at = timestamp()
+WITH r
+UNWIND $dates AS day_date
+MATCH (d:Day {date: day_date})
+MERGE (r)-[:SUMMARIZES]->(d)
+SET d.consolidated = true
+"""
+
+# Tier links are derived from the period bounds, so they self-heal: a day
+# consolidated after its week was built is picked up the next time the week is.
+_LINK_ROLLUP_TIERS_CYPHER = """
+MATCH (parent:Rollup {rollup_id: $rollup_id})
+MATCH (child:Rollup {kind: $child_kind})
+WHERE child.start_date >= parent.start_date
+  AND child.end_date <= parent.end_date
+MERGE (child)-[:ROLLS_UP_INTO]->(parent)
+RETURN count(child) AS linked
+"""
+
+_GET_ROLLUP_CYPHER = """
+MATCH (r:Rollup {rollup_id: $rollup_id})
+RETURN properties(r) AS props
+"""
+
+_LIST_ROLLUPS_CYPHER = """
+MATCH (r:Rollup)
+WHERE ($kind IS NULL OR r.kind = $kind)
+  AND ($start IS NULL OR r.end_date >= $start)
+  AND ($end IS NULL OR r.start_date <= $end)
+RETURN properties(r) AS props
+ORDER BY r.end_date DESC, r.kind
+LIMIT $limit
+"""
+
+_SET_ROLLUP_NARRATIVE_CYPHER = """
+MATCH (r:Rollup {rollup_id: $rollup_id})
+SET r.narrative = $narrative, r.updated_at = timestamp()
+RETURN r.rollup_id AS rollup_id
+"""
+
+# Sessions carry project_id as a bare string; this promotes it to a node with a
+# lifespan. Dormancy is recomputed every pass, so a revived project goes back to
+# 'active' without any manual step.
+_SYNC_PROJECTS_CYPHER = """
+MATCH (s:Session)
+WHERE coalesce(s.project_id, '') <> ''
+WITH s.project_id AS project_key, count(s) AS sessions,
+     min(s.start) AS first_seen, max(s.end) AS last_seen,
+     sum(coalesce(s.active_seconds, 0.0)) AS active_seconds
+MERGE (p:Project {project_key: project_key})
+  ON CREATE SET p.name = project_key, p.created_at = timestamp()
+SET p.sessions = sessions, p.first_seen = first_seen, p.last_seen = last_seen,
+    p.active_seconds = active_seconds,
+    p.status = CASE WHEN last_seen >= $dormant_before THEN 'active' ELSE 'dormant' END,
+    p.updated_at = timestamp()
+RETURN count(p) AS projects
+"""
+
+_LINK_PROJECT_SESSIONS_CYPHER = """
+MATCH (s:Session) WHERE coalesce(s.project_id, '') <> ''
+MATCH (p:Project {project_key: s.project_id})
+MERGE (s)-[:PART_OF]->(p)
+"""
+
+_LIST_PROJECTS_CYPHER = """
+MATCH (p:Project)
+WHERE $status IS NULL OR p.status = $status
+RETURN p.project_key AS project_key, p.name AS name,
+       coalesce(p.status, 'active') AS status, p.sessions AS sessions,
+       p.first_seen AS first_seen, p.last_seen AS last_seen,
+       round(coalesce(p.active_seconds, 0.0) / 60.0, 1) AS active_minutes
+ORDER BY p.last_seen DESC
+LIMIT $limit
+"""
+
+# A goal is what the user said they were doing, which no amount of screen
+# watching produces on its own — focus sessions are the only place it is stated.
+_SYNC_GOALS_CYPHER = """
+MATCH (f:FocusSession)
+WHERE coalesce(f.goal, '') <> ''
+WITH toLower(trim(f.goal)) AS goal_key, head(collect(f.goal)) AS name,
+     count(f) AS sessions, min(f.started_at) AS first_seen,
+     max(coalesce(f.ended_at, f.started_at)) AS last_seen,
+     sum(coalesce(f.active_seconds, 0.0)) AS active_seconds
+MERGE (g:Goal {goal_key: goal_key})
+  ON CREATE SET g.created_at = timestamp()
+SET g.name = name, g.sessions = sessions, g.first_seen = first_seen,
+    g.last_seen = last_seen, g.active_seconds = active_seconds,
+    g.updated_at = timestamp()
+RETURN count(g) AS goals
+"""
+
+_LINK_GOAL_SESSIONS_CYPHER = """
+MATCH (f:FocusSession) WHERE coalesce(f.goal, '') <> ''
+MATCH (g:Goal {goal_key: toLower(trim(f.goal))})
+MERGE (g)-[:PURSUED_IN]->(f)
+"""
+
+_LIST_GOALS_CYPHER = """
+MATCH (g:Goal)
+RETURN g.goal_key AS goal_key, g.name AS name, g.sessions AS sessions,
+       g.first_seen AS first_seen, g.last_seen AS last_seen,
+       round(coalesce(g.active_seconds, 0.0) / 60.0, 1) AS active_minutes
+ORDER BY g.last_seen DESC
+LIMIT $limit
+"""
+
+# Decay. Selection and deletion are two statements rather than one clever
+# clause: the set is small, and a delete driven by an explicit id list is far
+# easier to reason about — and to audit — than one fused into an aggregation.
+#
+# An entity the user merged or renamed into is exempt however old it is: that
+# alias is a correction they made by hand, and deleting its target would quietly
+# undo their edit.
+_STALE_ENTITY_IDS_CYPHER = """
+MATCH (n:Entity)
+WHERE coalesce(n.memory_status, 'quarantined') = 'quarantined'
+  AND NOT EXISTS { MATCH (:EntityAlias {canonical_id: n.entity_id}) }
+OPTIONAL MATCH (n)<-[:MENTIONS]-(e:Event)
+WITH n, count(e) AS mentions, coalesce(max(e.span_end), 0.0) AS last_seen
+WHERE mentions < $min_events AND last_seen < $before
+RETURN n.entity_id AS entity_id
+"""
+
+_DELETE_ENTITIES_CYPHER = """
+MATCH (n:Entity) WHERE n.entity_id IN $ids
+DETACH DELETE n
+"""
+
+_ORPHAN_CLAIM_IDS_CYPHER = """
+MATCH (c:Claim)
+WHERE NOT (c)<-[:SUPPORTS]-(:Event)
+RETURN c.claim_id AS claim_id
+"""
+
+_DELETE_CLAIMS_CYPHER = """
+MATCH (c:Claim) WHERE c.claim_id IN $ids
+DETACH DELETE c
 """
 
 _REBUILD_INVOLVES_CYPHER = """
