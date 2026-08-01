@@ -642,7 +642,21 @@ async def _job_consolidate(ctx):
 
 def _agent_check_in_job(agent):
     async def run(ctx):
-        result = await _run_agent_check_in(agent.room_id)
+        # The 06:00 check-in is a report of the calendar day that just ended.
+        # Keeping this scope in the user turn makes the intent explicit to the
+        # agent and prevents a morning report from silently reviewing a partial
+        # current day.
+        report_date = (datetime.date.fromtimestamp(ctx.now)
+                       - datetime.timedelta(days=1)).isoformat()
+        result = await _run_agent_check_in(
+            agent.room_id,
+            prompt=(
+                f"Generate the daily report for the previous day, {report_date}. "
+                "Use only evidence through that date; do not treat today's "
+                "partial activity as part of the report.\n\n"
+                f"{agent.check_in}"
+            ),
+        )
         return JobResult(detail=f"{len(result['reply'])} chars", delivered=True)
     return run
 
@@ -2194,7 +2208,7 @@ async def room_chat(room_id: str, request: Request):
     return response
 
 
-async def _run_agent_check_in(room_id):
+async def _run_agent_check_in(room_id, prompt=None):
     """Run one agent's default check-in and post the reply into its room.
 
     Shared by the manual endpoint and the orchestrator's scheduled job, so an
@@ -2208,7 +2222,8 @@ async def _run_agent_check_in(room_id):
         raise ValueError("not an agent room")
     if neo4j_store.get_room(room_id) is None:
         neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
-    messages, citations, meta = _room_chat_turn(room_id, agent.check_in)
+    messages, citations, meta = _room_chat_turn(
+        room_id, prompt if prompt is not None else agent.check_in)
     result = await conversation_manager.complete(
         room_id=room_id, room=neo4j_store.get_room(room_id),
         messages=messages, max_tokens=750)

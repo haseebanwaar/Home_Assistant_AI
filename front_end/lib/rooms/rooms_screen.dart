@@ -7,6 +7,7 @@ import '../network/http_json.dart';
 import 'quran_room_screen.dart';
 import 'research_room_screen.dart';
 import 'tomorrow_plan_screen.dart';
+import 'personal_agent_room_screens.dart';
 
 const _ink = Color(0xFF070B14);
 const _panel = Color(0xFF111827);
@@ -173,6 +174,39 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
   }
 
   void _open(Map<String, dynamic> room) {
+    // The four personal rooms have dedicated canvases: structured prompts,
+    // daily rhythm/food tracking, and a room-specific history. Keep the
+    // generic room screen for every other agent or user-created room.
+    switch (room['room_id']) {
+      case 'agent:motivational':
+        Navigator.of(context)
+            .push(MaterialPageRoute(
+              builder: (_) => MotivationalRoomScreen(apiBase: widget.apiBase),
+            ))
+            .then((_) => _load());
+        return;
+      case 'agent:roaster':
+        Navigator.of(context)
+            .push(MaterialPageRoute(
+              builder: (_) => RoasterRoomScreen(apiBase: widget.apiBase),
+            ))
+            .then((_) => _load());
+        return;
+      case 'agent:creative-coach':
+        Navigator.of(context)
+            .push(MaterialPageRoute(
+              builder: (_) => CreativeCoachRoomScreen(apiBase: widget.apiBase),
+            ))
+            .then((_) => _load());
+        return;
+      case 'agent:wisdom':
+        Navigator.of(context)
+            .push(MaterialPageRoute(
+              builder: (_) => WisdomRoomScreen(apiBase: widget.apiBase),
+            ))
+            .then((_) => _load());
+        return;
+    }
     if (room['room_id'] == 'agent:research' ||
         room['room_id'] == 'agent:phd-helper') {
       Navigator.of(context)
