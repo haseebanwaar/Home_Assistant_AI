@@ -48,8 +48,7 @@ dist/
 build/
 /examples/
 /smart_devices/
-/.temp_media/
-/utils/
+/.temp/
 /qdrant_db/
 /agent_workspaces/
 
