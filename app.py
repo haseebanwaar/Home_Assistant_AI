@@ -447,7 +447,7 @@ async def startup_event():
         try:
             neo4j_store.ensure_source_room("screen")
         except Exception as exc:
-            logger.warning("ensure_source_room(screen) failed: %s", exc)
+            logger.warning("ensure_source_room(screen) failed : %s", exc)
         try:
             neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
             # Research supersedes the older PhD Helper room. Preserve its notes,
