@@ -454,7 +454,7 @@ async def startup_event():
             # messages, and linked activity, then keep it out of the active list.
             neo4j_store.merge_rooms("agent:phd-helper", "agent:research")
         except Exception as exc:
-            logger.warning("ensure_agent_rooms failed: %s", exc)
+            logger.warning("ensure_agent_rooms failed:%s", exc)
 
     # Give the assistant graph-backed memory tools when the graph is available.
     if neo4j_store is not None:
