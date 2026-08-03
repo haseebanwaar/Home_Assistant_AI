@@ -2,7 +2,6 @@ import os
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
- # vllm serve "/mnt/d/models/vlm/qwen3vl_8b" --max-model-len 20000 --kv-cache-memory-bytes 6G --trust-remote-code --max_num_seqs 1 --enable-auto-tool-choice --tool-call-parser hermes --no-enable-prefix-caching --limit-mm-per-prompt.video=1 --enforce-eager --video_pruning_rate 0.1 --dtype half  --limit-mm-per-prompt 1  --mm-processor-cache-gb 1 --async-scheduling
 # transformer 4.57,   torch 2.9.0 ,  triton 3.5.0,
 # source /home/haseeb/venv2/bin/activate
 
@@ -21,9 +20,19 @@ def new_vlm_client() -> AsyncOpenAI:
     """
     return AsyncOpenAI(
         api_key=os.getenv("VLM_API_KEY"),
-        # Alternates: lmdeploy :23333, llama.cpp :8080, vllm :8000 — set VLM_BASE_URL in .env
-        base_url=os.getenv("VLM_BASE_URL"),
+        # Qwen3.6 is served by llama.cpp; configure its OpenAI endpoint in .env.
+        base_url=os.getenv("VLM_BASE_URL", "http://127.0.0.1:8888/v1"),
     )
+
+
+def thinking_request_kwargs(enabled=False, budget=None):
+    """llama.cpp/Qwen chat-template controls for one request."""
+    kwargs = {"extra_body": {
+        "chat_template_kwargs": {"enable_thinking": bool(enabled)},
+    }}
+    if enabled and budget is not None and int(budget) >= 0:
+        kwargs["extra_body"]["thinking_budget_tokens"] = int(budget)
+    return kwargs
 
 
 # Shared client for the main app loop and the (single) screen worker thread.

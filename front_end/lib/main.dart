@@ -145,6 +145,7 @@ class _MyAppState extends State<MyApp> {
   static const _clipboardAnswerPromptPreferenceKey = 'clipboard_answer_prompt';
   static const _promptShortcutPreferencePrefix = 'reflection_prompt_shortcut_';
   static const _promptTextPreferencePrefix = 'reflection_prompt_text_';
+  static const _shortcutThinkingPreferencePrefix = 'shortcut_thinking_';
   static const _disabledShortcutValue = 'disabled';
   static const _defaultHomeHub = String.fromEnvironment(
     'HOME_HUB_URL',
@@ -175,6 +176,7 @@ class _MyAppState extends State<MyApp> {
   bool _isTalking = false;
   bool _isLive = false; // Add this line
   bool _useMemory = false; // Add this line
+  bool _conversationThinking = false;
   bool _backendConnected = false;
   String _backendActivity = 'Connecting...';
   Map<String, dynamic> _backendStatus = const {};
@@ -226,6 +228,12 @@ class _MyAppState extends State<MyApp> {
   // Only presets the user actually reworded appear here; everything else falls
   // back to the shipped prompt, so edits survive changes to the defaults.
   Map<String, String> _promptTexts = {};
+  Map<String, bool> _shortcutThinking = {
+    'reflect_now': true,
+    'reflect_from_source': true,
+    clipboardAnswerActionId: false,
+    for (final preset in reflectionPromptPresets) preset.id: true,
+  };
   final GlobalHotkeyService _globalHotkeys = createGlobalHotkeyService();
   String? _globalHotkeyError;
 
@@ -416,6 +424,7 @@ class _MyAppState extends State<MyApp> {
             expectedFrames: (source['expected_frames'] as num?)?.toInt() ?? 0,
             bufferedFrames: (source['buffered_frames'] as num?)?.toInt() ?? 0,
             available: source['available'] == true,
+            thinking: source['thinking'] == true,
           ),
         )
         .where((source) => source.id.isNotEmpty)
@@ -458,6 +467,7 @@ class _MyAppState extends State<MyApp> {
     String sourceId,
     double sampleFps,
     int inferenceIntervalSeconds,
+    bool thinking,
   ) async {
     final apiBase = _apiBase;
     if (apiBase.isEmpty || _captureSettingsSavingSource != null) return;
@@ -474,6 +484,7 @@ class _MyAppState extends State<MyApp> {
               'source_id': sourceId,
               'sample_fps': sampleFps,
               'inference_interval_seconds': inferenceIntervalSeconds,
+              'thinking': thinking,
             }),
           )
           .timeout(const Duration(seconds: 8));
@@ -541,9 +552,10 @@ class _MyAppState extends State<MyApp> {
         preset.defaultBinding,
       );
       if (binding != null && usedBindings.contains(binding)) {
-        binding = usedBindings.contains(preset.defaultBinding)
-            ? null
-            : preset.defaultBinding;
+        binding =
+            usedBindings.contains(preset.defaultBinding)
+                ? null
+                : preset.defaultBinding;
       }
       promptShortcuts[preset.id] = binding;
       if (binding != null) usedBindings.add(binding);
@@ -560,11 +572,18 @@ class _MyAppState extends State<MyApp> {
       clipboardShortcut = null;
     }
     if (!mounted) return;
+    final shortcutThinking = <String, bool>{
+      for (final entry in _shortcutThinking.entries)
+        entry.key:
+            prefs.getBool('$_shortcutThinkingPreferencePrefix${entry.key}') ??
+            entry.value,
+    };
     setState(() {
       _reflectShortcut = shortcut;
       _sourceReflectShortcut = sourceShortcut;
       _clipboardAnswerShortcut = clipboardShortcut;
       _promptShortcuts = promptShortcuts;
+      _shortcutThinking = shortcutThinking;
     });
     await _syncGlobalHotkeys();
   }
@@ -574,6 +593,22 @@ class _MyAppState extends State<MyApp> {
 
   String _promptTextPreferenceKey(String presetId) =>
       '$_promptTextPreferencePrefix$presetId';
+
+  bool _thinkingForShortcut(String actionId) =>
+      _shortcutThinking[actionId] ?? false;
+
+  void _updateShortcutThinking(String actionId, bool enabled) {
+    setState(() {
+      _shortcutThinking = Map<String, bool>.from(_shortcutThinking)
+        ..[actionId] = enabled;
+    });
+    unawaited(_persistShortcutThinking(actionId, enabled));
+  }
+
+  Future<void> _persistShortcutThinking(String actionId, bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('$_shortcutThinkingPreferencePrefix$actionId', enabled);
+  }
 
   Future<void> _loadPromptTexts() async {
     final prefs = await SharedPreferences.getInstance();
@@ -667,9 +702,10 @@ class _MyAppState extends State<MyApp> {
   void _updateClipboardAnswerPrompt(String? prompt) {
     final trimmed = prompt?.trim();
     setState(() {
-      _clipboardAnswerPrompt = trimmed == null || trimmed.isEmpty
-          ? defaultClipboardAnswerPrompt
-          : trimmed;
+      _clipboardAnswerPrompt =
+          trimmed == null || trimmed.isEmpty
+              ? defaultClipboardAnswerPrompt
+              : trimmed;
     });
     unawaited(_persistClipboardAnswerPrompt(trimmed));
   }
@@ -732,8 +768,8 @@ class _MyAppState extends State<MyApp> {
           GlobalHotkeyRegistration(
             name: preset.title,
             binding: shortcut,
-            onPressed: () =>
-                unawaited(_runGlobalReflection(promptPreset: preset)),
+            onPressed:
+                () => unawaited(_runGlobalReflection(promptPreset: preset)),
           ),
     ];
     final error = await _globalHotkeys.sync(registrations);
@@ -759,7 +795,8 @@ class _MyAppState extends State<MyApp> {
   Future<void> _syncNotificationMonitoring() async {
     if (!_deliveryPreferencesLoaded) return;
     final events = !_notificationsMuted && _eventNotificationsEnabled;
-    final proactive = !_notificationsMuted &&
+    final proactive =
+        !_notificationsMuted &&
         _proactiveEnabled &&
         _proactiveNotificationsEnabled;
     if (_apiBase.isEmpty || (!events && !proactive)) {
@@ -926,12 +963,14 @@ class _MyAppState extends State<MyApp> {
     String? text,
     String? contextOverride,
     bool includeImage = true,
+    bool? thinkingOverride,
   }) async {
     try {
       if (mounted) {
         setState(
-          () => _backendActivity =
-              text != null ? 'Sending message' : 'Uploading audio',
+          () =>
+              _backendActivity =
+                  text != null ? 'Sending message' : 'Uploading audio',
         );
       }
       // Clear the audio queue for the new response
@@ -945,18 +984,21 @@ class _MyAppState extends State<MyApp> {
       final Map<String, dynamic> requestBody = {
         'data': audio,
         'text': text,
-        'image': includeImage && _fileImage != null
-            ? base64.encode(_fileImage!)
-            : null,
+        'image':
+            includeImage && _fileImage != null
+                ? base64.encode(_fileImage!)
+                : null,
         'talking': _isTalking,
         'context': contextOverride ?? _currentContext,
         'live': _isLive, // Add this line
         'memory': _useMemory, // Add this line
+        'thinking': thinkingOverride ?? _conversationThinking,
       };
 
-      final request = http.Request('POST', url)
-        ..headers['Content-Type'] = 'application/json'
-        ..body = json.encode(requestBody);
+      final request =
+          http.Request('POST', url)
+            ..headers['Content-Type'] = 'application/json'
+            ..body = json.encode(requestBody);
 
       final streamedResponse = await request.send();
 
@@ -966,8 +1008,9 @@ class _MyAppState extends State<MyApp> {
         print('Response body: $body');
         if (mounted)
           setState(
-            () => _backendActivity =
-                'Backend error (${streamedResponse.statusCode})',
+            () =>
+                _backendActivity =
+                    'Backend error (${streamedResponse.statusCode})',
           );
         return;
       }
@@ -1110,6 +1153,7 @@ class _MyAppState extends State<MyApp> {
         ),
         contextOverride: 'talker',
         includeImage: false,
+        thinkingOverride: _thinkingForShortcut(clipboardAnswerActionId),
       );
     } finally {
       if (mounted) setState(() => _isProcessing = false);
@@ -1307,20 +1351,25 @@ class _MyAppState extends State<MyApp> {
       } catch (error) {
         if (mounted) {
           setState(
-            () => _globalHotkeyError =
-                'The shortcut fired, but HomeMind could not come forward: $error',
+            () =>
+                _globalHotkeyError =
+                    'The shortcut fired, but HomeMind could not come forward: $error',
           );
         }
       }
     }
     if (!mounted) return;
     if (chooseSource) {
-      await _showReflectionSourcePicker();
+      await _showReflectionSourcePicker(
+        thinking: _thinkingForShortcut('reflect_from_source'),
+      );
     } else {
+      final actionId = promptPreset?.id ?? 'reflect_now';
       await _reflectOnScreen(
         question: promptPreset == null ? null : _promptTextFor(promptPreset),
         actionLabel: promptPreset?.title,
         background: true,
+        thinking: _thinkingForShortcut(actionId),
       );
     }
   }
@@ -1343,7 +1392,7 @@ class _MyAppState extends State<MyApp> {
         .toList();
   }
 
-  Future<void> _showReflectionSourcePicker() async {
+  Future<void> _showReflectionSourcePicker({bool? thinking}) async {
     if (_reflecting) {
       _showSnack('A reflection is already running');
       return;
@@ -1376,114 +1425,119 @@ class _MyAppState extends State<MyApp> {
         shape: const RoundedRectangleBorder(
           borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
         ),
-        builder: (sheetContext) => SafeArea(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(18, 10, 18, 24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Center(
-                  child: Container(
-                    width: 38,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: _line,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 18),
-                const Text(
-                  'Reflect from source',
-                  style: TextStyle(
-                    fontSize: 19,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-                const SizedBox(height: 5),
-                const Text(
-                  'Choose the exact live frames HomeMind should attach.',
-                  style: TextStyle(color: _muted, fontSize: 11.5),
-                ),
-                const SizedBox(height: 14),
-                if (sources.isEmpty)
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 22),
-                    child: Center(
-                      child: Text(
-                        'No reflection sources are configured.',
-                        style: TextStyle(color: _muted),
-                      ),
-                    ),
-                  )
-                else
-                  ...sources.map((source) {
-                    final isMobile = source.id.startsWith('mobile_');
-                    final icon = source.id == 'pc_screen'
-                        ? Icons.desktop_windows_outlined
-                        : isMobile
-                            ? (source.context == 'screen'
-                                ? Icons.phone_android_outlined
-                                : Icons.phone_iphone_outlined)
-                            : Icons.videocam_outlined;
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Material(
-                        color: _panelRaised,
-                        borderRadius: BorderRadius.circular(14),
-                        child: ListTile(
-                          enabled: source.available,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          leading: Icon(
-                            icon,
-                            color: source.available ? _mint : _muted,
-                          ),
-                          title: Text(
-                            source.label,
-                            style: const TextStyle(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                          subtitle: Text(
-                            source.detail,
-                            style: const TextStyle(
-                              color: _muted,
-                              fontSize: 10,
-                            ),
-                          ),
-                          trailing: source.available
-                              ? const Icon(
-                                  Icons.chevron_right_rounded,
-                                  color: _muted,
-                                )
-                              : const Text(
-                                  'Unavailable',
-                                  style: TextStyle(
-                                    color: _muted,
-                                    fontSize: 9.5,
-                                  ),
-                                ),
-                          onTap: source.available
-                              ? () => Navigator.pop(sheetContext, source)
-                              : null,
+        builder:
+            (sheetContext) => SafeArea(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(18, 10, 18, 24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 38,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: _line,
+                          borderRadius: BorderRadius.circular(8),
                         ),
                       ),
-                    );
-                  }),
-              ],
+                    ),
+                    const SizedBox(height: 18),
+                    const Text(
+                      'Reflect from source',
+                      style: TextStyle(
+                        fontSize: 19,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 5),
+                    const Text(
+                      'Choose the exact live frames HomeMind should attach.',
+                      style: TextStyle(color: _muted, fontSize: 11.5),
+                    ),
+                    const SizedBox(height: 14),
+                    if (sources.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 22),
+                        child: Center(
+                          child: Text(
+                            'No reflection sources are configured.',
+                            style: TextStyle(color: _muted),
+                          ),
+                        ),
+                      )
+                    else
+                      ...sources.map((source) {
+                        final isMobile = source.id.startsWith('mobile_');
+                        final icon =
+                            source.id == 'pc_screen'
+                                ? Icons.desktop_windows_outlined
+                                : isMobile
+                                ? (source.context == 'screen'
+                                    ? Icons.phone_android_outlined
+                                    : Icons.phone_iphone_outlined)
+                                : Icons.videocam_outlined;
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Material(
+                            color: _panelRaised,
+                            borderRadius: BorderRadius.circular(14),
+                            child: ListTile(
+                              enabled: source.available,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                              leading: Icon(
+                                icon,
+                                color: source.available ? _mint : _muted,
+                              ),
+                              title: Text(
+                                source.label,
+                                style: const TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              subtitle: Text(
+                                source.detail,
+                                style: const TextStyle(
+                                  color: _muted,
+                                  fontSize: 10,
+                                ),
+                              ),
+                              trailing:
+                                  source.available
+                                      ? const Icon(
+                                        Icons.chevron_right_rounded,
+                                        color: _muted,
+                                      )
+                                      : const Text(
+                                        'Unavailable',
+                                        style: TextStyle(
+                                          color: _muted,
+                                          fontSize: 9.5,
+                                        ),
+                                      ),
+                              onTap:
+                                  source.available
+                                      ? () =>
+                                          Navigator.pop(sheetContext, source)
+                                      : null,
+                            ),
+                          ),
+                        );
+                      }),
+                  ],
+                ),
+              ),
             ),
-          ),
-        ),
       );
     } finally {
       _choosingReflectionSource = false;
     }
     if (selected != null && mounted) {
-      await _reflectOnScreen(requestedSource: selected);
+      await _reflectOnScreen(requestedSource: selected, thinking: thinking);
     }
   }
 
@@ -1492,6 +1546,7 @@ class _MyAppState extends State<MyApp> {
       _reflectOnScreen(
         question: _promptTextFor(preset),
         actionLabel: preset.title,
+        thinking: _thinkingForShortcut(preset.id),
       ),
     );
   }
@@ -1524,99 +1579,102 @@ class _MyAppState extends State<MyApp> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
       ),
-      builder: (sheetContext) => SafeArea(
-        child: SizedBox(
-          height: MediaQuery.sizeOf(sheetContext).height * .76,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(18, 10, 18, 0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Center(
-                      child: Container(
-                        width: 38,
-                        height: 4,
-                        decoration: BoxDecoration(
-                          color: _line,
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 18),
-                    const Text(
-                      'Guided reflection',
-                      style: TextStyle(
-                        fontSize: 19,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 5),
-                    const Text(
-                      'Run a general prompt on the current Screen or Camera context.',
-                      style: TextStyle(color: _muted, fontSize: 11.5),
-                    ),
-                    const SizedBox(height: 14),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: ListView(
-                  key: const Key('prompt-action-list'),
-                  padding: const EdgeInsets.fromLTRB(18, 0, 18, 24),
-                  children: [
-                    for (final preset in reflectionPromptPresets)
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 8),
-                        child: Material(
-                          color: _panelRaised,
-                          borderRadius: BorderRadius.circular(14),
-                          child: ListTile(
-                            key: ValueKey('prompt-action-${preset.id}'),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14),
+      builder:
+          (sheetContext) => SafeArea(
+            child: SizedBox(
+              height: MediaQuery.sizeOf(sheetContext).height * .76,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(18, 10, 18, 0),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Center(
+                          child: Container(
+                            width: 38,
+                            height: 4,
+                            decoration: BoxDecoration(
+                              color: _line,
+                              borderRadius: BorderRadius.circular(8),
                             ),
-                            leading: Icon(
-                              _promptPresetIcon(preset.kind),
-                              color: _promptPresetColor(preset.kind),
-                            ),
-                            title: Text(
-                              preset.title,
-                              style: const TextStyle(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            subtitle: Text(
-                              '${_promptShortcuts[preset.id]?.label ?? 'Shortcut disabled'}'
-                              ' • ${preset.description}',
-                              style: const TextStyle(
-                                color: _muted,
-                                fontSize: 10,
-                              ),
-                            ),
-                            trailing: const Icon(
-                              Icons.chevron_right_rounded,
-                              color: _muted,
-                            ),
-                            onTap: () => Navigator.pop(sheetContext, preset),
                           ),
                         ),
-                      ),
-                  ],
-                ),
+                        const SizedBox(height: 18),
+                        const Text(
+                          'Guided reflection',
+                          style: TextStyle(
+                            fontSize: 19,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 5),
+                        const Text(
+                          'Run a general prompt on the current Screen or Camera context.',
+                          style: TextStyle(color: _muted, fontSize: 11.5),
+                        ),
+                        const SizedBox(height: 14),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child: ListView(
+                      key: const Key('prompt-action-list'),
+                      padding: const EdgeInsets.fromLTRB(18, 0, 18, 24),
+                      children: [
+                        for (final preset in reflectionPromptPresets)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Material(
+                              color: _panelRaised,
+                              borderRadius: BorderRadius.circular(14),
+                              child: ListTile(
+                                key: ValueKey('prompt-action-${preset.id}'),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                                leading: Icon(
+                                  _promptPresetIcon(preset.kind),
+                                  color: _promptPresetColor(preset.kind),
+                                ),
+                                title: Text(
+                                  preset.title,
+                                  style: const TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                subtitle: Text(
+                                  '${_promptShortcuts[preset.id]?.label ?? 'Shortcut disabled'}'
+                                  ' • ${preset.description}',
+                                  style: const TextStyle(
+                                    color: _muted,
+                                    fontSize: 10,
+                                  ),
+                                ),
+                                trailing: const Icon(
+                                  Icons.chevron_right_rounded,
+                                  color: _muted,
+                                ),
+                                onTap:
+                                    () => Navigator.pop(sheetContext, preset),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
-        ),
-      ),
     );
     if (selected != null && mounted) {
       await _reflectOnScreen(
         question: selected.prompt,
         actionLabel: selected.title,
+        thinking: _thinkingForShortcut(selected.id),
       );
     }
   }
@@ -1634,6 +1692,7 @@ class _MyAppState extends State<MyApp> {
     // Set when a global shortcut started this and the window stayed back, so
     // failures are reported by the OS instead of to an unwatched SnackBar.
     bool background = false,
+    bool? thinking,
   }) async {
     final label = actionLabel ?? 'Reflection';
     Future<void> report(String message) async {
@@ -1668,11 +1727,15 @@ class _MyAppState extends State<MyApp> {
             Uri.parse('$_apiBase/reflect'),
             headers: const {'Content-Type': 'application/json'},
             body: json.encode({
-              'context': requestedSource?.context ??
+              'context':
+                  requestedSource?.context ??
                   (_currentContext == 'camera' ? 'camera' : 'screen'),
               if (requestedSource != null) 'source': requestedSource.id,
               'frames': _reflectFrames,
               'speak': _proactiveVoiceEnabled,
+              'thinking':
+                  thinking ??
+                  ((requestedSource?.context ?? _currentContext) == 'screen'),
               if (question != null && question.trim().isNotEmpty)
                 'question': question.trim(),
             }),
@@ -1688,9 +1751,10 @@ class _MyAppState extends State<MyApp> {
         return;
       }
       final audioB64 = data['audio'];
-      final audio = audioB64 is String && audioB64.isNotEmpty
-          ? base64.decode(audioB64)
-          : null;
+      final audio =
+          audioB64 is String && audioB64.isNotEmpty
+              ? base64.decode(audioB64)
+              : null;
       final clip = data['clip'] as Map<String, dynamic>?;
       if (!mounted) return;
       setState(() {
@@ -1767,8 +1831,8 @@ class _MyAppState extends State<MyApp> {
             _notificationsMuted
                 ? Icons.notifications_off_outlined
                 : _unreadNotifications > 0
-                    ? Icons.notifications_active_outlined
-                    : Icons.notifications_none_outlined,
+                ? Icons.notifications_active_outlined
+                : Icons.notifications_none_outlined,
             size: 20,
           ),
         ),
@@ -1883,6 +1947,7 @@ class _MyAppState extends State<MyApp> {
       if (mounted)
         setState(() {
           _currentContext = _contextOptions[index];
+          _conversationThinking = index == 1;
           for (var i = 0; i < _selectedContexts.length; i++) {
             _selectedContexts[i] = i == index;
           }
@@ -1930,16 +1995,16 @@ class _MyAppState extends State<MyApp> {
     final asr = (_backendStatus['asr'] as Map?) ?? const {};
     final asrReady = asr['ready'] == true;
     Widget indicator(Color color, String text) => Padding(
-          padding: const EdgeInsets.only(right: 12, bottom: 4),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.circle, size: 11, color: color),
-              const SizedBox(width: 5),
-              Text(text, style: const TextStyle(fontSize: 12)),
-            ],
-          ),
-        );
+      padding: const EdgeInsets.only(right: 12, bottom: 4),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.circle, size: 11, color: color),
+          const SizedBox(width: 5),
+          Text(text, style: const TextStyle(fontSize: 12)),
+        ],
+      ),
+    );
     return Container(
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
@@ -2043,14 +2108,16 @@ class _MyAppState extends State<MyApp> {
         _captureSourceRow(
           icon: Icons.desktop_windows,
           label: 'Desktop screen',
-          statusText: screenPaused
-              ? 'Paused'
-              : (screenHealthy
-                  ? 'Recording · ${screen['frames'] ?? 0} frames'
-                  : 'Starting…'),
-          dotColor: screenPaused
-              ? Colors.amber
-              : (screenHealthy ? Colors.green : Colors.grey),
+          statusText:
+              screenPaused
+                  ? 'Paused'
+                  : (screenHealthy
+                      ? 'Recording · ${screen['frames'] ?? 0} frames'
+                      : 'Starting…'),
+          dotColor:
+              screenPaused
+                  ? Colors.amber
+                  : (screenHealthy ? Colors.green : Colors.grey),
           paused: screenPaused,
           available: true,
           onToggle: () => _toggleScreen(!screenPaused),
@@ -2065,22 +2132,24 @@ class _MyAppState extends State<MyApp> {
       final events = cam['events_logged'] ?? 0;
       final summary = '${cam['last_summary'] ?? ''}';
       final motion = (cam['last_motion'] as Map?);
-      final idle = motion != null &&
+      final idle =
+          motion != null &&
           motion['warming'] != true &&
           (motion['motion_frames'] ?? 0) == 0;
       rows.add(
         _captureSourceRow(
           icon: Icons.videocam,
           label: '${cam['name'] ?? id}',
-          statusText: !connected
-              ? 'Offline${cam['error'] != null ? ' · ${cam['error']}' : ''}'
-              : paused
+          statusText:
+              !connected
+                  ? 'Offline${cam['error'] != null ? ' · ${cam['error']}' : ''}'
+                  : paused
                   ? 'Paused · $events events'
                   : idle
-                      ? 'Idle · watching for motion · $events events'
-                      : (summary.isNotEmpty
-                          ? summary
-                          : 'Watching · $events events'),
+                  ? 'Idle · watching for motion · $events events'
+                  : (summary.isNotEmpty
+                      ? summary
+                      : 'Watching · $events events'),
           dotColor:
               !connected ? Colors.red : (paused ? Colors.amber : Colors.green),
           paused: paused,
@@ -2154,18 +2223,20 @@ class _MyAppState extends State<MyApp> {
               ChoiceChip(
                 label: const Text('Camera'),
                 selected: _captureSource == CaptureSource.camera,
-                onSelected: running
-                    ? null
-                    : (_) => setState(
+                onSelected:
+                    running
+                        ? null
+                        : (_) => setState(
                           () => _captureSource = CaptureSource.camera,
                         ),
               ),
               ChoiceChip(
                 label: const Text('Screen'),
                 selected: _captureSource == CaptureSource.screen,
-                onSelected: running
-                    ? null
-                    : (_) => setState(
+                onSelected:
+                    running
+                        ? null
+                        : (_) => setState(
                           () => _captureSource = CaptureSource.screen,
                         ),
               ),
@@ -2283,9 +2354,10 @@ class _MyAppState extends State<MyApp> {
   }
 
   Widget _buildTapToSpeakButton() {
-    Color color = _isProcessing
-        ? _muted
-        : (_isRecording ? const Color(0xFFFF607C) : _mint);
+    Color color =
+        _isProcessing
+            ? _muted
+            : (_isRecording ? const Color(0xFFFF607C) : _mint);
 
     return GestureDetector(
       onTapDown: _isProcessing ? null : (_) => _start(),
@@ -2297,9 +2369,10 @@ class _MyAppState extends State<MyApp> {
         decoration: BoxDecoration(
           shape: BoxShape.circle,
           gradient: LinearGradient(
-            colors: _isRecording
-                ? [const Color(0xFFFF607C), const Color(0xFFFF8A68)]
-                : [color, const Color(0xFF42C7D6)],
+            colors:
+                _isRecording
+                    ? [const Color(0xFFFF607C), const Color(0xFFFF8A68)]
+                    : [color, const Color(0xFF42C7D6)],
           ),
           boxShadow: [
             BoxShadow(
@@ -2340,9 +2413,10 @@ class _MyAppState extends State<MyApp> {
                   isDense: true,
                   filled: true,
                   fillColor: _ink,
-                  hintText: _isRecording
-                      ? 'Listening…'
-                      : 'Type a message to HomeMind',
+                  hintText:
+                      _isRecording
+                          ? 'Listening…'
+                          : 'Type a message to HomeMind',
                   hintStyle: const TextStyle(color: _muted, fontSize: 13),
                   contentPadding: const EdgeInsets.symmetric(
                     horizontal: 14,
@@ -2372,20 +2446,21 @@ class _MyAppState extends State<MyApp> {
                 backgroundColor: canSend ? _mint : _panel,
                 minimumSize: const Size(46, 46),
               ),
-              icon: _isProcessing && !_isRecording
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: _mint,
+              icon:
+                  _isProcessing && !_isRecording
+                      ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: _mint,
+                        ),
+                      )
+                      : Icon(
+                        Icons.send_rounded,
+                        size: 20,
+                        color: canSend ? _ink : _muted,
                       ),
-                    )
-                  : Icon(
-                      Icons.send_rounded,
-                      size: 20,
-                      color: canSend ? _ink : _muted,
-                    ),
             ),
           ],
         );
@@ -2430,8 +2505,12 @@ class _MyAppState extends State<MyApp> {
       onReflectionShortcutChanged: _updateReflectShortcut,
       onSourceReflectionShortcutChanged: _updateSourceReflectShortcut,
       onClipboardAnswerShortcutChanged: _updateClipboardAnswerShortcut,
-      onReflectNow: _reflectOnScreen,
-      onChooseReflectionSource: _showReflectionSourcePicker,
+      onReflectNow:
+          () => _reflectOnScreen(thinking: _thinkingForShortcut('reflect_now')),
+      onChooseReflectionSource:
+          () => _showReflectionSourcePicker(
+            thinking: _thinkingForShortcut('reflect_from_source'),
+          ),
       onAnswerClipboard: _answerClipboard,
       promptShortcuts: _promptShortcuts,
       onPromptShortcutChanged: _updatePromptShortcut,
@@ -2453,8 +2532,10 @@ class _MyAppState extends State<MyApp> {
       captureSettingsLoading: _captureSettingsLoading,
       captureSettingsSavingSource: _captureSettingsSavingSource,
       captureSettingsError: _captureSettingsError,
-      onCaptureSourceChanged: (sourceId, fps, interval) {
-        unawaited(_updateCaptureSource(sourceId, fps, interval));
+      shortcutThinking: _shortcutThinking,
+      onShortcutThinkingChanged: _updateShortcutThinking,
+      onCaptureSourceChanged: (sourceId, fps, interval, thinking) {
+        unawaited(_updateCaptureSource(sourceId, fps, interval, thinking));
       },
     );
   }
@@ -2581,24 +2662,25 @@ class _MyAppState extends State<MyApp> {
               icon: Icons.auto_awesome,
               label: 'Assistant',
               selected: _workspaceIndex == 1,
-              onTap: () =>
-                  _openWorkspace(1, AssistantScreen(apiBase: _apiBase)),
+              onTap:
+                  () => _openWorkspace(1, AssistantScreen(apiBase: _apiBase)),
             ),
             _workspaceNavItem(
               icon: Icons.forum_outlined,
               label: 'Rooms',
               selected: _workspaceIndex == 2,
-              onTap: () =>
-                  _openWorkspace(2, RoomsListScreen(apiBase: _apiBase)),
+              onTap:
+                  () => _openWorkspace(2, RoomsListScreen(apiBase: _apiBase)),
             ),
             _workspaceNavItem(
               icon: Icons.manage_search,
               label: 'Memory',
               selected: _workspaceIndex == 3,
-              onTap: () => _openWorkspace(
-                3,
-                MemoryTimelineScreen(apiBase: _apiBase),
-              ),
+              onTap:
+                  () => _openWorkspace(
+                    3,
+                    MemoryTimelineScreen(apiBase: _apiBase),
+                  ),
             ),
             _workspaceNavItem(
               icon: Icons.notifications_none_outlined,
@@ -2620,9 +2702,10 @@ class _MyAppState extends State<MyApp> {
               ),
             ),
             _workspaceNavItem(
-              icon: _notificationsMuted
-                  ? Icons.notifications_off_outlined
-                  : Icons.record_voice_over_outlined,
+              icon:
+                  _notificationsMuted
+                      ? Icons.notifications_off_outlined
+                      : Icons.record_voice_over_outlined,
               label: 'Initiative & alerts',
               badge: _notificationsMuted ? 'MUTED' : null,
               onTap: _showInitiativeSheet,
@@ -2732,61 +2815,62 @@ class _MyAppState extends State<MyApp> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
       ),
-      builder: (sheetContext) => Padding(
-        padding: EdgeInsets.fromLTRB(
-          22,
-          12,
-          22,
-          22 + MediaQuery.viewInsetsOf(sheetContext).bottom,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Center(
-              child: Container(
-                width: 38,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: _line,
-                  borderRadius: BorderRadius.circular(8),
+      builder:
+          (sheetContext) => Padding(
+            padding: EdgeInsets.fromLTRB(
+              22,
+              12,
+              22,
+              22 + MediaQuery.viewInsetsOf(sheetContext).bottom,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 38,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: _line,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
                 ),
-              ),
-            ),
-            const SizedBox(height: 22),
-            const Text(
-              'Home hub',
-              style: TextStyle(fontSize: 19, fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 5),
-            const Text(
-              'Connect this device to your local assistant.',
-              style: TextStyle(color: _muted, fontSize: 12),
-            ),
-            const SizedBox(height: 18),
-            SizedBox(
-              width: double.infinity,
-              child: _bodyTextarea(MediaQuery.sizeOf(context)),
-            ),
-            const SizedBox(height: 14),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton(
-                onPressed: () {
-                  Navigator.pop(sheetContext);
-                  _connectToHomeHub();
-                },
-                style: FilledButton.styleFrom(
-                  backgroundColor: _mint,
-                  foregroundColor: _ink,
-                  padding: const EdgeInsets.symmetric(vertical: 15),
+                const SizedBox(height: 22),
+                const Text(
+                  'Home hub',
+                  style: TextStyle(fontSize: 19, fontWeight: FontWeight.w700),
                 ),
-                child: const Text('Connect'),
-              ),
+                const SizedBox(height: 5),
+                const Text(
+                  'Connect this device to your local assistant.',
+                  style: TextStyle(color: _muted, fontSize: 12),
+                ),
+                const SizedBox(height: 18),
+                SizedBox(
+                  width: double.infinity,
+                  child: _bodyTextarea(MediaQuery.sizeOf(context)),
+                ),
+                const SizedBox(height: 14),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: () {
+                      Navigator.pop(sheetContext);
+                      _connectToHomeHub();
+                    },
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _mint,
+                      foregroundColor: _ink,
+                      padding: const EdgeInsets.symmetric(vertical: 15),
+                    ),
+                    child: const Text('Connect'),
+                  ),
+                ),
+              ],
             ),
-          ],
-        ),
-      ),
+          ),
     );
   }
 
@@ -2798,198 +2882,210 @@ class _MyAppState extends State<MyApp> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
       ),
-      builder: (sheetContext) => StatefulBuilder(
-        builder: (context, setSheetState) {
-          void update(VoidCallback change) {
-            setState(change);
-            setSheetState(() {});
-            _persistDeliveryPreferences();
-          }
+      builder:
+          (sheetContext) => StatefulBuilder(
+            builder: (context, setSheetState) {
+              void update(VoidCallback change) {
+                setState(change);
+                setSheetState(() {});
+                _persistDeliveryPreferences();
+              }
 
-          Widget toggle({
-            required IconData icon,
-            required String title,
-            required String subtitle,
-            required bool value,
-            required ValueChanged<bool>? onChanged,
-          }) {
-            return SwitchListTile.adaptive(
-              contentPadding: const EdgeInsets.symmetric(horizontal: 4),
-              secondary: Icon(
-                icon,
-                color:
-                    onChanged == null ? _muted.withValues(alpha: .45) : _mint,
-              ),
-              title: Text(
-                title,
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
-                  color: onChanged == null ? _muted : Colors.white,
-                ),
-              ),
-              subtitle: Text(
-                subtitle,
-                style: const TextStyle(color: _muted, fontSize: 10.5),
-              ),
-              value: value,
-              activeTrackColor: _mint,
-              onChanged: onChanged,
-            );
-          }
-
-          final proactiveControlsEnabled = _proactiveEnabled;
-          final notificationControlsEnabled = !_notificationsMuted;
-          return SafeArea(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(18, 10, 18, 24),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Center(
-                    child: Container(
-                      width: 38,
-                      height: 4,
-                      decoration: BoxDecoration(
-                        color: _line,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                    ),
+              Widget toggle({
+                required IconData icon,
+                required String title,
+                required String subtitle,
+                required bool value,
+                required ValueChanged<bool>? onChanged,
+              }) {
+                return SwitchListTile.adaptive(
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                  secondary: Icon(
+                    icon,
+                    color:
+                        onChanged == null
+                            ? _muted.withValues(alpha: .45)
+                            : _mint,
                   ),
-                  const SizedBox(height: 18),
-                  const Text(
-                    'Initiative & alerts',
+                  title: Text(
+                    title,
                     style: TextStyle(
-                      fontSize: 19,
-                      fontWeight: FontWeight.w800,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: onChanged == null ? _muted : Colors.white,
                     ),
                   ),
-                  const SizedBox(height: 5),
-                  const Text(
-                    'Choose how HomeMind reaches you. These are delivery controls; '
-                    'the backend can continue observing and remembering.',
-                    style: TextStyle(color: _muted, fontSize: 11.5),
+                  subtitle: Text(
+                    subtitle,
+                    style: const TextStyle(color: _muted, fontSize: 10.5),
                   ),
-                  const SizedBox(height: 16),
-                  Container(
-                    decoration: BoxDecoration(
-                      color: _panelRaised,
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(color: _line),
-                    ),
-                    child: Column(
-                      children: [
-                        toggle(
-                          icon: Icons.auto_awesome,
-                          title: 'Proactive assistant',
-                          subtitle:
-                              'Allow unprompted insights from screen, mobile, camera and memory context.',
-                          value: _proactiveEnabled,
-                          onChanged: (value) =>
-                              update(() => _proactiveEnabled = value),
+                  value: value,
+                  activeTrackColor: _mint,
+                  onChanged: onChanged,
+                );
+              }
+
+              final proactiveControlsEnabled = _proactiveEnabled;
+              final notificationControlsEnabled = !_notificationsMuted;
+              return SafeArea(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(18, 10, 18, 24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Center(
+                        child: Container(
+                          width: 38,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: _line,
+                            borderRadius: BorderRadius.circular(8),
+                          ),
                         ),
-                        const Divider(height: 1, color: _line),
-                        toggle(
-                          icon: Icons.volume_up_outlined,
-                          title: 'Speak insights',
-                          subtitle: 'Play proactive insights aloud using TTS.',
-                          value: _proactiveVoiceEnabled,
-                          onChanged: proactiveControlsEnabled
-                              ? (value) => update(
-                                    () => _proactiveVoiceEnabled = value,
-                                  )
-                              : null,
-                        ),
-                        toggle(
-                          icon: Icons.chat_bubble_outline,
-                          title: 'Show in conversation',
-                          subtitle:
-                              'Add proactive insights to the Home conversation feed.',
-                          value: _proactiveFeedEnabled,
-                          onChanged: proactiveControlsEnabled
-                              ? (value) => update(
-                                    () => _proactiveFeedEnabled = value,
-                                  )
-                              : null,
-                        ),
-                        toggle(
-                          icon: Icons.notification_add_outlined,
-                          title: 'Notify proactive insights',
-                          subtitle:
-                              'Deliver insights as Android system notifications, including in the background.',
-                          value: _proactiveNotificationsEnabled,
-                          onChanged: proactiveControlsEnabled &&
-                                  notificationControlsEnabled
-                              ? (value) => update(
-                                    () =>
-                                        _proactiveNotificationsEnabled = value,
-                                  )
-                              : null,
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  const Padding(
-                    padding: EdgeInsets.only(left: 4, bottom: 7),
-                    child: Text(
-                      'NOTIFICATIONS',
-                      style: TextStyle(
-                        color: _muted,
-                        fontSize: 9,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 1.3,
                       ),
-                    ),
-                  ),
-                  Container(
-                    decoration: BoxDecoration(
-                      color: _panelRaised,
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(color: _line),
-                    ),
-                    child: Column(
-                      children: [
-                        toggle(
-                          icon: Icons.notifications_active_outlined,
-                          title: 'Home event alerts',
-                          subtitle:
-                              'Notify critical and important safety, security and activity events.',
-                          value: _eventNotificationsEnabled,
-                          onChanged: notificationControlsEnabled
-                              ? (value) => update(
-                                    () => _eventNotificationsEnabled = value,
-                                  )
-                              : null,
+                      const SizedBox(height: 18),
+                      const Text(
+                        'Initiative & alerts',
+                        style: TextStyle(
+                          fontSize: 19,
+                          fontWeight: FontWeight.w800,
                         ),
-                        const Divider(height: 1, color: _line),
-                        toggle(
-                          icon: Icons.notifications_off_outlined,
-                          title: 'Mute all notifications',
-                          subtitle:
-                              'Stops system notifications. Voice and the in-app feed remain available.',
-                          value: _notificationsMuted,
-                          onChanged: (value) =>
-                              update(() => _notificationsMuted = value),
+                      ),
+                      const SizedBox(height: 5),
+                      const Text(
+                        'Choose how HomeMind reaches you. These are delivery controls; '
+                        'the backend can continue observing and remembering.',
+                        style: TextStyle(color: _muted, fontSize: 11.5),
+                      ),
+                      const SizedBox(height: 16),
+                      Container(
+                        decoration: BoxDecoration(
+                          color: _panelRaised,
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: _line),
+                        ),
+                        child: Column(
+                          children: [
+                            toggle(
+                              icon: Icons.auto_awesome,
+                              title: 'Proactive assistant',
+                              subtitle:
+                                  'Allow unprompted insights from screen, mobile, camera and memory context.',
+                              value: _proactiveEnabled,
+                              onChanged:
+                                  (value) =>
+                                      update(() => _proactiveEnabled = value),
+                            ),
+                            const Divider(height: 1, color: _line),
+                            toggle(
+                              icon: Icons.volume_up_outlined,
+                              title: 'Speak insights',
+                              subtitle:
+                                  'Play proactive insights aloud using TTS.',
+                              value: _proactiveVoiceEnabled,
+                              onChanged:
+                                  proactiveControlsEnabled
+                                      ? (value) => update(
+                                        () => _proactiveVoiceEnabled = value,
+                                      )
+                                      : null,
+                            ),
+                            toggle(
+                              icon: Icons.chat_bubble_outline,
+                              title: 'Show in conversation',
+                              subtitle:
+                                  'Add proactive insights to the Home conversation feed.',
+                              value: _proactiveFeedEnabled,
+                              onChanged:
+                                  proactiveControlsEnabled
+                                      ? (value) => update(
+                                        () => _proactiveFeedEnabled = value,
+                                      )
+                                      : null,
+                            ),
+                            toggle(
+                              icon: Icons.notification_add_outlined,
+                              title: 'Notify proactive insights',
+                              subtitle:
+                                  'Deliver insights as Android system notifications, including in the background.',
+                              value: _proactiveNotificationsEnabled,
+                              onChanged:
+                                  proactiveControlsEnabled &&
+                                          notificationControlsEnabled
+                                      ? (value) => update(
+                                        () =>
+                                            _proactiveNotificationsEnabled =
+                                                value,
+                                      )
+                                      : null,
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      const Padding(
+                        padding: EdgeInsets.only(left: 4, bottom: 7),
+                        child: Text(
+                          'NOTIFICATIONS',
+                          style: TextStyle(
+                            color: _muted,
+                            fontSize: 9,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 1.3,
+                          ),
+                        ),
+                      ),
+                      Container(
+                        decoration: BoxDecoration(
+                          color: _panelRaised,
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: _line),
+                        ),
+                        child: Column(
+                          children: [
+                            toggle(
+                              icon: Icons.notifications_active_outlined,
+                              title: 'Home event alerts',
+                              subtitle:
+                                  'Notify critical and important safety, security and activity events.',
+                              value: _eventNotificationsEnabled,
+                              onChanged:
+                                  notificationControlsEnabled
+                                      ? (value) => update(
+                                        () =>
+                                            _eventNotificationsEnabled = value,
+                                      )
+                                      : null,
+                            ),
+                            const Divider(height: 1, color: _line),
+                            toggle(
+                              icon: Icons.notifications_off_outlined,
+                              title: 'Mute all notifications',
+                              subtitle:
+                                  'Stops system notifications. Voice and the in-app feed remain available.',
+                              value: _notificationsMuted,
+                              onChanged:
+                                  (value) =>
+                                      update(() => _notificationsMuted = value),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (!_notificationController.isSupported) ...[
+                        const SizedBox(height: 12),
+                        const Text(
+                          'System notification delivery is currently available on Android. '
+                          'Voice and the in-app feed work on other platforms.',
+                          style: TextStyle(color: _muted, fontSize: 10.5),
                         ),
                       ],
-                    ),
+                    ],
                   ),
-                  if (!_notificationController.isSupported) ...[
-                    const SizedBox(height: 12),
-                    const Text(
-                      'System notification delivery is currently available on Android. '
-                      'Voice and the in-app feed work on other platforms.',
-                      style: TextStyle(color: _muted, fontSize: 10.5),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          );
-        },
-      ),
+                ),
+              );
+            },
+          ),
     );
   }
 
@@ -3083,37 +3179,38 @@ class _MyAppState extends State<MyApp> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
       ),
-      builder: (sheetContext) => SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 38,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: _line,
-                  borderRadius: BorderRadius.circular(8),
-                ),
+      builder:
+          (sheetContext) => SafeArea(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(16, 10, 16, 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 38,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: _line,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  _buildCaptureSourcesPanel(),
+                  const SizedBox(height: 12),
+                  _buildCapturePanel(),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: TextButton.icon(
+                      onPressed: _clearMemory,
+                      icon: const Icon(Icons.layers_clear_outlined, size: 17),
+                      label: const Text('Clear long-term memory'),
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(height: 16),
-              _buildCaptureSourcesPanel(),
-              const SizedBox(height: 12),
-              _buildCapturePanel(),
-              const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                child: TextButton.icon(
-                  onPressed: _clearMemory,
-                  icon: const Icon(Icons.layers_clear_outlined, size: 17),
-                  label: const Text('Clear long-term memory'),
-                ),
-              ),
-            ],
+            ),
           ),
-        ),
-      ),
     );
   }
 
@@ -3270,6 +3367,7 @@ class _MyAppState extends State<MyApp> {
                     _selectedContexts[i] = i == index;
                   }
                   _currentContext = _contextOptions[index];
+                  _conversationThinking = index == 1;
                   _isLive = index != 0;
                 });
               },
@@ -3354,6 +3452,11 @@ class _MyAppState extends State<MyApp> {
                 'Memory',
                 _useMemory,
                 (v) => setState(() => _useMemory = v),
+              ),
+              _buildToggleSwitch(
+                'Thinking',
+                _conversationThinking,
+                (v) => setState(() => _conversationThinking = v),
               ),
             ],
           ),
@@ -3467,17 +3570,19 @@ class _MyAppState extends State<MyApp> {
             title: 'Explore memory',
             subtitle: 'Search timeline and entities',
             color: const Color(0xFF62B5FF),
-            onTap: () =>
-                _openWorkspace(3, MemoryTimelineScreen(apiBase: _apiBase)),
+            onTap:
+                () =>
+                    _openWorkspace(3, MemoryTimelineScreen(apiBase: _apiBase)),
           ),
           const SizedBox(height: 7),
           action(
             icon: _reflecting ? Icons.hourglass_top : Icons.psychology_outlined,
             title: 'Reflect now',
-            subtitle: _reflecting
-                ? 'Reading the last ${_reflectFrames}s…'
-                : '${_reflectShortcut?.label ?? 'Shortcut disabled'} • '
-                    'last ${_reflectFrames}s of frames',
+            subtitle:
+                _reflecting
+                    ? 'Reading the last ${_reflectFrames}s…'
+                    : '${_reflectShortcut?.label ?? 'Shortcut disabled'} • '
+                        'last ${_reflectFrames}s of frames',
             color: const Color(0xFFFFC857),
             onTap: _reflecting ? () {} : _reflectOnScreen,
           ),
@@ -3544,6 +3649,12 @@ class _MyAppState extends State<MyApp> {
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 6),
+          _buildToggleSwitch(
+            'Thinking',
+            _conversationThinking,
+            (v) => setState(() => _conversationThinking = v),
           ),
           const SizedBox(height: 8),
           Row(
@@ -3613,12 +3724,15 @@ class _MyAppState extends State<MyApp> {
     final shortcutBindings = <ShortcutActivator, VoidCallback>{};
     final reflectShortcut = _reflectShortcut;
     if (reflectShortcut != null) {
-      shortcutBindings[reflectShortcut.activator] = _reflectOnScreen;
+      shortcutBindings[reflectShortcut.activator] =
+          () => _reflectOnScreen(thinking: _thinkingForShortcut('reflect_now'));
     }
     final sourceReflectShortcut = _sourceReflectShortcut;
     if (sourceReflectShortcut != null) {
       shortcutBindings[sourceReflectShortcut.activator] =
-          _showReflectionSourcePicker;
+          () => _showReflectionSourcePicker(
+            thinking: _thinkingForShortcut('reflect_from_source'),
+          );
     }
     final clipboardAnswerShortcut = _clipboardAnswerShortcut;
     if (clipboardAnswerShortcut != null) {
@@ -3671,54 +3785,55 @@ class _MyAppState extends State<MyApp> {
                       desktop ? 22 : 14,
                       14,
                     ),
-                    child: desktop
-                        ? Column(
-                            children: [
-                              _buildHeader(s),
-                              const SizedBox(height: 14),
-                              Align(
-                                alignment: Alignment.centerLeft,
-                                child: _buildBackendIndicators(),
-                              ),
-                              const SizedBox(height: 14),
-                              Expanded(
-                                child: Row(
-                                  crossAxisAlignment:
-                                      CrossAxisAlignment.stretch,
-                                  children: [
-                                    Expanded(
-                                      flex: 5,
-                                      child: _buildConversationCard(),
-                                    ),
-                                    const SizedBox(width: 14),
-                                    SizedBox(
-                                      width: 348,
-                                      child: SingleChildScrollView(
-                                        child: Column(
-                                          children: [
-                                            _buildQuickAccessPanel(),
-                                            const SizedBox(height: 12),
-                                            _buildControlPanel(),
-                                          ],
+                    child:
+                        desktop
+                            ? Column(
+                              children: [
+                                _buildHeader(s),
+                                const SizedBox(height: 14),
+                                Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: _buildBackendIndicators(),
+                                ),
+                                const SizedBox(height: 14),
+                                Expanded(
+                                  child: Row(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.stretch,
+                                    children: [
+                                      Expanded(
+                                        flex: 5,
+                                        child: _buildConversationCard(),
+                                      ),
+                                      const SizedBox(width: 14),
+                                      SizedBox(
+                                        width: 348,
+                                        child: SingleChildScrollView(
+                                          child: Column(
+                                            children: [
+                                              _buildQuickAccessPanel(),
+                                              const SizedBox(height: 12),
+                                              _buildControlPanel(),
+                                            ],
+                                          ),
                                         ),
                                       ),
-                                    ),
-                                  ],
+                                    ],
+                                  ),
                                 ),
-                              ),
-                            ],
-                          )
-                        : Column(
-                            children: [
-                              _buildMobileHeader(),
-                              const SizedBox(height: 10),
-                              _buildMobileStatus(),
-                              const SizedBox(height: 10),
-                              Expanded(child: _buildConversationCard()),
-                              const SizedBox(height: 10),
-                              _buildMobileControls(),
-                            ],
-                          ),
+                              ],
+                            )
+                            : Column(
+                              children: [
+                                _buildMobileHeader(),
+                                const SizedBox(height: 10),
+                                _buildMobileStatus(),
+                                const SizedBox(height: 10),
+                                Expanded(child: _buildConversationCard()),
+                                const SizedBox(height: 10),
+                                _buildMobileControls(),
+                              ],
+                            ),
                   ),
                 ),
               ),
@@ -3866,14 +3981,15 @@ class MessageBubble extends StatelessWidget {
         minimumSize: Size.zero,
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
       ),
-      onPressed: () => showClipSheet(
-        context,
-        apiBase: apiBase,
-        clipId: message.clipId!,
-        caption: message.text,
-        coversSeconds: message.clipCoversSeconds,
-        playsSeconds: message.clipPlaysSeconds,
-      ),
+      onPressed:
+          () => showClipSheet(
+            context,
+            apiBase: apiBase,
+            clipId: message.clipId!,
+            caption: message.text,
+            coversSeconds: message.clipCoversSeconds,
+            playsSeconds: message.clipPlaysSeconds,
+          ),
       icon: Icon(Icons.play_circle_outline, size: 15, color: accent),
       label: Text(
         'Watch what I saw',

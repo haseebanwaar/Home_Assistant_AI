@@ -12,7 +12,7 @@ from mss import mss
 import numpy as np
 from lmdeploy.vl.constants import IMAGE_TOKEN
 from lmdeploy.vl.utils import encode_image_base64
-from providers.local_openAI import client, get_model_name_vlm
+from providers.local_openAI import client, get_model_name_vlm, thinking_request_kwargs
 from utils.qwen_preprocess import encode_video
 import cv2
 import tempfile
@@ -26,6 +26,7 @@ from sources.capture_settings import (
 )
 from sources.idle import PresenceGate
 from sources.video_writer import open_mp4_writer
+from sources.frame_budget import frames_as_image_parts
 
 # Windows-only PID lookup for the active window (Step 1: process_name capture).
 try:
@@ -59,7 +60,7 @@ def _process_for_hwnd(hwnd):
 class RealtimeScreenCapture:
     def __init__(self, video_source,model_name_vlm, window_size=60, fps=1.0, monitor_index=1, target_resolution=None,
                  activity_logger=None, insight_callback=None, start_capture=True, pipeline=None,
-                 clip_store=None, presence_gate=None):
+                 clip_store=None, presence_gate=None, thinking=True):
         """
         Args:
             video_source: screen (not used)
@@ -90,6 +91,8 @@ class RealtimeScreenCapture:
         self.last_error = None
         self.monitor_index = monitor_index
         self.model_name_vlm = model_name_vlm
+        self.thinking = bool(thinking)
+        self.max_tokens = int(os.getenv("SCREEN_MAX_TOKENS", "18000"))
         self.target_resolution = target_resolution
         self.activity_logger = activity_logger
         # Optional callback(description, timestamp) invoked after each minute is
@@ -175,8 +178,9 @@ class RealtimeScreenCapture:
         """
         if len(imgs) == 0:
             return ''
-        video_b64 = self._encode_buffer_to_mp4_base64(imgs,fps=self.fps)
-        if not video_b64: return "Error encoding video"
+        image_parts, frame_info = frames_as_image_parts(imgs)
+        if not image_parts:
+            return "Error preparing screen frames"
 
         # also provie ;long term memory here. like for an hour? b
         # if len(self.description_history) > 10:
@@ -226,15 +230,16 @@ Create a retrievable memory record that preserves what matters most for future r
                 "role": "user",
                 "content": [
                     {"type": "text", "text": f"{question}"},
-                    {
-                        "type": "video_url",
-                        "video_url": {"url": f"data:video/mp4;base64,{video_b64}"}
-                    }
+                    *image_parts,
                 ]
             }
         ]
         tim = time.perf_counter()
-        response = await client.chat.completions.create(model=self.model_name_vlm, messages=messages,max_tokens=2500)
+        response = await client.chat.completions.create(
+            model=self.model_name_vlm, messages=messages,
+            max_tokens=self.max_tokens if self.thinking else 2500,
+            **thinking_request_kwargs(self.thinking),
+        )
 
         answer = response.choices[0].dict()['message']['content']
         logger.debug("Screen description: %s", answer)
@@ -279,13 +284,13 @@ Create a retrievable memory record that preserves what matters most for future r
                         len(sample.frames), len(imgs), [round(t, 1) for t in sample.timestamps])
             imgs = sample.frames
 
-        video_b64 = self._encode_buffer_to_mp4_base64(imgs, fps=self.fps)
-        if not video_b64:
-            return ExtractionResult(summary="Error encoding video", confidence=0.0), "empty", profile.name
+        image_parts, frame_info = frames_as_image_parts(imgs)
+        if not image_parts:
+            return ExtractionResult(summary="Error preparing screen frames", confidence=0.0), "empty", profile.name
 
         base_content = [
             {"type": "text", "text": EXTRACTION_USER_PROMPT},
-            {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{video_b64}"}},
+            *image_parts,
         ]
 
         async def generate(feedback):
@@ -297,14 +302,17 @@ Create a retrievable memory record that preserves what matters most for future r
                 {"role": "user", "content": user_content},
             ]
             resp = await client.chat.completions.create(
-                model=self.model_name_vlm, messages=messages, max_tokens=2500,
+                model=self.model_name_vlm, messages=messages,
+                max_tokens=self.max_tokens if self.thinking else 2500,
+                **thinking_request_kwargs(self.thinking),
             )
             return resp.choices[0].dict()["message"]["content"]
 
         tim = time.perf_counter()
         result, status = await run_extraction(generate)
-        logger.info("Structured extraction (%s, profile=%s) of %d frames took %.3f s",
-                    status, profile.name, len(imgs), time.perf_counter() - tim)
+        logger.info("Structured extraction (%s, profile=%s) using %d/%d images took %.3f s",
+                    status, profile.name, frame_info["kept"], len(imgs),
+                    time.perf_counter() - tim)
         return result, status, profile.name
 
     def _encode_buffer_to_mp4_base64(self,frames, fps=1.0):
@@ -704,7 +712,8 @@ Create a retrievable memory record that preserves what matters most for future r
         self.paused = False
         logger.info("Screen capture resumed.")
 
-    def update_capture_profile(self, sample_fps, inference_interval_seconds):
+    def update_capture_profile(self, sample_fps, inference_interval_seconds,
+                               thinking=None):
         """Apply a new profile and discard the current/pending capture window."""
         fps, interval = validate_capture_profile(
             sample_fps, inference_interval_seconds
@@ -712,6 +721,8 @@ Create a retrievable memory record that preserves what matters most for future r
         with self.lock:
             self.fps = fps
             self.window_size = interval
+            if thinking is not None:
+                self.thinking = bool(thinking)
             self.frame_buffer = deque(
                 maxlen=expected_frame_count(fps, interval)
             )
@@ -773,6 +784,7 @@ Create a retrievable memory record that preserves what matters most for future r
             "monitor_index": self.monitor_index,
             "sample_fps": self.fps,
             "inference_interval_seconds": self.window_size,
+            "thinking": self.thinking,
             "expected_frames": expected_frame_count(
                 self.fps, self.window_size
             ),

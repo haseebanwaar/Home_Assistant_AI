@@ -76,7 +76,7 @@ def _host_of(url):
 
 class CameraManager:
     def __init__(self, model_name_vlm, neo4j_store=None, activity_logger=None,
-                 window_seconds=60, fps=1.0, notification_sink=None,
+                 window_seconds=120, fps=0.5, notification_sink=None,
                  insight_callback=None, clip_store=None, profile_store=None):
         self.model_name_vlm = model_name_vlm
         self.neo4j = neo4j_store

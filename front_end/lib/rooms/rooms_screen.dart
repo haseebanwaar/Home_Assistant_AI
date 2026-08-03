@@ -180,30 +180,39 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     switch (room['room_id']) {
       case 'agent:motivational':
         Navigator.of(context)
-            .push(MaterialPageRoute(
-              builder: (_) => MotivationalRoomScreen(apiBase: widget.apiBase),
-            ))
+            .push(
+              MaterialPageRoute(
+                builder: (_) => MotivationalRoomScreen(apiBase: widget.apiBase),
+              ),
+            )
             .then((_) => _load());
         return;
       case 'agent:roaster':
         Navigator.of(context)
-            .push(MaterialPageRoute(
-              builder: (_) => RoasterRoomScreen(apiBase: widget.apiBase),
-            ))
+            .push(
+              MaterialPageRoute(
+                builder: (_) => RoasterRoomScreen(apiBase: widget.apiBase),
+              ),
+            )
             .then((_) => _load());
         return;
       case 'agent:creative-coach':
         Navigator.of(context)
-            .push(MaterialPageRoute(
-              builder: (_) => CreativeCoachRoomScreen(apiBase: widget.apiBase),
-            ))
+            .push(
+              MaterialPageRoute(
+                builder:
+                    (_) => CreativeCoachRoomScreen(apiBase: widget.apiBase),
+              ),
+            )
             .then((_) => _load());
         return;
       case 'agent:wisdom':
         Navigator.of(context)
-            .push(MaterialPageRoute(
-              builder: (_) => WisdomRoomScreen(apiBase: widget.apiBase),
-            ))
+            .push(
+              MaterialPageRoute(
+                builder: (_) => WisdomRoomScreen(apiBase: widget.apiBase),
+              ),
+            )
             .then((_) => _load());
         return;
     }
@@ -863,6 +872,7 @@ class _RoomScreenState extends State<RoomScreen> {
   String? _window;
   // Answer from the current camera/screen frame buffers as well as from memory.
   bool _live = false;
+  bool _thinking = false;
 
   bool get _isDaily => widget.kind == 'daily';
   bool get _isAgent => widget.kind == 'agent';
@@ -1076,7 +1086,7 @@ class _RoomScreenState extends State<RoomScreen> {
         '_pending': true,
       });
       // For chat, also show a "thinking" placeholder immediately — the model
-      // is a single-sequence vLLM shared with screen capture, so the reply can
+      // is a single-sequence local model shared with screen capture, so the reply can
       // take a while to come back. This gives instant acknowledgement.
       if (isChat) {
         _feed.add({
@@ -1111,6 +1121,7 @@ class _RoomScreenState extends State<RoomScreen> {
                 if (start != null) 'start': start,
                 if (end != null) 'end': end,
                 if (_live) 'live': true,
+                'thinking': _thinking,
               }
               : {'text': text};
       if (isChat && widget.assistantMode == 'agent') {
@@ -2347,6 +2358,18 @@ class _RoomScreenState extends State<RoomScreen> {
                 const SizedBox(width: 8),
                 _liveChip(),
               ],
+              if (_mode == 'chat') ...[
+                const SizedBox(width: 8),
+                FilterChip(
+                  label: Text(_thinking ? 'Thinking on' : 'Thinking off'),
+                  selected: _thinking,
+                  onSelected: (value) => setState(() => _thinking = value),
+                  avatar: Icon(
+                    _thinking ? Icons.psychology : Icons.psychology_outlined,
+                    size: 16,
+                  ),
+                ),
+              ],
             ],
           ),
           if (_mode == 'chat') ...[const SizedBox(height: 6), _scopeSummary()],
@@ -2505,7 +2528,7 @@ class _RoomScreenState extends State<RoomScreen> {
 }
 
 /// A left-aligned assistant bubble with animated dots, shown while the reply
-/// is in flight (the model can take a while — single-sequence vLLM).
+/// is in flight (the model can take a while — single-sequence llama.cpp).
 class _ThinkingBubble extends StatefulWidget {
   final List<String> activities;
   const _ThinkingBubble({this.activities = const []});

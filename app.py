@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import Lock
 
 import nest_asyncio
+import cv2
 from collections import deque
 from dotenv import load_dotenv
 import pydub
@@ -26,7 +27,7 @@ from lmdeploy.vl.utils import encode_image_base64
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from providers.asr.parakeet import nemo_transcribe, parakeet_health
-from providers.local_openAI import client, get_model_name_vlm
+from providers.local_openAI import client, get_model_name_vlm, thinking_request_kwargs
 from providers.tts.kokoro.kokoro_tts import (
     get_kokoro_voice_settings,
     run_kokoro,
@@ -37,7 +38,7 @@ from sources.screen import RealtimeScreenCapture
 from sources.idle import PresenceGate
 from sources.camera_manager import CameraManager
 from sources.clips import ClipStore, parse_range, valid_clip_id
-from sources.frame_budget import fit_frames, frames_as_video
+from sources.frame_budget import prepare_frames, frames_as_image_parts
 from sources.capture_settings import (
     SourceCaptureSettings,
     validate_capture_profile,
@@ -120,14 +121,9 @@ def env_float(name, default, minimum=0.01):
 
 
 DEBUG_VERBOSE = env_bool("DEBUG_VERBOSE")
-MAX_FRAMES = env_int("MAX_FRAMES", 20)
-# Frame COUNT is not what runs out — vision tokens are. A native-resolution
-# camera frame costs thousands of them, so MAX_FRAMES alone let one live window
-# overflow the whole context. See sources/frame_budget.py.
-LIVE_FRAME_TOKEN_BUDGET = env_int("LIVE_FRAME_TOKEN_BUDGET", 6000)
+MAX_FRAMES = env_int("MAX_FRAMES", 60)
 # Playback rate stamped on the live clip sent with a room chat. Matches the
 # capture rate, so the model reads its timing the same way the capture path does.
-LIVE_VIDEO_FPS = env_float("LIVE_VIDEO_FPS", 1.0)
 MAX_MEMORY_ITEMS = env_int("MAX_MEMORY_ITEMS", 20)
 
 app = FastAPI(title="Home Assistant AI")
@@ -332,7 +328,7 @@ CONCISE_SYSTEM_PROMPT = f"""You are a conversational AI designed for a real-time
 
 def validate_configuration():
     """Fail at startup with actionable messages for required POC settings."""
-    vlm_url = os.getenv("VLM_BASE_URL", "http://0.0.0.0:8000/v1").strip()
+    vlm_url = os.getenv("VLM_BASE_URL", "http://127.0.0.1:8888/v1").strip()
     if not vlm_url.startswith(("http://", "https://")):
         raise RuntimeError("VLM_BASE_URL must start with http:// or https://")
 
@@ -341,15 +337,15 @@ def validate_configuration():
         raise RuntimeError("PARAKEET_SERVER_URL must start with http:// or https://")
 
     env_int("APP_PORT", 8000)
-    env_int("MAX_FRAMES", 20)
+    env_int("MAX_FRAMES", 60)
     env_int("MAX_MEMORY_ITEMS", 20)
     if env_bool("SCREEN_CAPTURE_ENABLED", True):
         env_int("SCREEN_MONITOR_INDEX", 1)
-        env_int("SCREEN_WINDOW_SECONDS", 60)
-        env_float("SCREEN_FPS", 1.0)
+        env_int("SCREEN_WINDOW_SECONDS", 120)
+        env_float("SCREEN_FPS", 2.0)
     if env_bool("CAMERA_CAPTURE_ENABLED", True):
-        env_int("CAMERA_WINDOW_SECONDS", 60)
-        env_float("CAMERA_FPS", 1.0)
+        env_int("CAMERA_WINDOW_SECONDS", 120)
+        env_float("CAMERA_FPS", 0.5)
 
 
 # === STARTUP ===
@@ -362,16 +358,18 @@ async def startup_event():
     validate_configuration()
     screen_fps, screen_interval = source_capture_settings.resolve(
         "pc_screen",
-        env_float("SCREEN_FPS", 1.0),
-        env_int("SCREEN_WINDOW_SECONDS", 60),
+        env_float("SCREEN_FPS", 2.0),
+        env_int("SCREEN_WINDOW_SECONDS", 120),
     )
+    screen_thinking = source_capture_settings.resolve_thinking(
+        "pc_screen", True)
     logger.info("Loading model...")
     try:
         vlm_model = await get_model_name_vlm()
     except Exception as exc:
         logger.error(
             "VLM server unreachable at %s: %s",
-            os.getenv("VLM_BASE_URL", "http://0.0.0.0:8000/v1"), exc,
+            os.getenv("VLM_BASE_URL", "http://127.0.0.1:8888/v1"), exc,
         )
         raise
     logger.info("Model loaded: %s", vlm_model)
@@ -474,6 +472,7 @@ async def startup_event():
             pipeline=memory_pipeline,
             clip_store=clip_store,
             presence_gate=screen_presence_gate,
+            thinking=screen_thinking,
         )
         logger.info("Screen capture enabled (monitor=%d).", screen_stream.monitor_index)
     else:
@@ -487,8 +486,8 @@ async def startup_event():
         camera_manager = CameraManager(
             model_name_vlm=vlm_model, neo4j_store=neo4j_store,
             activity_logger=activity_logger,
-            window_seconds=env_int("CAMERA_WINDOW_SECONDS", 60),
-            fps=env_float("CAMERA_FPS", 1.0),
+            window_seconds=env_int("CAMERA_WINDOW_SECONDS", 120),
+            fps=env_float("CAMERA_FPS", 0.5),
             notification_sink=notify_from_event,
             insight_callback=handle_observation_description if proactive is not None else None,
             clip_store=clip_store,
@@ -987,6 +986,7 @@ def _capture_settings_payload():
                 status["inference_interval_seconds"],
             "expected_frames": status["expected_frames"],
             "buffered_frames": status.get("frames", 0),
+            "thinking": bool(status.get("thinking", True)),
         })
     if camera_manager is not None:
         for worker in camera_manager.workers.values():
@@ -1001,6 +1001,7 @@ def _capture_settings_payload():
                     status["inference_interval_seconds"],
                 "expected_frames": status["expected_frames"],
                 "buffered_frames": status.get("buffered_frames", 0),
+                "thinking": False,
             })
     return {"sources": sources}
 
@@ -1025,6 +1026,10 @@ async def update_capture_settings(request: Request):
             status_code=400, content={"error": "request must be an object"}
         )
     source_id = str(data.get("source_id") or "").strip()
+    thinking = data.get("thinking")
+    if thinking is not None and not isinstance(thinking, bool):
+        return JSONResponse(
+            status_code=400, content={"error": "thinking must be a boolean"})
     try:
         fps, interval = validate_capture_profile(
             data.get("sample_fps"),
@@ -1052,8 +1057,16 @@ async def update_capture_settings(request: Request):
             )
 
     try:
-        source_capture_settings.set(source_id, fps, interval)
-        target.update_capture_profile(fps, interval)
+        effective_thinking = (
+            thinking if thinking is not None else target.thinking
+        ) if source_id == "pc_screen" else False
+        source_capture_settings.set(
+            source_id, fps, interval, thinking=effective_thinking)
+        if source_id == "pc_screen":
+            target.update_capture_profile(
+                fps, interval, thinking=effective_thinking)
+        else:
+            target.update_capture_profile(fps, interval)
     except (OSError, ValueError) as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     return _capture_settings_payload()
@@ -1512,7 +1525,8 @@ async def daily_report(date: str = None, post: bool = True):
                 model=vlm_model,
                 messages=[{"role": "user", "content": coach_prompt(
                     metrics, claims, comparison=comparison)}],
-                max_tokens=350)
+                max_tokens=350,
+                **thinking_request_kwargs(False))
             feedback = (resp.choices[0].message.content or "").strip()
         except Exception as exc:
             logger.warning("coach feedback LLM failed: %s", exc)
@@ -1790,7 +1804,8 @@ async def room_arc(room_id: str, weeks: int = 8, narrate: bool = False):
         try:
             response = await client.chat.completions.create(
                 model=vlm_model, messages=[{"role": "user", "content": prompt}],
-                max_tokens=400)
+                max_tokens=400,
+                **thinking_request_kwargs(False))
             result["narrative"] = (response.choices[0].message.content or "").strip()
         except Exception as exc:
             logger.warning("room arc narration failed: %s", exc)
@@ -1907,6 +1922,8 @@ async def _read_room_turn(request):
         "start": _ts(data.get("start")),
         "end": _ts(data.get("end")),
         "live": bool(data.get("live")),
+        "thinking": bool(data.get("thinking", False)),
+        "thinking_budget": data.get("thinking_budget"),
     }, None
 
 
@@ -2115,27 +2132,24 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
         role = "user" if m["role"] == "user" else "assistant"
         messages.append({"role": role, "content": m["text"]})
 
-    # One video, full resolution, budgeted by the server — the same way the
-    # capture path feeds it, and the reason that path never overflows. Twenty
-    # frames as separate images was ~58k tokens; as video it is ~12k.
-    video_b64, frame_info = frames_as_video(
-        live_frames, fps=LIVE_VIDEO_FPS, max_frames=MAX_FRAMES)
-    if video_b64:
+    # Preserve captured dimensions and cadence; llama.cpp owns visual
+    # preprocessing and the model's image-token budget.
+    image_parts, frame_info = frames_as_image_parts(live_frames)
+    if image_parts:
         messages.append({"role": "user", "content": [
             {"type": "text", "text": message},
-            {"type": "video_url",
-             "video_url": {"url": f"data:video/mp4;base64,{video_b64}"}},
+            *image_parts,
         ]})
     else:
         if live_frames:
-            live_warnings.append("live frames could not be encoded")
+            live_warnings.append("live frames could not be prepared")
         messages.append({"role": "user", "content": message})
 
     meta = {"live_sources": live_labels, "live_frames": frame_info["kept"],
             "live_frame_detail": frame_info,
             "warnings": live_warnings, "applications": applications or [],
             "start": start, "end": end}
-    logger.info("room chat %s: apps=%s window=(%s,%s) live=%d frame(s) as video "
+    logger.info("room chat %s: apps=%s window=(%s,%s) live=%d temporal image(s) "
                 "at %sx%s", room_id, applications, start, end,
                 frame_info["kept"], frame_info["width"], frame_info["height"])
     return messages, citations, meta
@@ -2187,6 +2201,8 @@ async def room_chat(room_id: str, request: Request):
             room=room,
             messages=messages,
             max_tokens=700 if get_agent(room_id) is not None else 500,
+            thinking=turn["thinking"],
+            thinking_budget=turn["thinking_budget"],
         )
         reply = result.reply
     except AgentRuntimeUnavailable as exc:
@@ -2282,6 +2298,8 @@ async def room_chat_stream(room_id: str, request: Request):
                 on_complete=persist,
                 max_tokens=700 if get_agent(room_id) is not None else 500,
                 meta=meta,
+                thinking=turn["thinking"],
+                thinking_budget=turn["thinking_budget"],
             ),
             media_type="application/x-ndjson",
         )
@@ -2290,7 +2308,9 @@ async def room_chat_stream(room_id: str, request: Request):
         _stream_reply(
             messages, citations, persist,
             max_tokens=700 if get_agent(room_id) is not None else 500,
-            meta=meta),
+            meta=meta,
+            thinking=turn["thinking"],
+            thinking_budget=turn["thinking_budget"]),
         media_type="application/x-ndjson")
 
 
@@ -2730,7 +2750,8 @@ async def assistant_conversation_message(conversation_id: str, request: Request)
     neo4j_store.add_conversation_message(conversation_id, "user", message)
     try:
         response = await client.chat.completions.create(
-            model=vlm_model, messages=messages, max_tokens=700)
+            model=vlm_model, messages=messages, max_tokens=700,
+            **thinking_request_kwargs(False))
         reply = (response.choices[0].message.content or "").strip()
     except Exception as exc:
         logger.warning("grounded assistant failed: %s", exc)
@@ -2741,7 +2762,8 @@ async def assistant_conversation_message(conversation_id: str, request: Request)
 
 
 async def _stream_agent_reply(
-        room_id, room, messages, citations, on_complete, max_tokens=700, meta=None):
+        room_id, room, messages, citations, on_complete, max_tokens=700, meta=None,
+        thinking=False, thinking_budget=None):
     """NDJSON-compatible agent response including MCP tool results.
 
     The agent loop may make several model/tool round trips before text exists.
@@ -2777,6 +2799,8 @@ async def _stream_agent_reply(
         room=room,
         messages=messages,
         max_tokens=max_tokens,
+        thinking=thinking,
+        thinking_budget=thinking_budget,
         progress=report,
     ))
     last_update = time.monotonic()
@@ -2823,7 +2847,8 @@ async def _stream_agent_reply(
     }) + "\n"
 
 
-async def _stream_reply(messages, citations, on_complete, max_tokens=700, meta=None):
+async def _stream_reply(messages, citations, on_complete, max_tokens=700, meta=None,
+                        thinking=False, thinking_budget=None):
     """NDJSON token stream, citations first.
 
     Evidence is known before generation starts, so sending it immediately lets
@@ -2838,7 +2863,10 @@ async def _stream_reply(messages, citations, on_complete, max_tokens=700, meta=N
     parts = []
     try:
         stream = await client.chat.completions.create(
-            model=vlm_model, messages=messages, max_tokens=max_tokens, stream=True)
+            model=vlm_model, messages=messages,
+            max_tokens=(max(max_tokens, env_int("THINKING_MAX_TOKENS", 18000))
+                        if thinking else max_tokens), stream=True,
+            **thinking_request_kwargs(thinking, thinking_budget))
         async for chunk in stream:
             if not chunk.choices:
                 continue
@@ -3101,7 +3129,8 @@ async def build_focus_recap(focus, post=False):
         response = await client.chat.completions.create(
             model=vlm_model, max_tokens=600,
             messages=[{"role": "user",
-                       "content": recap_mod.classify_prompt(goal, events)}])
+                       "content": recap_mod.classify_prompt(goal, events)}],
+            **thinking_request_kwargs(False))
         labels = recap_mod.parse_labels(
             response.choices[0].message.content, len(events))
     except Exception as exc:
@@ -3117,7 +3146,8 @@ async def build_focus_recap(focus, post=False):
             response = await client.chat.completions.create(
                 model=vlm_model, max_tokens=250,
                 messages=[{"role": "user",
-                           "content": recap_mod.feedback_prompt(breakdown)}])
+                           "content": recap_mod.feedback_prompt(breakdown)}],
+                **thinking_request_kwargs(False))
             feedback = (response.choices[0].message.content or "").strip()
         except Exception as exc:
             logger.warning("focus feedback LLM failed: %s", exc)
@@ -3390,13 +3420,16 @@ async def clip_ask(clip_id: str, request: Request):
     if meta.get("summary"):
         context_lines.append(f"- what was recorded at the time: {meta['summary']}")
 
-    video_b64 = await asyncio.to_thread(_read_clip_base64, path)
+    clip_frames = await asyncio.to_thread(_read_clip_frames, path, MAX_FRAMES)
+    image_parts, frame_info = frames_as_image_parts(clip_frames)
+    if not image_parts:
+        return JSONResponse(status_code=422, content={
+            "error": "clip frames could not be decoded"})
     content = [
         {"type": "text",
          "text": ("Clip context:\n" + "\n".join(context_lines)
                   + f"\n\nQuestion about this clip: {question}")},
-        {"type": "video_url",
-         "video_url": {"url": f"data:video/mp4;base64,{video_b64}"}},
+        *image_parts,
     ]
     try:
         response = await client.chat.completions.create(
@@ -3404,6 +3437,7 @@ async def clip_ask(clip_id: str, request: Request):
             messages=[{"role": "system", "content": CLIP_ASK_SYSTEM_PROMPT},
                       {"role": "user", "content": content}],
             max_tokens=env_int("CLIP_ASK_MAX_TOKENS", 400),
+            **thinking_request_kwargs(False),
         )
     except Exception as exc:
         logger.warning("Clip question failed (%s): %s", clip_id, exc)
@@ -3415,9 +3449,28 @@ async def clip_ask(clip_id: str, request: Request):
             "clip": clip_store.describe(clip_id)}
 
 
-def _read_clip_base64(path):
-    with open(path, "rb") as handle:
-        return base64.b64encode(handle.read()).decode("utf-8")
+def _read_clip_frames(path, max_frames=60):
+    """Decode a temporal spread from an evidence MP4 for llama.cpp vision."""
+    capture = cv2.VideoCapture(path)
+    try:
+        total = max(0, int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+        keep = max(1, int(max_frames))
+        if total > 1:
+            positions = sorted({
+                int(round(index * (total - 1) / max(keep - 1, 1)))
+                for index in range(min(keep, total))
+            })
+        else:
+            positions = [0]
+        frames = []
+        for position in positions:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, position)
+            ok, frame = capture.read()
+            if ok and frame is not None:
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        return frames
+    finally:
+        capture.release()
 
 
 NUDGE_FEEDBACK_VALUES = {"up", "down", "not_now"}
@@ -3553,6 +3606,7 @@ async def reflect_now(request: Request):
     count = max(1, min(count, MAX_FRAMES))
     hint = (data.get("question") or "").strip()
     speak = data.get("speak", False) is True
+    thinking = bool(data.get("thinking", context == "screen"))
 
     if vlm_model is None:
         return JSONResponse(status_code=503, content={"error": "VLM not ready"})
@@ -3564,8 +3618,7 @@ async def reflect_now(request: Request):
 
     window = frames[-count:]
     timestamp = time.time()
-    budgeted, frame_detail = fit_frames(
-        window, token_budget=LIVE_FRAME_TOKEN_BUDGET, max_frames=count)
+    budgeted, frame_detail = prepare_frames(window)
     instruction = (
         f"These are the last {len(budgeted)} frames from {source}, in "
         "order, oldest first. What is going on, and what is the most useful thing "
@@ -3578,8 +3631,7 @@ async def reflect_now(request: Request):
     for frame in budgeted:
         content.append({
             "type": "image_url",
-            "image_url": {"max_dynamic_patch": 9,
-                          "url": f"data:image/jpeg;base64,{encode_image_base64(frame)}"},
+            "image_url": {"url": f"data:image/jpeg;base64,{encode_image_base64(frame)}"},
         })
 
     try:
@@ -3588,6 +3640,7 @@ async def reflect_now(request: Request):
             messages=[{"role": "system", "content": REFLECT_SYSTEM_PROMPT},
                       {"role": "user", "content": content}],
             max_tokens=env_int("REFLECT_MAX_TOKENS", 500),
+            **thinking_request_kwargs(thinking),
         )
     except Exception as exc:
         logger.warning("Reflect failed (%s): %s", source, exc)
@@ -3716,9 +3769,7 @@ async def describe_mobile_frames(source, frames):
             "that would be useful to remember later. Do not guess."
         ),
     }]
-    # Bound prompt size independently from the live conversational frame limit.
-    budgeted, _ = fit_frames(
-        frames, token_budget=LIVE_FRAME_TOKEN_BUDGET, max_frames=MAX_FRAMES)
+    budgeted, _ = prepare_frames(frames)
     for frame in budgeted:
         content.append({
             "type": "image_url",
@@ -3728,6 +3779,7 @@ async def describe_mobile_frames(source, frames):
         model=vlm_model,
         messages=[{"role": "user", "content": content}],
         max_tokens=800,
+        **thinking_request_kwargs(source == "screen"),
     )
     return (response.choices[0].message.content or "").strip()
 
@@ -3782,6 +3834,7 @@ async def live_chat(request: Request):
     context = data.get("context") or "talker"
     live = data.get("live", False)
     memory = data.get("memory", False)
+    thinking = bool(data.get("thinking", context == "screen"))
     # A typed turn: same pipeline, minus ASR. Everything downstream (live
     # frames, memory tools, TTS) behaves exactly as it does for speech.
     typed_text = (data.get("text") or "").strip()
@@ -3800,6 +3853,7 @@ async def live_chat(request: Request):
         generate_response(
             wav_bytes_audio, wav_bytes_image, _chat_history,
             concise, context, live, memory, typed_text or None,
+            thinking,
         ),
         media_type="application/x-ndjson",
     )
@@ -3935,17 +3989,13 @@ def build_user_content(transcription, image_b64, context, live):
         except Exception as exc:
             info["warnings"].append(f"image decode failed: {exc}")
 
-    # Live stream frames (screen/camera), capped by vision-token budget.
+    # Live stream frames (screen/camera). The server owns visual preprocessing.
     if live:
         frames, source, warning = _frames_for_context(context)
         if warning:
             info["warnings"].append(warning)
         if frames:
-            # Budgeted by vision tokens, not frame count: at native capture
-            # resolution a single window of frames can exceed the whole context.
-            frames, frame_info = fit_frames(
-                frames, token_budget=LIVE_FRAME_TOKEN_BUDGET,
-                max_frames=MAX_FRAMES)
+            frames, frame_info = prepare_frames(frames)
             info["frame_detail"] = frame_info
             for index, img in enumerate(frames):
                 try:
@@ -3957,10 +4007,7 @@ def build_user_content(transcription, image_b64, context, live):
                     continue
                 user_content.append({
                     "type": "image_url",
-                    "image_url": {
-                        "max_dynamic_patch": 9,
-                        "url": f"data:image/jpeg;base64,{encoded}",
-                    },
+                    "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
                 })
         info["source"] = source
         info["frames"] = sum(
@@ -3987,6 +4034,7 @@ async def gather_tool_context(transcription):
         ],
         tools=tool_registry.openai_schemas,
         tool_choice="auto",
+        **thinking_request_kwargs(False),
     )
 
     tool_calls = response.choices[0].message.tool_calls or []
@@ -4052,7 +4100,8 @@ def build_messages(concise, memory_text, chat_history, user_content,
 
 # === RESPONSE GENERATION ===
 async def generate_response(wav_bytes_audio, wav_bytes_image, chat_history,
-                            concise, context, live, memory, typed_text=None):
+                            concise, context, live, memory, typed_text=None,
+                            thinking=True):
     """Handle an incoming turn (spoken or typed) and stream text + TTS as NDJSON."""
     turn_id = uuid.uuid4().hex[:8]
     t_turn = time.perf_counter()
@@ -4126,6 +4175,9 @@ async def generate_response(wav_bytes_audio, wav_bytes_image, chat_history,
     try:
         chat_response = await client.chat.completions.create(
             model=vlm_model, messages=messages, stream=True,
+            max_tokens=(env_int("THINKING_MAX_TOKENS", 18000)
+                        if thinking else env_int("CHAT_MAX_TOKENS", 2000)),
+            **thinking_request_kwargs(thinking),
         )
     except Exception as exc:
         logger.warning("[%s] VLM request failed: %s", turn_id, exc)

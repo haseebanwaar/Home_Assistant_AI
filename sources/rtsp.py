@@ -6,16 +6,17 @@ garbage, so they are applied before the first `cv2.VideoCapture` is built:
 `rtsp_transport;tcp` — RTSP defaults to UDP, where a lost packet costs the
 decoder a reference frame.
 
-`CAMERA_STREAM` — main (default) or sub. Measured on both cameras, the HEVC main
+`CAMERA_STREAM` — sub (default) or main. Measured on both cameras, the HEVC main
 stream (`subtype=0`) sustains only 6-7 fps of software decode against a ~15 fps
 source and emits a continuous run of `Could not find ref with POC` errors; the
 visible result is the flat grey and macroblock frames the VLM kept narrating
 ("the view transitions from a heavily pixelated, gray screen…"), with a peak
 frame-to-frame delta of 52-118 grey levels that no motion gate can distinguish
 from a real event. The substream (`subtype=1`) decodes at full rate with ZERO
-decoder errors and a peak delta of 3.0 — but it is not the default, because
-these are HD cameras and resolution is what they are for. Corruption that gets
-through is caught after extraction instead; see `sources.camera_validation`.
+decoder errors and a peak delta of 3.0, so it is the default. Set
+`CAMERA_STREAM=main` only when full resolution is explicitly preferred.
+Corruption that gets through is caught after extraction instead; see
+`sources.camera_validation`.
 
 `flat_frame_pct` in `status()` is how you tell a decode problem from a quiet
 scene without reading VLM summaries. It is measured over sampled frames (see
@@ -88,12 +89,10 @@ def _redact(url):
 def prefer_substream(url):
     """Rewrite an RTSP URL to the camera's substream (see module docstring).
 
-    Off by default: the substream decodes cleanly but costs resolution, and these
-    are HD cameras chosen for that resolution — dropping it to dodge a decode
-    problem would quietly degrade every extraction. `CAMERA_STREAM=sub` opts in
-    for a camera where picture quality matters less than a clean decode.
+    The substream is the default because it keeps continuous capture reliable.
+    `CAMERA_STREAM=main` opts out when full resolution is required.
     """
-    if os.getenv("CAMERA_STREAM", "main").strip().lower() != "sub":
+    if os.getenv("CAMERA_STREAM", "sub").strip().lower() != "sub":
         return url
     for pattern, replacement in _SUBSTREAM_REWRITES:
         new_url, count = pattern.subn(replacement, url or "", count=1)

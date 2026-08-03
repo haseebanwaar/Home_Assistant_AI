@@ -29,6 +29,7 @@ import numpy as np
 
 from sources.rtsp import RealtimeCameraStream
 from sources.video_writer import open_mp4_writer
+from sources.frame_budget import frames_as_image_parts
 from sources.motion_gate import MotionGate
 from sources.camera_validation import HEALTH, classify
 from sources.capture_settings import (
@@ -38,7 +39,7 @@ from sources.capture_settings import (
 from memory.models.extraction import ENTITY_TYPE_SUGGESTIONS
 from memory.extraction.validator import run_extraction
 from memory.pipeline import MemoryPipeline
-from providers.local_openAI import new_vlm_client
+from providers.local_openAI import new_vlm_client, thinking_request_kwargs
 
 logger = logging.getLogger("home_assistant")
 
@@ -96,7 +97,7 @@ class CameraCaptureWorker:
 
     def __init__(self, camera_id, name, rtsp_url, model_name_vlm,
                  neo4j_store=None, activity_logger=None,
-                 window_seconds=60, fps=1.0, notification_sink=None,
+                 window_seconds=120, fps=0.5, notification_sink=None,
                  insight_callback=None, clip_store=None):
         self.camera_id = camera_id
         self.name = name
@@ -290,12 +291,16 @@ class CameraCaptureWorker:
         self.last_processed_at = timestamp
 
     async def _extract(self, frames):
-        video_b64 = _encode_frames_to_mp4_base64(frames, fps=self.fps)
+        image_parts, frame_info = frames_as_image_parts(frames)
+        if not image_parts:
+            raise ValueError("could not prepare camera frames for inference")
         base_content = [
             {"type": "text", "text": _CAMERA_USER_PROMPT},
-            {"type": "video_url",
-             "video_url": {"url": f"data:video/mp4;base64,{video_b64}"}},
+            *image_parts,
         ]
+        logger.info("Camera %s inference using %d/%d temporal images at %sx%s",
+                    self.camera_id, frame_info["kept"], len(frames),
+                    frame_info["width"], frame_info["height"])
 
         async def generate(feedback):
             user_content = list(base_content)
@@ -306,7 +311,10 @@ class CameraCaptureWorker:
                 {"role": "user", "content": user_content},
             ]
             resp = await self._client.chat.completions.create(
-                model=self.model_name_vlm, messages=messages, max_tokens=self._max_tokens)
+                model=self.model_name_vlm, messages=messages,
+                max_tokens=self._max_tokens,
+                **thinking_request_kwargs(False),
+            )
             return resp.choices[0].dict()["message"]["content"]
 
         return await run_extraction(generate)
@@ -358,6 +366,7 @@ class CameraCaptureWorker:
             "last_motion": self.last_motion,
             "sample_fps": self.fps,
             "inference_interval_seconds": self.window_seconds,
+            "thinking": False,
             "expected_frames": expected_frame_count(
                 self.fps, self.window_seconds
             ),

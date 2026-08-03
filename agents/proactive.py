@@ -166,6 +166,7 @@ class ProactiveNarrator:
                 max_tokens=180,
                 temperature=0.8,
                 top_p=0.95,
+                **thinking_request_kwargs(False),
             )
             text = (response.choices[0].message.content or "").strip()
 
@@ -243,6 +244,7 @@ class ProactiveNarrator:
             max_tokens=180,
             temperature=0.9,
             top_p=0.95,
+            **thinking_request_kwargs(False),
         )
         return (response.choices[0].message.content or "").strip()
 
@@ -497,3 +499,4 @@ class ProactiveNarrator:
             "moment. If you speak, lead with specific substance and use linked memory "
             "to advance the thought rather than narrating what is visible.")
         return "\n".join(parts)
+from providers.local_openAI import thinking_request_kwargs

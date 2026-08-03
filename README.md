@@ -14,8 +14,8 @@
 
 ### 🧠 The Core Engine
 At the heart of the system is the **Core Vision-Language Model (VLM)** for perception and reasoning.
-- **Model:** Qwen3-VL 8B
-- **Hosting:** Local `vLLM` instance.
+- **Model:** Qwen3.6 35B-A3B with vision projection
+- **Hosting:** Local `llama.cpp` server on port 8888.
 - **Performance:** Thanks to 3D pooling, it processes **1 minute of video in just 10 seconds** on an RTX 3090.
 - **Features:** Leverages an unusually large context window and robust community support.
 
@@ -273,6 +273,6 @@ $env:MCP_LIVE_TEST=1; python -m pytest tests/test_mcp_config.py
 
 | Component | Technology | Speed/Capability |
 | :--- | :--- | :--- |
-| **VLM Engine** | Qwen3-VL 8B (vLLM) | 1 min video → 10s processing (RTX 3090) |
+| **VLM Engine** | Qwen3.6 35B-A3B (llama.cpp) | 2 min temporal image sequence per inference |
 | **ASR** | Parakeet / Whisper | Ultra-low latency / Multilingual |
 | **Memory** | Vector Store + Reranker | Full-day context retention |
