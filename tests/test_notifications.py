@@ -69,3 +69,20 @@ def test_notifications_can_be_marked_read(tmp_path):
     center.mark_read(alert["id"])
 
     assert center.list()["unread_count"] == 0
+
+
+def test_explicit_task_notification_keeps_speech_and_action_metadata(tmp_path):
+    center = NotificationCenter(path=str(tmp_path / "notifications.json"))
+    item = center.publish(
+        "Task overdue · reminder 1/3",
+        "Submit chapter was due. Reply with a reason or reschedule it.",
+        category="task_deadline", room_id="agent:tomorrow-planner",
+        speak=True, metadata={"task_id": "task-1", "action": "delay_response"},
+        timestamp=1000,
+    )
+
+    restored = NotificationCenter(
+        path=str(tmp_path / "notifications.json")).list()["notifications"][0]
+    assert item["speak"] is True
+    assert restored["metadata"]["task_id"] == "task-1"
+    assert restored["category"] == "task_deadline"

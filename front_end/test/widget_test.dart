@@ -52,4 +52,32 @@ void main() {
     expect(challengeAction, findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  // The phone home screen used to fit everything on screen by squeezing it,
+  // which clipped content outright once the screen was short — a landscape
+  // phone, or a portrait one with the keyboard up. It scrolls now, so no size
+  // may produce an overflow.
+  const crampedSizes = <String, Size>{
+    'small phone': Size(320, 568),
+    'common phone': Size(360, 640),
+    'landscape phone': Size(844, 390),
+    'keyboard open': Size(390, 420),
+  };
+  crampedSizes.forEach((label, size) {
+    testWidgets('mobile home and drawer fit on a $label', (
+      WidgetTester tester,
+    ) async {
+      final errors = <Object>[];
+      final previous = FlutterError.onError;
+      FlutterError.onError = (details) => errors.add(details.exception);
+      addTearDown(() => FlutterError.onError = previous);
+
+      await pumpAt(tester, size);
+      expect(errors, isEmpty, reason: '$label home');
+
+      await tester.tap(find.byIcon(Icons.menu_rounded));
+      await tester.pumpAndSettle();
+      expect(errors, isEmpty, reason: '$label drawer');
+    });
+  });
 }

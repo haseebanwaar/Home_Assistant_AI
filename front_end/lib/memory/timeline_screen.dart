@@ -887,6 +887,9 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
                 final fact = (raw as Map).cast<String, dynamic>();
                 final confidence =
                     (fact['confidence'] as num?)?.toDouble() ?? 0;
+                // A belief you confirmed in a reflection answer is settled;
+                // everything else is still the assistant's own reading.
+                final confirmed = fact['verified_at'] != null;
                 return Card(
                   color: _panel,
                   child: ListTile(
@@ -897,13 +900,29 @@ class _MemoryTimelineScreenState extends State<MemoryTimelineScreen>
                         style: const TextStyle(color: _mint, fontSize: 11),
                       ),
                     ),
-                    title: Text(
-                      '${fact['name']}: ${fact['value']}',
-                      style: const TextStyle(color: Colors.white),
+                    title: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            '${fact['name']}: ${fact['value']}',
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                        ),
+                        if (confirmed)
+                          const Padding(
+                            padding: EdgeInsets.only(left: 8),
+                            child: Icon(
+                              Icons.verified_outlined,
+                              size: 16,
+                              color: _mint,
+                            ),
+                          ),
+                      ],
                     ),
                     subtitle: Text(
                       '${fact['category']} · ${fact['source']} · '
-                      '${fact['evidence_count']} evidence',
+                      '${fact['evidence_count']} evidence · '
+                      '${confirmed ? 'confirmed by you' : 'not yet confirmed'}',
                       style: const TextStyle(color: _muted),
                     ),
                     trailing: IconButton(

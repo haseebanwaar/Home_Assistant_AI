@@ -20,6 +20,7 @@ import pydub
 import soundfile as sf
 import uvicorn
 from PIL import Image
+from pydantic import ValidationError
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from qdrant_client import QdrantClient
@@ -37,6 +38,7 @@ from vector_store.activity_logger import ActivityLogger
 from sources.screen import RealtimeScreenCapture
 from sources.idle import PresenceGate
 from sources.camera_manager import CameraManager
+from sources.camera_state import CameraStateStore
 from sources.clips import ClipStore, parse_range, valid_clip_id
 from sources.frame_budget import prepare_frames, frames_as_image_parts
 from sources.capture_settings import (
@@ -45,41 +47,116 @@ from sources.capture_settings import (
 )
 from vector_store.rag.activity_retriever import ActivityRetriever
 from memory.retrieval.evidence import EvidenceRetriever
+from memory.retrieval.grounding import (
+    format_evidence_line,
+    temporal_window,
+)
 from tools.registry import ToolRegistry, register_default_tools
 from agents.proactive import ProactiveNarrator
-from agents.personal_agents import AGENTS as PERSONAL_AGENTS, get_agent
+from agents.personal_agents import (
+    AGENTS as PERSONAL_AGENTS,
+    CREATIVE_COACH_ROOM_ID,
+    get_agent,
+)
 from agents.agent_runtime import AgentRuntime, AgentRuntimeUnavailable
+from agents.daily_reflection import (
+    DailyReflectionStore,
+    REFLECTION_SYSTEM_PROMPT,
+    reflection_context,
+)
 from agents.conversation_manager import ConversationManager
+from agents.calorie_estimator import (
+    CalorieEstimateStore,
+    estimate_missing as estimate_missing_calories,
+    explicit_calories,
+    normalize_food_text,
+)
 from agents.graph_tools import graph_toolset_factory
+from agents.horizons import (
+    HORIZON_LABELS,
+    HORIZONS,
+    HORIZON_SYSTEM_PROMPT,
+    HorizonStore,
+    PREDICTION_GRADING_PROMPT,
+    closed_key as horizon_closed_key,
+    due_horizons,
+    format_grades as format_horizon_grades,
+    format_review as format_horizon_review,
+    grading_context as horizon_grading_context,
+    horizon_context,
+    period_bounds as horizon_bounds,
+    period_key as horizon_period_key,
+)
 from agents.orchestrator import (
     DailyAt,
     DeliveryBudget,
     Interval,
     JobResult,
+    JobStateStore,
     Orchestrator,
+    WeeklyAt,
     parse_daily,
+    parse_weekly,
 )
-from agents.schemas import PlanEvaluation, PlanProposal
+from agents.product_review import (
+    PRODUCT_REVIEW_SYSTEM_PROMPT,
+    ProductReviewStore,
+    format_review,
+    review_context,
+    week_bounds,
+)
+from agents.quran_study import (
+    QURAN_STUDY_SYSTEM_PROMPT,
+    QuranStudyStore,
+    SURAHS as QURAN_SURAHS,
+    study_context as quran_study_context,
+    validate_passage as validate_quran_passage,
+)
+from agents.calendar import (
+    EXPECTATIONS as CALENDAR_EXPECTATIONS,
+    REPEATS as CALENDAR_REPEATS,
+    CalendarStore,
+)
+from agents.room_canvas_store import RoomCanvasStore
+from agents.room_pacing import AgentPacingError, RoomAgentPacer
+from agents.satisfaction import (
+    SATISFACTION_MAX,
+    SATISFACTION_MIN,
+    activity_satisfaction,
+    clamp_satisfaction,
+)
+from agents.schemas import (ActivityReport, DailyReflectionQuestions,
+                            HorizonReview, PlanProposal,
+                            PredictionGrades, QuranStudyGuide,
+                            SatisfactionScores, WeeklyProductReview)
 from agents.tomorrow_planner import (
+    STALE_AFTER_DAYS as TOMORROW_STALE_AFTER_DAYS,
     TomorrowPlanStore,
     lock_at as tomorrow_plan_lock_at,
-    plan_phase as tomorrow_plan_phase,
 )
+from utils.jobs import jobs as job_board
+from utils.maintenance import maintenance_window_active
 from memory.consolidation import Consolidator, DAY as ROLLUP_DAY, rollup_line
+from memory.refinement import MemoryRefiner
 from memory.notifications import NotificationCenter
 from memory.personal import PersonalMemory, learn_from_user_message
+from memory.verification import ReflectionMemoryAuditor
 from memory.rooms.scope import RoomScopeError, resolve_camera_scope
 from memory.summary.reports import (
     PERIOD_DAYS,
     PRODUCTIVITY_DOMAIN,
+    REPORT_HISTORY_DAYS,
     BaselineError,
     PeriodError,
     compare as compare_periods,
     date_range,
+    history_window,
+    hour_histogram,
     period_window,
     pivot_series,
     previous_window,
     resolve_baseline,
+    score_series,
     series_activities,
 )
 
@@ -162,6 +239,69 @@ agent_runtime = AgentRuntime(
 )
 conversation_manager = ConversationManager(
     client=client, model_name=lambda: vlm_model, agent_runtime=agent_runtime)
+#: Automatic (unprompted) agent runs are spaced per room. Plan generation,
+#: evaluation and satisfaction scoring all compete for the same room, and each
+#: one is a full high-effort Claude run.
+agent_pacer = RoomAgentPacer()
+
+
+async def _intelligent_complete(effort="high", **kwargs):
+    """Run analysis/generation with the full Claude reasoning profile.
+
+    Adaptive thinking with no explicit token ceiling is the SDK's supported
+    equivalent of an unlimited thinking budget. Per-run turn/tool safety
+    limits remain in force to stop runaway jobs.
+
+    `effort` defaults to high, which is right for the many short generations
+    that call this. The few jobs that are worth more than that — the written
+    activity report, which reads a fortnight of its own history before it says
+    anything — raise it explicitly.
+    """
+    kwargs.update({
+        "allow_agent": True,
+        "require_agent": True,
+        "use_all_tools": True,
+        "thinking": True,
+        "thinking_budget": None,
+        "effort": effort,
+    })
+    return await conversation_manager.complete(**kwargs)
+
+
+async def _creative_coach_report_complete(prompt, *, max_tokens,
+                                          output_type=str, effort="high"):
+    """Write activity reports as the persistent Creative Coach agent.
+
+    A report is not a separate ``daily`` agent.  Keeping the room ID, stored
+    room configuration, workspace, tools, and role prompt together here makes
+    the short Coach note and the scored narrative two outputs of the same
+    Claude agent.
+    """
+    neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
+    room = neo4j_store.get_room(CREATIVE_COACH_ROOM_ID) or {}
+    built_in = get_agent(CREATIVE_COACH_ROOM_ID)
+    name = room.get("name") or (built_in.name if built_in else "Creative Coach")
+    instructions = (
+        room.get("instructions")
+        or (built_in.instructions if built_in else "Write an evidence-grounded report.")
+    )
+    return await _intelligent_complete(
+        effort=effort,
+        room_id=CREATIVE_COACH_ROOM_ID,
+        room=room,
+        messages=[
+            {"role": "system", "content": (
+                f"You are {name}, the user's persistent personal agent. "
+                "Write this report in that same role and keep its evidence and "
+                "safety boundaries.\n\nYour role:\n" + instructions
+            )},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=max_tokens,
+        output_type=output_type,
+    )
+
+
 screen_stream = None
 camera_manager = None
 camera_bootstrap_task = None
@@ -178,13 +318,41 @@ delivery_budget = DeliveryBudget(
 )
 # The single scheduler behind every agent. Jobs are registered during startup;
 # `orchestrator_task` drives the one loop that replaced the per-agent sleepers.
+# Run history is durable, so a PC that was off through the 04:00 maintenance
+# hour catches its jobs up on the first tick after it comes back instead of
+# waiting another day.
 orchestrator = Orchestrator(
-    store_getter=lambda: neo4j_store, budget=delivery_budget)
+    store_getter=lambda: neo4j_store, budget=delivery_budget,
+    state_store=JobStateStore(
+        os.getenv("AGENT_JOB_STATE_PATH", "data/agent_jobs.json")),
+    reserved_start=env_int("MAINTENANCE_WINDOW_START_HOUR", 4, minimum=0),
+    reserved_end=env_int("MAINTENANCE_WINDOW_END_HOUR", 5, minimum=1))
 orchestrator_task = None
 memory_pipeline = None   # Step-a: live sessions/events/knowledge pipeline
 neo4j_store = None       # optional graph sink for the live pipeline
 personal_memory = PersonalMemory(
     os.getenv("PERSONAL_MEMORY_PATH", "data/personal_memory.sqlite3"))
+daily_reflections = DailyReflectionStore(
+    os.getenv("DAILY_REFLECTION_PATH", "data/daily_reflections.sqlite3"))
+# The weekly pass that reads those answers as feedback about this application.
+product_reviews = ProductReviewStore(
+    os.getenv("PRODUCT_REVIEW_PATH", "data/product_reviews.sqlite3"))
+# The long instrument: week/month/quarter/half/year/lifelong reflection, the
+# forecasts each one makes, and the threads they track across periods.
+horizon_reviews = HorizonStore(
+    os.getenv("HORIZONS_PATH", "data/horizons.sqlite3"))
+# Quran Room: every passage report it writes, and the one vocabulary deck those
+# reports feed. The recall marks on that deck are the user's, not the model's.
+quran_study = QuranStudyStore(
+    os.getenv("QURAN_STUDY_PATH", "data/quran_study.sqlite3"))
+room_canvas_store = RoomCanvasStore(
+    os.getenv("ROOM_CANVAS_PATH", "data/room_canvases.json"))
+# The only record of what he *meant* to be doing. Every other store holds
+# evidence of what happened; without this one a sick week and an avoidant week
+# are indistinguishable to the rooms that judge them. See agents/calendar.py.
+calendar_store = CalendarStore(os.getenv("CALENDAR_PATH", "data/calendar.json"))
+calorie_estimate_store = CalorieEstimateStore(
+    os.getenv("CALORIE_ESTIMATES_PATH", "data/calorie_estimates.json"))
 _personal_learning_tasks = set()
 _proactive_insights = deque(maxlen=20)
 _proactive_seq = 0
@@ -193,17 +361,28 @@ notification_center = NotificationCenter(
     important_cooldown_seconds=env_int(
         "NOTIFICATION_COOLDOWN_SECONDS", 600, minimum=0),
 )
-# Every stored capture window writes a low-res clip; retention (below) keeps only
-# the ones something referenced. See sources/clips.py.
+# Every stored capture window writes a low-res clip. Time-based retention keeps
+# both ordinary and referenced evidence for 30 days; the daily size-cap pass can
+# still evict oldest unpinned clips first. See sources/clips.py.
 clip_store = ClipStore(
     base_dir=os.getenv("CLIP_STORE_PATH", "data/clips"),
     max_width=env_int("CLIP_MAX_WIDTH", 960, minimum=64),
     playback_fps=env_float("CLIP_PLAYBACK_FPS", 8.0),
-    retention_minutes=env_int("CLIP_RETENTION_MINUTES", 120, minimum=0),
-    pinned_retention_days=env_int("CLIP_PINNED_RETENTION_DAYS", 7, minimum=0),
+    retention_minutes=env_int("CLIP_RETENTION_MINUTES", 30 * 24 * 60, minimum=0),
+    pinned_retention_days=env_int("CLIP_PINNED_RETENTION_DAYS", 30, minimum=0),
     max_total_mb=env_int("CLIP_MAX_TOTAL_MB", 2048, minimum=0),
     crf=env_int("CLIP_CRF", 23, minimum=0),
     enabled=env_bool("CLIP_CAPTURE_ENABLED", True),
+)
+# What each camera believes is standing true of its scene, and for how long, so
+# consecutive clips read as one continuous account instead of restating the view
+# every two minutes. See sources/camera_state.py.
+camera_state_store = CameraStateStore(
+    path=os.getenv("CAMERA_STATE_PATH", "data/camera_state.sqlite3"),
+    stale_after_seconds=env_int("CAMERA_STATE_STALE_HOURS", 6, minimum=1) * 3600,
+    max_slots=env_int("CAMERA_STATE_MAX_SLOTS", 60, minimum=4),
+    history_days=env_int("CAMERA_STATE_HISTORY_DAYS", 90, minimum=1),
+    enabled=env_bool("CAMERA_STATE_ENABLED", True),
 )
 
 
@@ -379,31 +558,40 @@ async def startup_event():
     if env_bool("PROACTIVE_ENABLED", True):
         proactive = ProactiveNarrator(
             vlm_model, client,
-            cooldown_seconds=env_int("PROACTIVE_COOLDOWN_SECONDS", 120),
-            focus_cooldown_seconds=env_int("PROACTIVE_FOCUS_COOLDOWN_SECONDS", 60),
+            cooldown_seconds=env_int("PROACTIVE_COOLDOWN_SECONDS", 300),
+            focus_cooldown_seconds=env_int("PROACTIVE_FOCUS_COOLDOWN_SECONDS", 300),
+            evaluation_interval_seconds=env_int(
+                "PROACTIVE_INTERVAL_SECONDS", 300, minimum=60),
             retriever=evidence_retriever,
             # Lazy — the graph is connected further down in this same startup.
             store_getter=lambda: neo4j_store,
             personal_memory=personal_memory,
+            # So an unprompted remark can build on what he already wrote about
+            # himself instead of announcing it back to him.
+            reflections=daily_reflections,
+            agent_runtime=agent_runtime,
             # Paced against the scheduled agents, not just against itself.
             delivery_budget=delivery_budget,
         )
         insight_callback = handle_screen_description
-        logger.info("Proactive narrator enabled (cooldown=%ds).", proactive.cooldown_seconds)
+        logger.info(
+            "Proactive Claude insight agent enabled (evaluation=%ds, cooldown=%ds).",
+            proactive.evaluation_interval_seconds, proactive.cooldown_seconds)
     else:
         logger.info("Proactive narrator disabled.")
 
     # Presence, shared by the capture loop (which stops capturing when nobody is
     # there) and the timeline (which stops crediting time). Keyboard/mouse is the
-    # primary signal; a repainting screen covers watching, which has no input.
+    # requirement; watching-as-presence is opt-in (PLAYBACK_MAX_MINUTES).
     # INPUT_IDLE_TIMEOUT_SECONDS=0 opts out of both.
     screen_presence_gate = PresenceGate()
-    logger.info("Presence: input cut-off %s, watching allowed while >%.1f%% of "
-                "the screen repaints, for up to %.0f min without input.",
+    logger.info("Presence: keyboard/mouse required within %s; watching-as-presence %s.",
                 f"{screen_presence_gate.input.timeout_seconds:.0f}s"
-                if screen_presence_gate.input.enabled else "disabled",
-                screen_presence_gate.change_fraction * 100.0,
-                screen_presence_gate.max_playback_minutes)
+                if screen_presence_gate.input.enabled else "(cut-off disabled)",
+                f">{screen_presence_gate.change_fraction * 100:.1f}% of the screen "
+                f"repainting, up to {screen_presence_gate.max_playback_minutes:.0f} "
+                f"min without input"
+                if screen_presence_gate.playback_enabled else "off — input is a must")
 
     # Step-a: optional live memory pipeline (sessions/events/knowledge + stores).
     # Fully opt-in — unset LIVE_MEMORY leaves the legacy per-minute path unchanged.
@@ -460,6 +648,17 @@ async def startup_event():
         register_graph_tools(tool_registry, lambda: neo4j_store)
         logger.info("Registered graph memory tools: %s", tool_registry.names)
 
+    # "Has anyone driven the orange car today?" cannot be answered by searching
+    # clip descriptions — every clip said the same thing. It is answered from
+    # how long the car has been parked and what usually happens to it by now.
+    if env_bool("CAMERA_STATE_ENABLED", True):
+        from tools.camera_state_tools import register_camera_state_tools
+        register_camera_state_tools(
+            tool_registry, lambda: camera_state_store,
+            lambda: [(worker.camera_id, worker.name)
+                     for worker in (camera_manager.workers.values()
+                                    if camera_manager is not None else [])])
+
     if env_bool("SCREEN_CAPTURE_ENABLED", True):
         screen_stream = RealtimeScreenCapture(
             video_source="",
@@ -492,6 +691,7 @@ async def startup_event():
             insight_callback=handle_observation_description if proactive is not None else None,
             clip_store=clip_store,
             profile_store=source_capture_settings,
+            state_store=camera_state_store,
         )
         camera_bootstrap_task = asyncio.create_task(
             asyncio.to_thread(camera_manager.discover_and_start))
@@ -517,13 +717,87 @@ async def startup_event():
 # them may speak, and `/orchestrator/status` reports what each has done.
 
 def register_agent_jobs():
-    """Register every scheduled agent. Called once, after the graph connects."""
+    """Register every scheduled agent. Called once, after the graph connects.
+
+    The maintenance jobs below run inside the 04:00 window on a machine that is
+    on overnight. On one that is not, they keep `catch_up_seconds=None`: the
+    missed slot is still worth running whenever the PC comes back, so they fire
+    on the first tick after startup instead of losing the night. Jobs whose
+    output is pinned to the wall clock (the nightly report, the morning
+    check-ins) bound their catch-up instead — see `MAINTENANCE_RETRIES`.
+    """
+    retries = env_int("MAINTENANCE_RETRIES", 3, minimum=0)
+    retry_delay = env_int("MAINTENANCE_RETRY_SECONDS", 900, minimum=60)
+
     if clip_store.enabled:
         orchestrator.add(
             "clip-retention", "Clip retention", _job_clip_retention,
-            Interval(env_int("CLIP_PRUNE_INTERVAL_SECONDS", 900, minimum=30)),
-            priority=90,
-            description="Expire clips nothing referenced.")
+            parse_daily(os.getenv("CLIP_PRUNE_AT"), DailyAt(4, 45)),
+            priority=90, reserved_window=True,
+            max_retries=retries, retry_delay_seconds=retry_delay,
+            description="Daily 30-day clip expiry and storage-cap cleanup.")
+
+    # These two jobs use durable SQLite/canvas state and remain useful even if
+    # Neo4j is temporarily unavailable. Graph evidence is optional enrichment.
+    if env_bool("MEMORY_REFINEMENT_ENABLED", True):
+        orchestrator.add(
+            "memory-refinement", "Personal memory refinement",
+            _job_refine_memory,
+            parse_daily(os.getenv("MEMORY_REFINEMENT_AT"), DailyAt(4, 0)),
+            priority=70, timeout_seconds=900, reserved_window=True,
+            max_retries=retries, retry_delay_seconds=retry_delay,
+            description="Merge safe near-duplicate personal facts and preserve evidence.")
+
+    if env_bool("REFLECTION_MEMORY_AUDIT_ENABLED", True):
+        # Runs before the new question set is written: memory is repaired from
+        # yesterday's answers first, so today's questions can go after what is
+        # still unconfirmed instead of re-asking what was just settled.
+        orchestrator.add(
+            "reflection-memory-audit", "Reflection memory audit",
+            _job_reflection_memory_audit,
+            parse_daily(os.getenv("REFLECTION_MEMORY_AUDIT_AT"), DailyAt(4, 10)),
+            priority=76, timeout_seconds=1800, reserved_window=True,
+            max_retries=retries, retry_delay_seconds=retry_delay,
+            description="Verify and correct personal memory against the user's "
+                        "own reflection answers.")
+
+    if env_bool("DAILY_REFLECTION_ENABLED", True):
+        orchestrator.add(
+            "daily-reflection", "Daily reflection questions",
+            _job_daily_reflection,
+            parse_daily(os.getenv("DAILY_REFLECTION_AT"), DailyAt(4, 25)),
+            priority=75, timeout_seconds=1800, reserved_window=True,
+            max_retries=retries, retry_delay_seconds=retry_delay,
+            description="Think deeply and prepare 20 personalized questions for today.")
+
+    if env_bool("PRODUCT_REVIEW_ENABLED", True):
+        # Monday morning, about the week that just finished. Outside the
+        # maintenance window on purpose: it is something to read with coffee,
+        # and it speaks, so it claims a delivery slot like any other report.
+        orchestrator.add(
+            "weekly-product-review", "Weekly review of your answers",
+            _job_weekly_product_review,
+            parse_weekly(os.getenv("PRODUCT_REVIEW_AT"), WeeklyAt(0, 7, 0)),
+            priority=40, speaks=True, timeout_seconds=1800,
+            max_retries=retries, retry_delay_seconds=retry_delay,
+            description="Read the week's reflection answers as feedback about "
+                        "this app and suggest concrete improvements.")
+
+    if env_bool("HORIZONS_ENABLED", True):
+        # Daily, but almost always a no-op: it writes only the windows that have
+        # actually closed. A daily tick is what makes it self-healing — a month
+        # boundary missed while the PC was off is picked up the next morning,
+        # and the grading pass runs every day whether or not a window closed.
+        # Deliberately after the 04:00-05:00 maintenance window so the night's
+        # consolidation rollups are already in the graph to read.
+        orchestrator.add(
+            "horizon-reviews", "Horizons review", _job_horizon_reviews,
+            parse_daily(os.getenv("HORIZONS_AT"), DailyAt(7, 30)),
+            priority=45, speaks=True, timeout_seconds=3600,
+            max_retries=retries, retry_delay_seconds=retry_delay,
+            description="Grade forecasts that came due, then reflect on and "
+                        "forecast any week, month, quarter, half-year, year or "
+                        "lifelong window that has closed.")
 
     if neo4j_store is None:
         logger.info("Graph disabled: only maintenance jobs are scheduled.")
@@ -535,7 +809,13 @@ def register_agent_jobs():
             DailyAt(env_int("DAILY_REPORT_HOUR", 23, minimum=0),
                     env_int("DAILY_REPORT_MINUTE", 30, minimum=0)),
             priority=20, speaks=True, needs_activity=True,
-            description="Coach's review of the day, stored on the day rollup.")
+            # The report always covers *today*, so a slot missed overnight must
+            # not be caught up the next afternoon: it would review the wrong
+            # day. A short bound still recovers a boot minutes after 23:30.
+            catch_up_seconds=env_int(
+                "DAILY_REPORT_CATCH_UP_SECONDS", 3600, minimum=0),
+            description="Coach's review of the day, stored on the day rollup, "
+                        "then the day's written report and its scores.")
 
     if env_bool("TOMORROW_PLANNER_ENABLED", True):
         # The planner both proposes and tracks, so it runs on a short interval
@@ -543,19 +823,32 @@ def register_agent_jobs():
         # (23:00 proposal, 10:30 lock) are finer than a single daily slot.
         #
         # Deliberately not budgeted: it writes a running log into its own room
-        # rather than addressing the user, and a per-minute job that claimed a
+        # rather than addressing the user, and an interval job that claimed a
         # delivery slot on every tick would starve the ones that do. Holding up
         # plan tracking because another agent just spoke would also be wrong.
         orchestrator.add(
             "tomorrow-planner", "Tomorrow planner", _job_tomorrow_planner,
-            Interval(600), priority=30,
+            Interval(env_int(
+                "TOMORROW_PLANNER_INTERVAL_SECONDS", 900, minimum=300)),
+            priority=30,
             description="Propose tomorrow's plan, then track it against activity.")
+        orchestrator.add(
+            "task-deadline-reminders", "Task deadline reminders",
+            _job_task_deadline_reminders,
+            Interval(env_int(
+                "TASK_REMINDER_CHECK_SECONDS", 30, minimum=15), run_at_start=True),
+            # The task's own repeat/delay settings are its delivery budget.
+            # Claiming the global speaker budget on empty 30-second checks would
+            # both starve other agents and make user-selected delays inaccurate.
+            priority=25, speaks=False,
+            description="Notify and speak when manually configured task deadlines pass.")
 
     if env_bool("MEMORY_CONSOLIDATION_ENABLED", True):
         orchestrator.add(
             "memory-consolidation", "Memory consolidation", _job_consolidate,
-            parse_daily(os.getenv("MEMORY_CONSOLIDATION_AT"), DailyAt(3, 15)),
-            priority=80, timeout_seconds=900,
+            parse_daily(os.getenv("MEMORY_CONSOLIDATION_AT"), DailyAt(4, 5)),
+            priority=80, timeout_seconds=900, reserved_window=True,
+            max_retries=retries, retry_delay_seconds=retry_delay,
             description="Roll days into week/month summaries, then decay noise.")
 
     if not env_bool("AGENT_CHECKINS_ENABLED", True):
@@ -571,6 +864,11 @@ def register_agent_jobs():
             _agent_check_in_job(agent), schedule,
             priority=50, speaks=True, needs_activity=True,
             timeout_seconds=env_int("AGENT_CHECKIN_TIMEOUT_SECONDS", 240),
+            # A morning check-in reports the day that just ended, so it stays
+            # correct if the PC boots late and it runs hours after its slot —
+            # but not so late that it lands on the following day.
+            catch_up_seconds=env_int(
+                "AGENT_CHECKIN_CATCH_UP_SECONDS", 6 * 3600, minimum=0),
             description=f"Unprompted review in the {agent.name} room.")
 
 
@@ -586,45 +884,114 @@ def _checkin_overrides():
 
 async def _job_clip_retention(ctx):
     await asyncio.to_thread(clip_store.prune)
-    return JobResult(detail="pruned")
+    # Camera state history rides along on the same nightly pass: it is the same
+    # question (how far back is this evidence still worth keeping) and the
+    # transition rows are what the clips are evidence *for*.
+    pruned = await asyncio.to_thread(camera_state_store.prune)
+    return JobResult(detail=f"pruned; camera state {pruned}")
 
 
 async def _job_daily_report(ctx):
-    """The Coach's nightly review — posted to the room and kept in the graph."""
+    """The Coach's nightly review — posted to the room and kept in the graph.
+
+    Then the day's written report, which is a different thing: the Coach speaks
+    to him, the written report judges the day and scores it. It runs nightly
+    rather than only when he opens the Reports view, because the scores are only
+    worth anything as an unbroken series — a fortnight with three days in it is
+    a fortnight the next report cannot calibrate against.
+    """
     result = await daily_report(date=ctx.today, post=True)
     if isinstance(result, JSONResponse):
         raise RuntimeError("daily report unavailable")
+
+    written = ""
+    if env_bool("DAILY_REPORT_WRITE_UP", True) and result.get("metrics", {}).get("events"):
+        try:
+            report = await report_activity(period="daily", date=ctx.today,
+                                           narrate=True)
+            narrative = (report or {}).get("narrative") if isinstance(report, dict) else None
+            if narrative:
+                written = f" scored={narrative.get('overall_score')}"
+            elif isinstance(report, dict) and report.get("narrative_error"):
+                written = " write-up failed"
+        except Exception as exc:
+            # The Coach's note is already posted; a failed write-up must not
+            # mark the whole nightly job as failed.
+            logger.warning("Nightly write-up for %s failed: %s", ctx.today, exc)
+            written = " write-up failed"
+
     return JobResult(
-        detail=f"{result.get('date')} posted={result.get('posted')}",
+        detail=f"{result.get('date')} posted={result.get('posted')}{written}",
         delivered=bool(result.get("posted")))
 
 
 async def _job_tomorrow_planner(ctx):
-    """One pass of the plan lifecycle: propose at 23:00, lock and track at 10:30."""
+    """One pass of the plan lifecycle: propose at 23:00, lock the draft at 10:30.
+
+    There is deliberately no completion check here. Nothing in this system may
+    decide that a task was done — only the user ticks a task off or deletes it,
+    so the job's whole remaining job is to propose and to stop editing.
+    """
     now = datetime.datetime.fromtimestamp(ctx.now)
     actions = []
     if now.hour >= 23:
         target = (now.date() + datetime.timedelta(days=1)).isoformat()
         if tomorrow_plan_store.get(target) is None:
-            await generate_tomorrow_plan(target)
-            actions.append(f"proposed {target}")
+            try:
+                await generate_tomorrow_plan(target)
+                actions.append(f"proposed {target}")
+            except AgentPacingError as exc:
+                actions.append(f"proposal deferred ({exc.seconds_remaining}s)")
 
     today = now.date().isoformat()
     plan = tomorrow_plan_store.get(today)
-    if plan and now >= tomorrow_plan_lock_at(today):
-        if not plan.get("finalized_at"):
-            plan = tomorrow_plan_store.finalize(today)
-            neo4j_store.add_message(
-                PLANNER_ROOM, "planner",
-                "The plan is now final. Tracking has started; tasks can be "
-                "checked manually or completed from activity evidence.")
-            actions.append("finalized")
-        evaluation_seconds = env_int(
-            "TOMORROW_PLAN_EVALUATION_SECONDS", 1800, minimum=300)
-        if time.time() - float(plan.get("last_evaluated_at") or 0) >= evaluation_seconds:
-            await evaluate_tomorrow_plan(today)
-            actions.append("evaluated")
+    if plan and now >= tomorrow_plan_lock_at(today) and not plan.get("finalized_at"):
+        tomorrow_plan_store.finalize(today)
+        neo4j_store.add_message(
+            PLANNER_ROOM, "planner",
+            "The plan is now final. Tasks stay on the list until you tick "
+            "them off or delete them.")
+        actions.append("finalized")
     return JobResult(detail=", ".join(actions) if actions else "nothing due")
+
+
+async def _job_task_deadline_reminders(ctx):
+    """Claim persistent reminders and expose each miss to accountability agents."""
+    now = datetime.datetime.fromtimestamp(ctx.now)
+    due = await asyncio.to_thread(tomorrow_plan_store.claim_due_reminders, now)
+    if not due:
+        return JobResult(detail="nothing due")
+    if neo4j_store is not None:
+        neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
+    for item in due:
+        task = item["task"]
+        number = item["reminder_number"]
+        total = task.get("reminder_repeats") or 0
+        days_open = task.get("days_open") or 0
+        body = (
+            f"{task['title']} was due at {task.get('deadline')}"
+            + (f" and has been open {days_open} day(s)" if days_open else "")
+            + ". Reply in Tomorrow with the reason for the delay, tick it off, "
+            "or choose a new deadline. It stays on the list until you do."
+        )
+        notification_center.publish(
+            f"Task overdue · reminder {number}/{total}", body,
+            category="task_deadline", source="tomorrow-planner",
+            room_id=PLANNER_ROOM, speak=True, timestamp=ctx.now,
+            metadata={"date": item["date"], "task_id": task["id"],
+                      "action": "delay_response"},
+        )
+        if neo4j_store is not None:
+            audit = (
+                f"OVERDUE TASK ({number}/{total}): {task['title']} was due "
+                f"{task.get('deadline')} and has been open {days_open} day(s) "
+                f"since {task.get('first_planned_on') or item['date']}. "
+                "Awaiting the user's reason, his own completion, or a new "
+                "deadline. Nobody else can close it."
+            )
+            for room_id in (PLANNER_ROOM, "agent:roaster", "agent:creative-coach"):
+                neo4j_store.add_message(room_id, "planner", audit, ts=ctx.now)
+    return JobResult(detail=f"sent {len(due)} reminder(s)", delivered=True)
 
 
 async def _job_consolidate(ctx):
@@ -637,6 +1004,470 @@ async def _job_consolidate(ctx):
                  - datetime.timedelta(days=1)).isoformat()
     result = await asyncio.to_thread(_consolidator().run, yesterday)
     return JobResult(detail=f"{yesterday}: {result.get('decay')}", data=result)
+
+
+async def _job_refine_memory(ctx):
+    result = await asyncio.to_thread(
+        MemoryRefiner(
+            personal_memory,
+            threshold=env_float("MEMORY_DUPLICATE_THRESHOLD", 0.88),
+        ).run)
+    return JobResult(
+        detail=f"merged {result['merged_count']} duplicate fact(s)", data=result)
+
+
+async def _memory_audit_complete(**kwargs):
+    """One-shot structured judgement over evidence already in the prompt.
+
+    Deliberately not `_intelligent_complete`: the auditor is given the answer
+    and the candidate facts, so there is nothing for a tool loop to discover,
+    and the audit must still work on a machine where the agent runtime is off.
+    """
+    kwargs.setdefault(
+        "room", neo4j_store.get_room("agent:daily-reflection")
+        if neo4j_store is not None else None)
+    kwargs.setdefault("thinking", env_bool("REFLECTION_AUDIT_THINKING", True))
+    return await conversation_manager.complete(**kwargs)
+
+
+def _reflection_block(query="", limit=6, days=400, max_chars=3000,
+                      answer_chars=1200, strict=False):
+    """The user's own answers, ready to paste into any prompt.
+
+    Wrapped once so no caller has to decide how to phrase the precedence rule,
+    and so a reflection-store problem can never take down a report or a nudge.
+    """
+    try:
+        return daily_reflections.prompt_context(
+            query=query, limit=limit, days=days, max_chars=max_chars,
+            answer_chars=answer_chars, strict=strict)
+    except Exception as exc:
+        logger.warning("Reflection ground truth unavailable: %s", exc)
+        return ""
+
+
+def _reflection_auditor():
+    """The workflow that spends reflection answers on fixing memory."""
+    return ReflectionMemoryAuditor(
+        personal_memory, daily_reflections, _memory_audit_complete,
+        graph_store=neo4j_store,
+        candidate_limit=env_int("REFLECTION_AUDIT_CANDIDATES", 14, minimum=4))
+
+
+async def _audit_reflection_answer(item):
+    """Background pass after a single answer is saved."""
+    try:
+        result = await _reflection_auditor().audit_answer(item)
+    except Exception as exc:
+        logger.warning("Reflection memory audit failed (%s): %s",
+                       item.get("question_id"), exc)
+        return None
+    if result.get("changes"):
+        logger.info("Reflection answer %s updated memory: %s",
+                    item.get("question_id"),
+                    ", ".join(f"{change['action']} {change.get('name') or ''}".strip()
+                              for change in result["changes"]))
+    return result
+
+
+async def _job_reflection_memory_audit(ctx):
+    """Verify personal memory against every answer written since the last pass.
+
+    Scheduled ahead of question generation: today's set should be built from
+    memory the user's own answers have already corrected, and should target what
+    is still unconfirmed.
+    """
+    result = await _reflection_auditor().run_pending(
+        limit=env_int("REFLECTION_AUDIT_BATCH", 25, minimum=1))
+    return JobResult(
+        detail=(f"{result['answers_audited']} answer(s), "
+                f"{result['changes']} memory change(s)"),
+        data={key: value for key, value in result.items() if key != "results"})
+
+
+async def generate_daily_reflections(date_str=None, replace=False):
+    target = date_str or datetime.date.today().isoformat()
+    datetime.date.fromisoformat(target)
+    existing = daily_reflections.get(target)
+    if existing is not None and existing.get("total") == 20 and not replace:
+        return existing
+    context = await asyncio.to_thread(
+        reflection_context, personal_memory, room_canvas_store,
+        neo4j_store, target, daily_reflections)
+    messages = [{"role": "system", "content": REFLECTION_SYSTEM_PROMPT}, {
+        "role": "user",
+        "content": "Create today's 20-question set from this evidence:\n\n" + context,
+    }]
+    result = await _intelligent_complete(
+        room_id="agent:daily-reflection",
+        room=(neo4j_store.get_room("agent:daily-reflection")
+              if neo4j_store is not None else None),
+        messages=messages,
+        max_tokens=5000,
+        output_type=DailyReflectionQuestions,
+    )
+    questions = [item.model_dump() for item in result.output.questions]
+    saved = await asyncio.to_thread(
+        daily_reflections.save, target, questions,
+        "adaptive thinking; personal memory + graph + room canvases")
+    if neo4j_store is not None:
+        neo4j_store.add_message(
+            "agent:daily-reflection", "reflection",
+            f"Prepared 20 deep-reflection questions for {target}.")
+    return saved
+
+
+async def _job_daily_reflection(ctx):
+    result = await generate_daily_reflections(ctx.today)
+    return JobResult(
+        detail=f"{result['date']}: {result['total']} questions",
+        data={"date": result["date"], "total": result["total"]})
+
+
+async def generate_weekly_product_review(week_start=None, replace=False):
+    """Read the week's answers as a report on this application.
+
+    The answers describe how his days actually went; this is the one pass that
+    asks what the software should therefore do differently. Every suggestion
+    carries the quote it came from, and his verdict on last week's suggestions
+    is in the context so nothing he dismissed comes back.
+    """
+    if week_start:
+        start = datetime.date.fromisoformat(str(week_start))
+        start -= datetime.timedelta(days=start.weekday())   # snap to Monday
+        end = start + datetime.timedelta(days=6)
+    else:
+        start, end = week_bounds()
+    existing = await asyncio.to_thread(product_reviews.get, start.isoformat())
+    if existing is not None and not replace:
+        return existing
+
+    answers = await asyncio.to_thread(
+        daily_reflections.answers_between, start.isoformat(), end.isoformat())
+    context = await asyncio.to_thread(
+        review_context, daily_reflections, product_reviews,
+        start.isoformat(), end.isoformat(), PERSONAL_AGENTS)
+    result = await _intelligent_complete(
+        room_id="agent:daily-reflection",
+        room=(neo4j_store.get_room("agent:daily-reflection")
+              if neo4j_store is not None else None),
+        messages=[
+            {"role": "system", "content": PRODUCT_REVIEW_SYSTEM_PROMPT},
+            {"role": "user",
+             "content": "Review this week and report what it asks of the "
+                        "application:\n\n" + context},
+        ],
+        max_tokens=4000,
+        output_type=WeeklyProductReview,
+    )
+    saved = await asyncio.to_thread(
+        product_reviews.save, start.isoformat(), end.isoformat(),
+        result.output.model_dump(), len(answers))
+    if neo4j_store is not None:
+        try:
+            neo4j_store.add_message(
+                "agent:daily-reflection", "reflection", format_review(saved))
+        except Exception as exc:
+            logger.warning("Could not post the weekly review: %s", exc)
+    return saved
+
+
+async def _job_weekly_product_review(ctx):
+    review = await generate_weekly_product_review()
+    count = len(review.get("suggestions") or [])
+    if count:
+        notification_center.publish(
+            "Weekly review of your reflections",
+            f"{count} suggested change{'s' if count != 1 else ''} to the app, "
+            f"from what you wrote between {review['week_start']} and "
+            f"{review['week_end']}.",
+            category="product_review", source="daily-reflection",
+            room_id="agent:daily-reflection", timestamp=ctx.now,
+            metadata={"week_start": review["week_start"]})
+    return JobResult(
+        detail=(f"{review['week_start']}: {count} suggestion(s) from "
+                f"{review.get('answers_considered', 0)} answer(s)"),
+        delivered=bool(count),
+        data={"week_start": review["week_start"], "suggestions": count})
+
+
+HORIZON_ROOM = "agent:horizons"
+
+
+def _horizon_life_start():
+    """The first day the system holds anything about — the lifelong window's start.
+
+    Taken from the graph and the reflection answers together: a machine that was
+    capturing before the questionnaire existed, or the reverse, still gets a
+    lifelong window that starts where its history actually starts.
+    """
+    candidates = []
+    if neo4j_store is not None:
+        try:
+            earliest = neo4j_store.earliest_day()
+            if earliest:
+                candidates.append(str(earliest))
+        except Exception as exc:
+            logger.debug("earliest graph day unavailable: %s", exc)
+    try:
+        rows = daily_reflections.answers_between(
+            "1970-01-01", datetime.date.today().isoformat(), limit=1)
+        if rows:
+            candidates.append(str(rows[0]["date"]))
+    except Exception as exc:
+        logger.debug("earliest reflection answer unavailable: %s", exc)
+    return min(candidates) if candidates else None
+
+
+async def generate_horizon_review(horizon, key=None, replace=False):
+    """Reflect on one closed window and forecast the next one of the same size.
+
+    The expensive part is deliberately not the model call: it is the ordering.
+    A month review is written after its weeks exist, a year after its quarters,
+    so each tier reads distillations instead of re-deriving raw history. That is
+    what keeps a lifelong review the same cost as a weekly one.
+    """
+    horizon = str(horizon)
+    if horizon not in HORIZONS:
+        raise ValueError(f"horizon must be one of {', '.join(HORIZONS)}")
+    key = str(key) if key else horizon_closed_key(horizon)
+    life_start = await asyncio.to_thread(_horizon_life_start)
+    start, end = horizon_bounds(horizon, key, life_start=life_start)
+    existing = await asyncio.to_thread(horizon_reviews.get_review, horizon, key)
+    if existing is not None and not replace:
+        return existing
+
+    context = await asyncio.to_thread(
+        horizon_context, horizon, key, horizon_reviews, neo4j_store,
+        personal_memory, daily_reflections, room_canvas_store, life_start)
+    result = await _intelligent_complete(
+        room_id=HORIZON_ROOM,
+        room=(neo4j_store.get_room(HORIZON_ROOM)
+              if neo4j_store is not None else None),
+        messages=[
+            {"role": "system", "content": HORIZON_SYSTEM_PROMPT},
+            {"role": "user",
+             "content": (f"Reflect on this {horizon} and forecast the next "
+                         f"one.\n\n{context}")},
+        ],
+        max_tokens=8000,
+        output_type=HorizonReview,
+    )
+    evidence_days = (datetime.date.fromisoformat(end)
+                     - datetime.date.fromisoformat(start)).days + 1
+    saved = await asyncio.to_thread(
+        horizon_reviews.save_review, horizon, key, result.output.model_dump(),
+        start, end, evidence_days, life_start)
+    if neo4j_store is not None:
+        try:
+            neo4j_store.add_message(HORIZON_ROOM, "reflection",
+                                    format_horizon_review(saved))
+        except Exception as exc:
+            logger.warning("Could not post the %s review: %s", horizon, exc)
+    return saved
+
+
+async def grade_due_horizon_predictions(limit=25, as_of=None):
+    """Judge the forecasts whose due date has passed.
+
+    Without this the room is a generator of confident sentences nobody ever
+    checks. With it, every horizon review is shown its own hit rate per
+    confidence band before it writes the next forecast.
+    """
+    due = await asyncio.to_thread(horizon_reviews.due_predictions, as_of, limit)
+    if not due:
+        return {"graded": 0, "due": 0, "results": []}
+    context = await asyncio.to_thread(
+        horizon_grading_context, due, horizon_reviews, neo4j_store,
+        daily_reflections, as_of)
+    result = await _intelligent_complete(
+        room_id=HORIZON_ROOM,
+        room=(neo4j_store.get_room(HORIZON_ROOM)
+              if neo4j_store is not None else None),
+        messages=[
+            {"role": "system", "content": PREDICTION_GRADING_PROMPT},
+            {"role": "user",
+             "content": "Grade each of these forecasts.\n\n" + context},
+        ],
+        max_tokens=4000,
+        output_type=PredictionGrades,
+    )
+    # Only the ids actually put to the model may be written: a grade for
+    # anything else is a hallucinated id, not a verdict.
+    allowed = {item["prediction_id"] for item in due}
+    graded = []
+    for grade in result.output.grades:
+        if grade.prediction_id not in allowed:
+            continue
+        updated = await asyncio.to_thread(
+            horizon_reviews.grade, grade.prediction_id, grade.status,
+            grade.verdict, grade.evidence, "agent")
+        if updated is not None:
+            graded.append(updated)
+    if graded and neo4j_store is not None:
+        try:
+            neo4j_store.add_message(HORIZON_ROOM, "reflection",
+                                    format_horizon_grades(graded))
+        except Exception as exc:
+            logger.warning("Could not post horizon grades: %s", exc)
+    return {"graded": len(graded), "due": len(due), "results": graded}
+
+
+QURAN_ROOM = "agent:islamic-quran"
+
+
+def _sync_quran_canvas():
+    """Publish the room's state where the other rooms read it.
+
+    Daily Reflection and Horizons both build prompts out of room canvases, so
+    the Quran journey has to land there or those rooms stop seeing that he
+    studies at all. The client used to push this; the store is the truth now.
+    """
+    try:
+        room_canvas_store.put(QURAN_ROOM, quran_study.canvas())
+    except Exception as exc:
+        logger.warning("Could not sync the Quran canvas: %s", exc)
+
+
+def _format_quran_guide(session):
+    """The passage report as room-timeline prose."""
+    guide = session.get("guide") or {}
+    words = ", ".join(
+        f"{word.get('arabic') or word.get('transliteration')} "
+        f"({word.get('meaning')})"
+        for word in (guide.get("words") or [])[:10]).strip()
+    lines = [
+        f"Study report — Surah {session['surah_name']} "
+        f"{session['from_ayah']}-{session['to_ayah']} ({session['date']}).",
+        str(guide.get("summary") or ""),
+    ]
+    if words:
+        lines.append(f"Words: {words}")
+    if guide.get("classical"):
+        lines.append(f"Classical tafsir: {guide['classical']}")
+    if guide.get("modern"):
+        lines.append(f"Contemporary reflection: {guide['modern']}")
+    if guide.get("conduct"):
+        lines.append(f"Character and rights: {guide['conduct']}")
+    return "\n\n".join(line for line in lines if line)
+
+
+async def generate_quran_study_guide(surah, from_ayah, to_ayah, date=None,
+                                     replace=True):
+    """Write one passage's report, store it, and harvest its vocabulary.
+
+    Generation and storage are one step deliberately. Previously the report only
+    entered the journey when the user pressed "complete reading", so a guide he
+    read and closed took its words with it — and the vocabulary notebook stayed
+    empty while he had in fact studied.
+    """
+    surah, from_ayah, to_ayah, name = validate_quran_passage(
+        surah, from_ayah, to_ayah)
+    day = str(date or datetime.date.today().isoformat())
+    datetime.date.fromisoformat(day)
+    existing = await asyncio.to_thread(
+        quran_study.find_session, day, surah, from_ayah, to_ayah)
+    if existing is not None and (existing.get("guide") or {}).get("summary") \
+            and not replace:
+        return existing
+
+    context = await asyncio.to_thread(
+        quran_study_context, quran_study, surah, from_ayah, to_ayah, name,
+        daily_reflections)
+    room = neo4j_store.get_room(QURAN_ROOM) if neo4j_store is not None else None
+    messages = [
+        {"role": "system", "content": QURAN_STUDY_SYSTEM_PROMPT},
+        {"role": "user", "content": context},
+    ]
+    # One repair attempt. A report that omits the tafsir or the words is the
+    # exact failure the room used to render as blank cards, so it is worth
+    # paying for a second pass rather than storing it.
+    for attempt in range(2):
+        try:
+            result = await _intelligent_complete(
+                room_id=QURAN_ROOM, room=room, messages=messages,
+                max_tokens=6000, output_type=QuranStudyGuide)
+            break
+        except ValidationError as exc:
+            logger.warning("Quran guide for %s %s-%s failed validation: %s",
+                           name, from_ayah, to_ayah, exc)
+            if attempt:
+                raise
+            messages = messages + [{
+                "role": "user",
+                "content": ("Your last report was rejected because it did not "
+                            f"satisfy the required shape:\n{exc}\n\nWrite it "
+                            "again with every required field filled — the "
+                            "words, the summarized classical commentary with "
+                            "its sources, the contemporary reflection, and the "
+                            "tadabbur questions. Leave nothing empty or "
+                            "placeholder."),
+            }]
+
+    saved = await asyncio.to_thread(
+        quran_study.save_guide, surah, from_ayah, to_ayah,
+        result.output.model_dump(), day)
+    await asyncio.to_thread(_sync_quran_canvas)
+    if neo4j_store is not None:
+        try:
+            neo4j_store.add_message(QURAN_ROOM, "reflection",
+                                    _format_quran_guide(saved))
+        except Exception as exc:
+            logger.warning("Could not post the Quran report: %s", exc)
+    return saved
+
+
+async def _job_horizon_reviews(ctx):
+    """Grade what came due, then write whichever windows have closed.
+
+    Grading runs first on purpose: a review written straight afterwards sees the
+    outcome of its own last forecast rather than a stale 'open'.
+    """
+    detail = []
+    delivered = False
+    try:
+        grades = await grade_due_horizon_predictions(
+            limit=env_int("HORIZON_GRADE_LIMIT", 25, minimum=1))
+        if grades["graded"]:
+            detail.append(f"graded {grades['graded']}")
+    except AgentRuntimeUnavailable:
+        raise
+    except Exception as exc:
+        logger.warning("Horizon grading failed: %s", exc)
+        detail.append("grading failed")
+
+    life_days = env_int("HORIZON_LIFE_REFRESH_DAYS", 30, minimum=1)
+    due = await asyncio.to_thread(
+        due_horizons, horizon_reviews, ctx.today, life_days)
+    # Six windows can close on the same morning (a new year does exactly that).
+    # Shortest first, a couple per run: the longer ones then read finished
+    # children on the following days instead of guessing at them.
+    budget = env_int("HORIZON_REVIEWS_PER_RUN", 2, minimum=1)
+    written = []
+    for horizon, key in due[:budget]:
+        try:
+            review = await generate_horizon_review(horizon, key)
+            written.append(f"{horizon}:{key}")
+            notification_center.publish(
+                f"{HORIZON_LABELS.get(horizon, horizon)} review ready",
+                (review.get("headline") or "")[:300]
+                or f"Your {horizon} review for {key} is ready.",
+                category="horizons", source="horizons",
+                room_id=HORIZON_ROOM, timestamp=ctx.now,
+                metadata={"horizon": horizon, "period_key": key})
+            delivered = True
+        except AgentRuntimeUnavailable:
+            raise
+        except Exception as exc:
+            logger.warning("Horizon review %s/%s failed: %s", horizon, key, exc)
+    if written:
+        detail.append("wrote " + ", ".join(written))
+    remaining = max(0, len(due) - len(written))
+    if remaining:
+        detail.append(f"{remaining} still due")
+    return JobResult(detail="; ".join(detail) or "nothing due",
+                     delivered=delivered,
+                     data={"written": written, "due": len(due)})
 
 
 def _agent_check_in_job(agent):
@@ -670,6 +1501,7 @@ def _consolidator():
 
 
 PLANNER_ROOM = "agent:tomorrow-planner"
+MOTIVATION_ROOM = "agent:motivational"
 
 PLANNER_PROPOSAL_SHAPE = """Return ONLY JSON:
 {
@@ -684,13 +1516,12 @@ PLANNER_PROPOSAL_SHAPE = """Return ONLY JSON:
   ]
 }"""
 
-PLANNER_EVALUATION_SHAPE = """Return ONLY JSON:
-{
-  "completions": [
-    {"task_id": "exact id", "completed": true, "evidence": "direct evidence"}
-  ],
-  "assessment": "2-3 concise sentences: progress, risk, and next best task"
-}"""
+SATISFACTION_RUBRIC = f"""`satisfaction` is how much the work was genuinely
+worth to the user, from {SATISFACTION_MIN} to {SATISFACTION_MAX}:
+1 = minor upkeep, 2 = useful but small, 3 = a solid piece of real work,
+4 = clearly moves something important forward, 5 = a genuinely meaningful
+day-maker. Judge worth, not duration — a long grind can be a 2 and a ten-minute
+call that keeps a promise can be a 5. Do not give everything the same score."""
 
 
 def _planner_activity_context(target_date, days=7):
@@ -742,13 +1573,28 @@ def _planner_fallback_tasks(history):
 
 def _planner_message(plan, heading="Tomorrow's proposed plan"):
     lines = [f"## {heading} — {plan['date']}", "", plan.get("summary") or ""]
+    carried_over = 0
     for task in plan["tasks"]:
+        carried = ""
+        if task.get("carried_count"):
+            carried_over += 1
+            carried = (
+                f" · still open since {task['first_planned_on']} "
+                f"(carried {task['carried_count']}×)"
+            )
         lines.append(
             f"- [ ] {task['title']} "
-            f"({task['estimated_minutes']} min, {task['priority']})"
+            f"({task['estimated_minutes']} min, {task['priority']}){carried}"
+        )
+    if carried_over:
+        lines.append(
+            f"\n{carried_over} of these were already on an earlier list and are "
+            "still not done. They stay here until you tick them off or delete "
+            "them."
         )
     lines.append(
-        "\nEditable until 10:30 AM on the target day; tracking starts after that."
+        "\nEditable until 10:30 AM on the target day. Only you can complete or "
+        "delete a task — nothing is marked done automatically."
     )
     return "\n".join(lines)
 
@@ -778,32 +1624,105 @@ async def generate_tomorrow_plan(date_str=None):
                 claim.get("text") for claim in day["claims"][:10]
             ],
         })
+    # Activity shows what he did; his answers show what he decided to do. A plan
+    # that ignores a stated intention or commitment is planning the wrong day.
+    stated = _reflection_block(
+        query="tomorrow plan priorities commitment deadline project research "
+              "family wife parents health next step",
+        limit=10, days=14, max_chars=5000, answer_chars=900)
+    # A plan that ignores the day it is planning for is worthless: a full list
+    # proposed for a day he already marked as travel, Eid, or sick is not an
+    # ambitious plan, it is a plan he cannot follow and will be judged against.
+    calendar_block = ""
+    try:
+        target_day = calendar_store.day(target)
+        calendar_block = "\n" + calendar_store.planning_context(
+            datetime.date.fromisoformat(target), days=14) + "\n"
+        if target_day["expectation"] != "normal":
+            reasons = "; ".join(
+                f"{entry['title']}"
+                + (f" [{entry['label']}]" if entry.get("label") else "")
+                + (f" — {entry['notes']}" if entry.get("notes") else "")
+                for entry in target_day["reasons"])
+            calendar_block += (
+                f"\n{target} is NOT an ordinary day for him: {reasons}. His "
+                f"routine is {target_day['routine_status']} that day. Plan "
+                "accordingly — propose markedly less, keep what you do propose "
+                "small and compatible with the circumstance, and say in the "
+                "summary that you sized the day down and why. Do not quietly "
+                "produce a normal list.\n")
+        elif target_day["entries"]:
+            # He labelled the day and left the reading of it open. Sizing it is
+            # a judgement call the model is here to make — but it has to make it
+            # out loud, so a day quietly planned as full can be argued with.
+            written = "; ".join(
+                f"{entry['title']}"
+                + (f" [{entry['label']}]" if entry.get("label") else "")
+                + (f" — {entry['notes']}" if entry.get("notes") else "")
+                for entry in target_day["entries"])
+            calendar_block += (
+                f"\nWhat he has written on {target}: {written}. He did not say "
+                "how much of his routine still applies, so decide it yourself "
+                "from his own words, size the plan to the hours that plausibly "
+                "leaves him, and state in the summary how you read the day.\n")
+    except Exception as exc:
+        logger.warning("Loading the calendar for the %s plan failed: %s",
+                       target, exc)
+
+    # Every task he never finished is already on tomorrow's list, so the model
+    # plans *around* the backlog instead of proposing it again — and sizes the
+    # new work against what is already owed.
+    carried = tomorrow_plan_store.open_before(target)
+    carried_block = ""
+    if carried:
+        carried_block = (
+            "\nAlready on tomorrow's list because he planned it earlier and "
+            "never completed it. Do NOT propose these again. They are his "
+            "existing workload: add fewer new tasks when this list is long, "
+            "and never imply they are done.\n"
+            + json.dumps([{"title": task["title"],
+                           "priority": task["priority"],
+                           "estimated_minutes": task["estimated_minutes"],
+                           "open_since": task.get("first_planned_on")}
+                          for task in carried], ensure_ascii=False)
+            + "\n"
+        )
     prompt = f"""You are predicting a realistic plan for the user's next day,
 {target}, from their recent observed activity.
 {PLANNER_PROPOSAL_SHAPE}
 Create 3-7 tasks. Prefer unfinished or recurring work and concrete outcomes over
 vague productivity advice. Keep the total workload realistic. Do not invent
-deadlines, meetings, or obligations not supported by the evidence.
+deadlines, meetings, or obligations not supported by the evidence. You cannot
+mark anything complete: only the user closes a task, so never describe past work
+as finished unless he said so.
+{carried_block}
+{calendar_block}
 
 Recent activity:
 {json.dumps(compact, ensure_ascii=False)}
+{(chr(10) + stated + chr(10) +
+  "An intention he stated in his own words outranks a pattern inferred from "
+  "activity: plan what he said he would do, and where activity shows he has "
+  "not started it, say so in the rationale rather than dropping the task."
+  ) if stated else ""}
 """
     summary = ""
     tasks = []
+    agent_pacer.require(PLANNER_ROOM)
     try:
-        result = await conversation_manager.complete(
+        result = await _intelligent_complete(
             room_id=PLANNER_ROOM,
             room=neo4j_store.get_room(PLANNER_ROOM),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=900,
             output_type=PlanProposal,
-            # The evidence is already assembled above; tools would only add
-            # round trips to a one-shot extraction.
-            allow_agent=False,
         )
         proposal = result.output
         summary = proposal.summary.strip()
         tasks = [task.model_dump() for task in proposal.tasks]
+    except AgentRuntimeUnavailable:
+        agent_pacer.release(PLANNER_ROOM)
+        raise
     except Exception as exc:
         logger.warning("Tomorrow plan generation failed, using fallback: %s", exc)
     if not tasks:
@@ -817,67 +1736,6 @@ Recent activity:
         "agent:tomorrow-planner", "planner", _planner_message(plan)
     )
     return plan
-
-
-async def evaluate_tomorrow_plan(date_str=None):
-    if neo4j_store is None:
-        raise RuntimeError("graph not enabled")
-    target = date_str or datetime.date.today().isoformat()
-    plan = tomorrow_plan_store.get(target)
-    if plan is None:
-        raise KeyError("plan not found")
-    if tomorrow_plan_phase(plan) == "draft":
-        raise ValueError("tracking begins at 10:30 AM")
-    metrics = neo4j_store.daily_metrics(target)
-    claims = neo4j_store.day_claims(target, limit=40)
-    evidence = {
-        "metrics": metrics,
-        "claims": [item.get("text") for item in claims],
-    }
-    prompt = f"""Evaluate today's observed activity against the user's finalized
-task plan.
-{PLANNER_EVALUATION_SHAPE}
-Mark a task complete ONLY when the activity directly demonstrates its outcome.
-Mere app usage, related browsing, or partial work is not completion. Omit tasks
-without enough evidence.
-
-Plan:
-{json.dumps(plan["tasks"], ensure_ascii=False)}
-
-Observed activity:
-{json.dumps(evidence, ensure_ascii=False)}
-"""
-    completions = []
-    assessment = "No reliable activity evidence is available yet."
-    try:
-        result = await conversation_manager.complete(
-            room_id=PLANNER_ROOM,
-            room=neo4j_store.get_room(PLANNER_ROOM),
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=700,
-            output_type=PlanEvaluation,
-            allow_agent=False,  # one-shot extraction over the evidence above
-        )
-        evaluation = result.output
-        completions = [item.model_dump() for item in evaluation.completions]
-        assessment = evaluation.assessment.strip() or assessment
-    except Exception as exc:
-        logger.warning("Tomorrow plan evaluation failed: %s", exc)
-    updated, changed = tomorrow_plan_store.apply_evaluation(
-        target, completions, assessment
-    )
-    if changed:
-        completed = [
-            task["title"] for task in updated["tasks"] if task["id"] in changed
-        ]
-        neo4j_store.add_message(
-            "agent:tomorrow-planner",
-            "planner",
-            "Automatically completed from activity evidence:\n- "
-            + "\n- ".join(completed)
-            + f"\n\n{assessment}",
-        )
-    return updated
 
 
 @app.on_event("shutdown")
@@ -1131,6 +1989,46 @@ async def cameras_health():
     return {"cameras": camera_manager.health_all() if camera_manager else []}
 
 
+@app.get("/cameras/state")
+async def cameras_state():
+    """What each camera believes is standing true, and what it usually does.
+
+    This is the continuous view the per-clip feed cannot give: every tracked
+    slot with how long it has held its current state, the times of day those
+    states usually change, and the habits that have not happened yet today.
+
+    Registered BEFORE /cameras/{camera_id}/... so the path isn't swallowed.
+    """
+    return {"cameras": camera_manager.state_all() if camera_manager else [],
+            "enabled": camera_state_store.enabled}
+
+
+@app.post("/cameras/state/forget")
+async def cameras_state_forget(request: Request):
+    """Drop a slot the extractor opened wrongly (a duplicate of a tracked thing).
+
+    Nothing else can undo that: a bad slot is confirmed on every window from
+    then on, so its duration keeps growing and it keeps entering the prompt as
+    though it were real.
+    """
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid JSON: {exc}"})
+    camera_id = (data or {}).get("camera_id") if isinstance(data, dict) else None
+    state_key = (data or {}).get("state_key") if isinstance(data, dict) else None
+    if not camera_id or not state_key:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "camera_id and state_key are required"})
+    forgotten = await asyncio.to_thread(
+        camera_state_store.forget, camera_id, state_key)
+    if not forgotten:
+        return JSONResponse(status_code=404, content={"error": "state not found"})
+    return {"forgotten": True, "camera_id": camera_id, "state_key": state_key,
+            "state": camera_state_store.snapshot(camera_id)}
+
+
 @app.post("/cameras/{camera_id:path}/control")
 async def camera_control(camera_id: str, request: Request):
     """Pause or resume a single camera worker."""
@@ -1254,6 +2152,33 @@ async def rooms_list(include_archived: bool = False):
     return {"rooms": neo4j_store.list_rooms(include_archived=include_archived)}
 
 
+@app.get("/jobs")
+async def jobs_status(upcoming: int = 4):
+    """Everything running right now, plus what is queued to run next.
+
+    The single answer to "what is using the GPU?": inference requests (with the
+    frame count that explains a slow one), speech synthesis, transcription, the
+    agent jobs that started them, and the external agent runs. Deliberately
+    cheap — no graph or ASR probe — because the UI polls it every couple of
+    seconds while work is in flight.
+    """
+    board = job_board.snapshot()
+    schedule = orchestrator.status()
+    due = [job for job in schedule["jobs"]
+           if job["enabled"] and job["due_in_seconds"] is not None]
+    due.sort(key=lambda job: job["due_in_seconds"])
+    board["scheduled"] = due[:max(0, upcoming)]
+    board["delivery_budget"] = schedule["budget"]
+    # A capture worker mid-inference is already a running VLM job; this says
+    # whether the sources feeding it are actually awake.
+    board["capture"] = {
+        "screen": bool(screen_stream and screen_stream.status().get("healthy")),
+        "cameras": sum(1 for camera in (camera_manager.status_all() if camera_manager else [])
+                       if camera.get("healthy")),
+    }
+    return board
+
+
 @app.get("/orchestrator/status")
 async def orchestrator_status():
     """What every agent is scheduled to do, when, and how it last went."""
@@ -1268,6 +2193,592 @@ async def orchestrator_run_job(job_id: str):
     except KeyError:
         return JSONResponse(status_code=404,
                             content={"error": f"unknown job: {job_id}"})
+
+
+@app.post("/memory/refine")
+async def memory_refine():
+    """Run the conservative personal-fact duplicate pass immediately."""
+    return await asyncio.to_thread(
+        MemoryRefiner(
+            personal_memory,
+            threshold=env_float("MEMORY_DUPLICATE_THRESHOLD", 0.88),
+        ).run)
+
+
+@app.get("/reflections/today")
+async def reflections_today(date: str = None):
+    target = date or datetime.date.today().isoformat()
+    try:
+        datetime.date.fromisoformat(target)
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "date must be YYYY-MM-DD"})
+    item = await asyncio.to_thread(daily_reflections.get, target)
+    if item is None:
+        return {"date": target, "status": "not_generated", "answered": 0,
+                "total": 0, "questions": []}
+    return item
+
+
+@app.post("/reflections/generate")
+async def reflections_generate(date: str = None, replace: bool = False):
+    try:
+        return await generate_daily_reflections(date, replace=replace)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except Exception as exc:
+        logger.warning("daily reflection generation failed: %s", exc)
+        return JSONResponse(status_code=502,
+                            content={"error": f"generation failed: {exc}"})
+
+
+@app.put("/reflections/questions/{question_id}/answer")
+async def reflection_answer(question_id: str, request: Request):
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid JSON: {exc}"})
+    answer = data.get("answer") if isinstance(data, dict) else None
+    try:
+        saved = await asyncio.to_thread(
+            daily_reflections.answer, question_id, answer)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if saved is None:
+        return JSONResponse(status_code=404, content={"error": "question not found"})
+
+    # The answer itself is already durable in the reflection store, and every
+    # module now retrieves it from there as ground truth. What runs here is the
+    # part that costs a model call: judging existing personal memory against
+    # what the user just said — confirming what holds, correcting what drifted,
+    # retracting what was never true — and learning what memory did not hold at
+    # all. It replaces the old blind extraction pass, which could only ever add.
+    task = asyncio.create_task(_audit_reflection_answer(saved))
+    _personal_learning_tasks.add(task)
+    task.add_done_callback(_personal_learning_tasks.discard)
+    if neo4j_store is not None:
+        neo4j_store.add_message(
+            "agent:daily-reflection", "user",
+            f"{saved['question']}\n\n{saved['answer']}")
+    return {"saved": True, "audit": "queued", **saved}
+
+
+@app.get("/reflections/insights")
+async def reflection_insights(days: int = 30, limit: int = 40):
+    """What the time spent answering has actually bought.
+
+    Coverage on one side, the state of personal memory on the other, and the
+    concrete list of beliefs the user's answers confirmed, corrected or deleted.
+    """
+    def load():
+        return {
+            "coverage": daily_reflections.coverage(days=days),
+            "memory": personal_memory.verification_stats(),
+            "recent_changes": personal_memory.audit_log(limit=limit),
+            "pending_audit": len(daily_reflections.pending_audit(limit=100)),
+            "next_questions_target": personal_memory.needs_verification(limit=10),
+        }
+    return await asyncio.to_thread(load)
+
+
+@app.post("/reflections/audit")
+async def reflection_audit(question_id: str = None, limit: int = 25):
+    """Run the memory audit now — for one answer, or for everything pending."""
+    auditor = _reflection_auditor()
+    try:
+        if question_id:
+            item = await asyncio.to_thread(daily_reflections.question, question_id)
+            if item is None:
+                return JSONResponse(status_code=404,
+                                    content={"error": "question not found"})
+            if not str(item.get("answer") or "").strip():
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "question has not been answered yet"})
+            return await auditor.audit_answer(item)
+        result = await auditor.run_pending(limit=max(1, min(int(limit), 100)))
+        return {key: value for key, value in result.items() if key != "results"}
+    except Exception as exc:
+        logger.warning("Manual reflection memory audit failed: %s", exc)
+        return JSONResponse(status_code=502, content={"error": str(exc)})
+
+
+@app.get("/reflections/weekly-review")
+async def weekly_product_review(week_start: str = None):
+    """The newest weekly review of the app, drawn from the user's answers."""
+    review = await asyncio.to_thread(product_reviews.get, week_start)
+    if review is None:
+        start, end = week_bounds()
+        return {"status": "not_generated",
+                "week_start": (week_start or start.isoformat()),
+                "week_end": end.isoformat(), "suggestions": []}
+    return {"status": "ready", **review}
+
+
+@app.get("/reflections/weekly-reviews")
+async def weekly_product_reviews(limit: int = 12):
+    return {"weeks": await asyncio.to_thread(product_reviews.weeks, limit)}
+
+
+@app.post("/reflections/weekly-review/generate")
+async def weekly_product_review_generate(week_start: str = None,
+                                         replace: bool = False):
+    try:
+        return await generate_weekly_product_review(week_start, replace=replace)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except AgentRuntimeUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    except Exception as exc:
+        logger.warning("weekly product review failed: %s", exc)
+        return JSONResponse(status_code=502,
+                            content={"error": f"review failed: {exc}"})
+
+
+@app.put("/reflections/suggestions/{suggestion_id}")
+async def weekly_suggestion_update(suggestion_id: str, request: Request):
+    """Plan, ship or dismiss one suggestion. Next week's review is told."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400, content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "expected an object"})
+    try:
+        updated = await asyncio.to_thread(
+            product_reviews.set_status, suggestion_id,
+            data.get("status"), data.get("note"))
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if updated is None:
+        return JSONResponse(status_code=404,
+                            content={"error": "suggestion not found"})
+    return updated
+
+
+# --- Horizons: week → lifelong reflection and forecasting -------------------
+#
+# `/horizons/threads` and `/horizons/calibration` are declared before
+# `/horizons/{horizon}` because FastAPI resolves in declaration order and would
+# otherwise read "threads" as a horizon name.
+
+@app.get("/horizons")
+async def horizons_index():
+    """What the room has distilled so far, and what it is still owed."""
+    def load():
+        life_start = _horizon_life_start()
+        today = datetime.date.today()
+        coverage = horizon_reviews.coverage()
+        due = due_horizons(horizon_reviews, today,
+                           env_int("HORIZON_LIFE_REFRESH_DAYS", 30, minimum=1))
+        horizons = []
+        for horizon in HORIZONS:
+            latest = horizon_reviews.get_review(horizon)
+            current = horizon_period_key(horizon, today)
+            closed = horizon_closed_key(horizon, today)
+            start, end = horizon_bounds(horizon, closed, life_start=life_start)
+            horizons.append({
+                "horizon": horizon,
+                "label": HORIZON_LABELS[horizon],
+                "current_key": current,
+                "closed_key": closed,
+                "closed_start": start,
+                "closed_end": end,
+                "reviews": coverage[horizon]["reviews"],
+                "earliest": coverage[horizon]["earliest"],
+                "latest_key": (latest or {}).get("period_key"),
+                "latest_headline": (latest or {}).get("headline"),
+                "due": any(item[0] == horizon for item in due),
+            })
+        return {
+            "life_start": life_start,
+            "horizons": horizons,
+            "due": [{"horizon": h, "period_key": k} for h, k in due],
+            "calibration": horizon_reviews.calibration(),
+            "open_predictions": len(horizon_reviews.due_predictions(limit=200)),
+            "threads": horizon_reviews.threads(limit=60),
+        }
+    return await asyncio.to_thread(load)
+
+
+@app.get("/horizons/threads")
+async def horizon_threads(status: str = None, history: bool = True,
+                          limit: int = 60):
+    """The long-running threads, each with its dated trajectory."""
+    return {"threads": await asyncio.to_thread(
+        horizon_reviews.threads, status, limit, history)}
+
+
+@app.put("/horizons/threads/{thread_id}")
+async def horizon_thread_update(thread_id: str, request: Request):
+    """The user's verdict on a thread. A thread he closes stays closed."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400,
+                            content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "expected an object"})
+    try:
+        updated = await asyncio.to_thread(
+            horizon_reviews.set_thread, thread_id, data.get("status"),
+            data.get("user_note"), data.get("name"))
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if updated is None:
+        return JSONResponse(status_code=404, content={"error": "thread not found"})
+    return updated
+
+
+@app.get("/horizons/calibration")
+async def horizon_calibration(horizon: str = None):
+    """How well this room has actually predicted the user."""
+    if horizon and horizon not in HORIZONS:
+        return JSONResponse(status_code=400,
+                            content={"error": f"unknown horizon: {horizon}"})
+    def load():
+        return {
+            "calibration": horizon_reviews.calibration(horizon=horizon),
+            "resolved": horizon_reviews.resolved_predictions(
+                horizon=horizon, limit=60),
+            "due": horizon_reviews.due_predictions(limit=60),
+        }
+    return await asyncio.to_thread(load)
+
+
+@app.post("/horizons/grade")
+async def horizon_grade_due(limit: int = 25, as_of: str = None):
+    """Judge every forecast whose due date has passed."""
+    try:
+        return await grade_due_horizon_predictions(
+            limit=max(1, min(int(limit), 100)), as_of=as_of)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except AgentRuntimeUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    except Exception as exc:
+        logger.warning("horizon grading failed: %s", exc)
+        return JSONResponse(status_code=502,
+                            content={"error": f"grading failed: {exc}"})
+
+
+@app.put("/horizons/predictions/{prediction_id}")
+async def horizon_prediction_update(prediction_id: str, request: Request):
+    """The user's own verdict on a forecast, which outranks the grader's."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400,
+                            content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "expected an object"})
+    try:
+        updated = await asyncio.to_thread(
+            horizon_reviews.grade, prediction_id,
+            data.get("status") or "unclear", data.get("verdict") or "",
+            data.get("evidence") or [], "user", data.get("user_note"))
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if updated is None:
+        return JSONResponse(status_code=404,
+                            content={"error": "prediction not found"})
+    return updated
+
+
+@app.post("/horizons/generate")
+async def horizon_generate(horizon: str = "week", key: str = None,
+                           replace: bool = False):
+    try:
+        return await generate_horizon_review(horizon, key, replace=replace)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except AgentRuntimeUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    except Exception as exc:
+        logger.warning("horizon review failed: %s", exc)
+        return JSONResponse(status_code=502,
+                            content={"error": f"review failed: {exc}"})
+
+
+@app.get("/horizons/{horizon}")
+async def horizon_review(horizon: str, key: str = None):
+    """One window's review — the newest at that horizon unless `key` is given."""
+    if horizon not in HORIZONS:
+        return JSONResponse(status_code=400,
+                            content={"error": f"unknown horizon: {horizon}"})
+    review = await asyncio.to_thread(horizon_reviews.get_review, horizon, key)
+    if review is None:
+        closed = horizon_closed_key(horizon)
+        return {"status": "not_generated", "horizon": horizon,
+                "label": HORIZON_LABELS[horizon],
+                "period_key": key or closed, "predictions": []}
+    return {"status": "ready", **review}
+
+
+@app.get("/horizons/{horizon}/history")
+async def horizon_history(horizon: str, limit: int = 24):
+    if horizon not in HORIZONS:
+        return JSONResponse(status_code=400,
+                            content={"error": f"unknown horizon: {horizon}"})
+    return {"horizon": horizon,
+            "reviews": await asyncio.to_thread(
+                horizon_reviews.reviews, horizon, limit)}
+
+
+# ---------------------------------------------------------------------------
+# Quran Room
+#
+# Three durable things: the passage reports (journey), the deduplicated word
+# deck built out of them (vocabulary), and the user's own recall mark on each
+# word. The mark is his; nothing the model produces may overwrite it.
+
+@app.get("/quran/surahs")
+async def quran_surahs():
+    """The chapter list the passage picker is built from."""
+    return {"surahs": [{"number": index, "name": name, "verses": verses}
+                       for index, (name, verses) in enumerate(QURAN_SURAHS, 1)]}
+
+
+@app.get("/quran/journey")
+async def quran_journey(limit: int = 200, guides: bool = True):
+    """Every report written so far, newest first, with progress totals."""
+    def load():
+        return {"sessions": quran_study.sessions(limit=limit, with_guide=guides),
+                "stats": quran_study.stats()}
+    return await asyncio.to_thread(load)
+
+
+@app.post("/quran/study-guide")
+async def quran_generate_study_guide(request: Request):
+    """Write (or rewrite) the report for one passage and store it."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400,
+                            content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "expected an object"})
+    try:
+        session = await generate_quran_study_guide(
+            data.get("surah"), data.get("from"), data.get("to"),
+            date=data.get("date"), replace=bool(data.get("replace", True)))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except AgentRuntimeUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    except ValidationError as exc:
+        logger.warning("Quran study guide failed validation twice: %s", exc)
+        return JSONResponse(status_code=502, content={
+            "error": "the study report came back incomplete twice; try again"})
+    except Exception as exc:
+        logger.warning("Quran study guide failed: %s", exc)
+        return JSONResponse(status_code=502,
+                            content={"error": f"study guide failed: {exc}"})
+    return session
+
+
+@app.put("/quran/sessions/{session_id}/reflection")
+async def quran_set_reflection(session_id: str, request: Request):
+    """What stayed with him about a passage, kept beside its report."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400,
+                            content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "expected an object"})
+    session = await asyncio.to_thread(
+        quran_study.set_reflection, session_id, data.get("reflection"))
+    if session is None:
+        return JSONResponse(status_code=404, content={"error": "session not found"})
+    await asyncio.to_thread(_sync_quran_canvas)
+    return session
+
+
+@app.get("/quran/vocabulary")
+async def quran_vocabulary(status: str = None, limit: int = 1000):
+    """The whole deck, deduplicated across every passage studied."""
+    try:
+        def load():
+            return {"words": quran_study.vocabulary(status=status, limit=limit),
+                    "stats": quran_study.stats()}
+        return await asyncio.to_thread(load)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.put("/quran/vocabulary/{word_id}")
+async def quran_set_word_status(word_id: str, request: Request):
+    """His own mark: still learning this word, or now remembers it."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400,
+                            content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "expected an object"})
+    try:
+        word = await asyncio.to_thread(
+            quran_study.set_word_status, word_id, data.get("status"))
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if word is None:
+        return JSONResponse(status_code=404, content={"error": "word not found"})
+    await asyncio.to_thread(_sync_quran_canvas)
+    return word
+
+
+@app.get("/memory/audits")
+async def memory_audits(limit: int = 50, evidence_id: str = None):
+    """The full trail of changes the user's answers made to personal memory."""
+    return {"audits": await asyncio.to_thread(
+        personal_memory.audit_log, limit, evidence_id)}
+
+
+@app.post("/memory/audits/{audit_id}/revert")
+async def memory_audit_revert(audit_id: str):
+    """Undo one memory change. The answer was ground truth; the reading of it
+    was a model's, so every applied verdict stays reversible."""
+    reverted = await asyncio.to_thread(personal_memory.revert_audit, audit_id)
+    if reverted is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "unknown or already reverted audit"})
+    return reverted
+
+
+@app.get("/memory/verification")
+async def memory_verification(limit: int = 20):
+    """Which beliefs the system is leaning on without ever having been told."""
+    def load():
+        return {"stats": personal_memory.verification_stats(),
+                "needs_verification": personal_memory.needs_verification(limit=limit)}
+    return await asyncio.to_thread(load)
+
+
+@app.get("/rooms/{room_id}/canvas")
+async def room_canvas_get(room_id: str):
+    return room_canvas_store.get(room_id) or {
+        "room_id": room_id, "updated_at": None, "canvas": {}}
+
+
+@app.put("/rooms/{room_id}/canvas")
+async def room_canvas_put(room_id: str, request: Request):
+    try:
+        data = await request.json()
+        canvas = data.get("canvas") if isinstance(data, dict) else None
+        return room_canvas_store.put(room_id, canvas)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.get("/accountability/calories")
+async def accountability_calories():
+    """Return durable calorie estimates used by Life Studio and reports."""
+    return {"estimates": calorie_estimate_store.lookup()}
+
+
+@app.post("/creative-coach/calories/estimate")
+async def creative_coach_calories_estimate(request: Request):
+    """Estimate newly logged foods and return an inspectable per-item total.
+
+    Claude may use the Creative Coach's browser tool for foods with a useful
+    authoritative listing. When the agent runtime is unavailable, the same
+    structured request falls back to the configured model's food knowledge.
+    """
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    raw_entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(raw_entries, list):
+        return JSONResponse(
+            status_code=400, content={"error": "entries must be a list"})
+    entries = [str(item or "").strip()[:300] for item in raw_entries]
+    entries = [item for item in entries if item][:40]
+    if not entries:
+        return {"items": [], "total_kcal": 0, "approximate": False}
+
+    built_in = get_agent("agent:creative-coach")
+    if neo4j_store is not None:
+        neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
+        room = dict(neo4j_store.get_room("agent:creative-coach") or {})
+        # This endpoint is explicitly the browser-capable food workflow. An
+        # older persisted built-in room may predate that default, so do not let
+        # its stale tool list silently downgrade an interactive estimate.
+        room["agent_tools"] = list(dict.fromkeys([
+            *(room.get("agent_tools") or []), "graph", "mcp:browser",
+        ]))
+    else:
+        room = {
+            "room_id": built_in.room_id,
+            "assistant_mode": built_in.assistant_mode,
+            "execution_profile": built_in.execution_profile,
+            "agent_tools": list(built_in.agent_tools),
+        }
+    try:
+        await estimate_missing_calories(
+            entries,
+            calorie_estimate_store,
+            conversation_manager.complete,
+            room_id="agent:creative-coach",
+            room=room,
+            allow_agent=True,
+            include_explicit=True,
+        )
+    except AgentRuntimeUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    except Exception as exc:
+        logger.warning("Interactive calorie estimation failed: %s", exc)
+
+    items = []
+    total = 0
+    approximate = False
+    for text in entries:
+        stated = explicit_calories(text)
+        cached = calorie_estimate_store.get(text)
+        if stated:
+            item = {
+                "text": text,
+                "key": normalize_food_text(text),
+                "kcal": stated,
+                "source": "user",
+                "basis": "stated in the log",
+                "confidence": 1.0,
+                "protein_g": cached.get("protein_g", 0) if cached else 0,
+                "carbohydrate_g": cached.get(
+                    "carbohydrate_g", 0) if cached else 0,
+                "fat_g": cached.get("fat_g", 0) if cached else 0,
+                "fibre_g": cached.get("fibre_g", 0) if cached else 0,
+                "vitamin_d_mcg": cached.get(
+                    "vitamin_d_mcg", 0) if cached else 0,
+                "ingredients": cached.get("ingredients", []) if cached else [],
+                "food_groups": cached.get("food_groups", []) if cached else [],
+            }
+        else:
+            item = {
+                "text": text,
+                "key": normalize_food_text(text),
+                "kcal": cached.get("kcal") if cached else None,
+                "source": cached.get("source") if cached else None,
+                "basis": cached.get("basis") if cached else "",
+                "confidence": cached.get("confidence") if cached else 0.0,
+                "protein_g": cached.get("protein_g", 0) if cached else 0,
+                "carbohydrate_g": cached.get(
+                    "carbohydrate_g", 0) if cached else 0,
+                "fat_g": cached.get("fat_g", 0) if cached else 0,
+                "fibre_g": cached.get("fibre_g", 0) if cached else 0,
+                "vitamin_d_mcg": cached.get(
+                    "vitamin_d_mcg", 0) if cached else 0,
+                "ingredients": cached.get("ingredients", []) if cached else [],
+                "food_groups": cached.get("food_groups", []) if cached else [],
+            }
+            approximate = True
+        if isinstance(item["kcal"], int):
+            total += item["kcal"]
+        items.append(item)
+    return {"items": items, "total_kcal": total,
+            "approximate": approximate,
+            "unresolved": sum(item["kcal"] is None for item in items)}
 
 
 @app.get("/memory/long-term")
@@ -1313,11 +2824,14 @@ async def agent_runtime_status():
 
 def _validate_room_agent_settings(data):
     """Normalize persisted room execution settings from create/patch payloads."""
-    if "assistant_mode" in data:
-        mode = str(data.get("assistant_mode") or "").strip().lower()
-        if mode not in {"chat", "agent"}:
-            raise ValueError("assistant_mode must be 'chat' or 'agent'")
-        data["assistant_mode"] = mode
+    # Accepted for older clients, but Claude Code is now the common runtime.
+    data["assistant_mode"] = "agent"
+    if "execution_profile" in data:
+        profile = str(data.get("execution_profile") or "").strip().lower()
+        if profile not in {"quick", "investigate", "act"}:
+            raise ValueError(
+                "execution_profile must be 'quick', 'investigate', or 'act'")
+        data["execution_profile"] = profile
     if "agent_tools" in data:
         raw = data.get("agent_tools")
         if not isinstance(raw, list):
@@ -1329,7 +2843,9 @@ def _validate_room_agent_settings(data):
         unknown = [item for item in selected if item not in available]
         if unknown:
             raise ValueError("unknown agent tools: " + ", ".join(unknown))
-        data["agent_tools"] = selected
+        # Graph memory is the baseline room capability. External/write-capable
+        # MCP servers remain explicit grants.
+        data["agent_tools"] = list(dict.fromkeys(["graph", *selected]))
     if "agent_workspace" in data:
         workspace = str(data.get("agent_workspace") or "").strip()
         # Resolve here as validation, but only create it when an agent actually
@@ -1381,8 +2897,9 @@ async def rooms_create(request: Request):
             room_id=room_id, name=name, kind="topic", auto=False, matcher=matcher,
             description=str(data.get("description") or "").strip(),
             instructions=str(data.get("instructions") or "").strip(),
-            assistant_mode=data.get("assistant_mode", "chat"),
-            agent_tools=data.get("agent_tools") or [],
+            assistant_mode="agent",
+            execution_profile=data.get("execution_profile", "investigate"),
+            agent_tools=data.get("agent_tools") or ["graph"],
             agent_workspace=data.get("agent_workspace") or "",
             agent_request_limit=data.get("agent_request_limit") or 0,
             agent_tool_calls_limit=data.get("agent_tool_calls_limit") or 0,
@@ -1521,13 +3038,16 @@ async def daily_report(date: str = None, post: bool = True):
     feedback = ""
     if metrics.get("events"):
         try:
-            resp = await client.chat.completions.create(
-                model=vlm_model,
-                messages=[{"role": "user", "content": coach_prompt(
-                    metrics, claims, comparison=comparison)}],
-                max_tokens=350,
-                **thinking_request_kwargs(False))
-            feedback = (resp.choices[0].message.content or "").strip()
+            result = await _creative_coach_report_complete(
+                coach_prompt(
+                    metrics, claims, comparison=comparison,
+                    reflection_context=_reflection_block(
+                        query="today focus energy sleep mood work plans",
+                        limit=8, days=7, max_chars=4000, answer_chars=900)),
+                max_tokens=350)
+            feedback = result.reply.strip()
+        except AgentRuntimeUnavailable as exc:
+            return JSONResponse(status_code=503, content={"error": str(exc)})
         except Exception as exc:
             logger.warning("coach feedback LLM failed: %s", exc)
 
@@ -1587,8 +3107,97 @@ async def tomorrow_plan_generate(request: Request):
     ).isoformat()
     try:
         plan = await generate_tomorrow_plan(date_str)
+    except AgentPacingError as exc:
+        # Checked first: it is a RuntimeError subclass.
+        return JSONResponse(status_code=429, content={
+            "error": str(exc), "retry_after_seconds": exc.seconds_remaining})
     except (KeyError, RuntimeError, ValueError) as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
+    return tomorrow_plan_store.payload(plan)
+
+
+@app.post("/planner/plans/{date_str}/tasks")
+async def tomorrow_plan_add_task(date_str: str, request: Request):
+    """Manually add a task, even after tracking has started or before a plan exists."""
+    try:
+        datetime.date.fromisoformat(date_str)
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("task must be an object")
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    try:
+        plan = tomorrow_plan_store.add_task(date_str, data)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return tomorrow_plan_store.payload(plan)
+
+
+@app.delete("/planner/plans/{date_str}/tasks/{task_id}")
+async def tomorrow_plan_delete_task(date_str: str, task_id: str):
+    """Remove a task for good — the user's only way to retire open work.
+
+    Deliberately unrestricted by plan phase: a task he has decided against
+    should not survive because it is past 10:30.
+    """
+    try:
+        plan, removed = tomorrow_plan_store.delete_task(date_str, task_id)
+    except KeyError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    if neo4j_store is not None and not removed.get("completed"):
+        # Dropping work is a decision worth a record: the accountability rooms
+        # should be able to ask why, rather than watch it vanish silently.
+        neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
+        neo4j_store.add_message(
+            PLANNER_ROOM, "user",
+            f"DELETED an uncompleted task: {removed['title']} "
+            f"(first planned {removed.get('first_planned_on') or date_str}, "
+            f"carried {removed.get('carried_count') or 0} time(s)).")
+    return tomorrow_plan_store.payload(plan)
+
+
+@app.patch("/planner/plans/{date_str}/tasks/{task_id}/details")
+async def tomorrow_plan_task_details(
+    date_str: str, task_id: str, request: Request
+):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("task must be an object")
+        plan = tomorrow_plan_store.update_task(date_str, task_id, data)
+    except KeyError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return tomorrow_plan_store.payload(plan)
+
+
+@app.post("/planner/plans/{date_str}/tasks/{task_id}/delay-response")
+async def tomorrow_plan_delay_response(
+    date_str: str, task_id: str, request: Request
+):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("response must be an object")
+        plan, task = tomorrow_plan_store.record_delay(
+            date_str, task_id, data.get("reason"), data.get("new_deadline"))
+    except KeyError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+    reason = task["delay_history"][-1]["reason"]
+    rescheduled = task["delay_history"][-1].get("new_deadline")
+    audit = (
+        f"DELAY RESPONSE: {task['title']} — reason: {reason}. "
+        + (f"Rescheduled to {rescheduled}." if rescheduled
+           else "No new deadline was chosen.")
+    )
+    if neo4j_store is not None:
+        neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
+        for room_id in (PLANNER_ROOM, "agent:roaster", "agent:creative-coach"):
+            neo4j_store.add_message(room_id, "user", audit)
     return tomorrow_plan_store.payload(plan)
 
 
@@ -1620,7 +3229,7 @@ async def tomorrow_plan_update(date_str: str, request: Request):
 async def tomorrow_plan_task_update(
     date_str: str, task_id: str, request: Request
 ):
-    """Manually check or uncheck a task without rewriting the plan."""
+    """Check or uncheck a task. The only path that can ever complete one."""
     try:
         data = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -1634,11 +3243,6 @@ async def tomorrow_plan_task_update(
     plan = tomorrow_plan_store.get(date_str)
     if plan is None:
         return JSONResponse(status_code=404, content={"error": "plan not found"})
-    if tomorrow_plan_phase(plan) == "draft":
-        return JSONResponse(
-            status_code=409,
-            content={"error": "manual tracking begins at 10:30 AM"},
-        )
     try:
         updated = tomorrow_plan_store.set_completed(
             date_str, task_id, data["completed"]
@@ -1657,15 +3261,225 @@ async def tomorrow_plan_finalize(date_str: str):
     return tomorrow_plan_store.payload(plan)
 
 
-@app.post("/planner/plans/{date_str}/evaluate")
-async def tomorrow_plan_evaluate(date_str: str):
+@app.get("/planner/open-tasks")
+async def tomorrow_plan_open_tasks():
+    """Everything still open anywhere, oldest first — the accountability feed."""
+    return {"tasks": tomorrow_plan_store.open_tasks(),
+            "stale_after_days": TOMORROW_STALE_AFTER_DAYS}
+
+
+@app.get("/calendar")
+async def calendar_overview(days: int = 14, past_days: int = 7):
+    """The whole calendar in one call: the week, the window, and what it means.
+
+    `days` of resolved days are returned rather than raw entries, because the
+    expectation for a date is the answer to the only question anyone asks of
+    this file, and recomputing the precedence rule in the client would give the
+    dashboard and the agents two different opinions about a sick day.
+
+    `labels` is what he has typed before, not a vocabulary the server issues —
+    the editor offers it as chips and accepts anything else he writes.
+    """
+    today = datetime.date.today()
+    first = today - datetime.timedelta(days=max(0, min(int(past_days), 90)))
+    last = today + datetime.timedelta(days=max(0, min(int(days), 366)))
+    return {
+        "today": today.isoformat(),
+        "routine": calendar_store.routine(),
+        "entries": calendar_store.entries(first.isoformat(), last.isoformat()),
+        "days": calendar_store.days(first.isoformat(), last.isoformat()),
+        "expectations": list(CALENDAR_EXPECTATIONS),
+        "repeats": list(CALENDAR_REPEATS),
+        "labels": calendar_store.labels(),
+    }
+
+
+@app.get("/calendar/day/{date_str}")
+async def calendar_day(date_str: str):
+    """One date resolved: the routine in force, and what suspended it."""
     try:
-        plan = await evaluate_tomorrow_plan(date_str)
+        return calendar_store.day(date_str)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.get("/calendar/routine")
+async def calendar_routine():
+    return {"routine": calendar_store.routine()}
+
+
+@app.put("/calendar/routine")
+async def calendar_set_routine(request: Request):
+    """Replace the standing week — the editor sends the list it now holds."""
+    try:
+        data = await request.json()
+        blocks = data.get("routine") if isinstance(data, dict) else data
+        if not isinstance(blocks, list):
+            raise ValueError("routine must be a list of blocks")
+        return {"routine": calendar_store.set_routine(blocks)}
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.post("/calendar/routine")
+async def calendar_add_routine(request: Request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("a routine block must be an object")
+        return calendar_store.add_routine(data)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.patch("/calendar/routine/{block_id}")
+async def calendar_update_routine(block_id: str, request: Request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("a routine block must be an object")
+        return calendar_store.update_routine(block_id, data)
     except KeyError as exc:
         return JSONResponse(status_code=404, content={"error": str(exc)})
-    except (RuntimeError, ValueError) as exc:
-        return JSONResponse(status_code=409, content={"error": str(exc)})
-    return tomorrow_plan_store.payload(plan)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.delete("/calendar/routine/{block_id}")
+async def calendar_delete_routine(block_id: str):
+    try:
+        return calendar_store.delete_routine(block_id)
+    except KeyError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+
+
+@app.get("/calendar/entries")
+async def calendar_entries(start: str = None, end: str = None):
+    try:
+        return {"entries": calendar_store.entries(start, end)}
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.post("/calendar/entries")
+async def calendar_add_entry(request: Request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("a calendar entry must be an object")
+        return calendar_store.add_entry(data)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.patch("/calendar/entries/{entry_id}")
+async def calendar_update_entry(entry_id: str, request: Request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("a calendar entry must be an object")
+        return calendar_store.update_entry(entry_id, data)
+    except KeyError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.delete("/calendar/entries/{entry_id}")
+async def calendar_delete_entry(entry_id: str):
+    try:
+        return calendar_store.delete_entry(entry_id)
+    except KeyError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+
+
+@app.post("/motivation/score")
+async def motivation_score(request: Request):
+    """Score detected work 1-5 for Meaningful Today's satisfaction bar.
+
+    The room's timeline is built entirely from detected evidence — completed
+    focus sessions and substantial captured work — so the points are the only
+    judgement in it, and they are made by the agent rather than typed in. Plan
+    tasks are deliberately not a source: nothing may infer that one was done.
+    Between runs (the room may start one automatic agent run per
+    `AGENT_ROOM_MIN_GAP_SECONDS`) the deterministic rule answers instead, which
+    is why every response says which one scored it.
+    """
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(status_code=400,
+                            content={"error": f"invalid JSON: {exc}"})
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return JSONResponse(status_code=400,
+                            content={"error": "items must be a list"})
+    candidates = []
+    for item in items[:40]:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "").strip()
+        title = str(item.get("title") or "").strip()
+        if not item_id or not title:
+            continue
+        try:
+            minutes = max(0, int(float(item.get("minutes") or 0)))
+        except (TypeError, ValueError):
+            minutes = 0
+        candidates.append({"id": item_id, "title": title, "minutes": minutes,
+                           "evidence": str(item.get("evidence") or "").strip()})
+    if not candidates:
+        return {"scores": [], "scored_by": "heuristic"}
+
+    fallback = {item["id"]: activity_satisfaction(item["minutes"])
+                for item in candidates}
+    remaining = agent_pacer.seconds_remaining(MOTIVATION_ROOM)
+    if not agent_pacer.claim(MOTIVATION_ROOM):
+        return {"scores": [{"id": key, "satisfaction": value,
+                            "reason": "scored from measured effort"}
+                           for key, value in fallback.items()],
+                "scored_by": "heuristic",
+                "retry_after_seconds": int(remaining)}
+
+    prompt = f"""Score each piece of the user's detected work today by how much
+satisfaction it genuinely earns.
+{SATISFACTION_RUBRIC}
+
+Score every item exactly once, reusing its `id`. Return ONLY JSON:
+{{"scores": [{{"id": "item id", "satisfaction": 3, "reason": "one short clause"}}]}}
+
+Detected work:
+{json.dumps(candidates, ensure_ascii=False)}
+"""
+    scored_by = "agent"
+    scores = dict(fallback)
+    reasons = {}
+    try:
+        result = await _intelligent_complete(
+            room_id=MOTIVATION_ROOM,
+            room=(neo4j_store.get_room(MOTIVATION_ROOM)
+                  if neo4j_store is not None else None),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=900,
+            output_type=SatisfactionScores,
+        )
+        for score in result.output.scores:
+            if score.id in scores:
+                scores[score.id] = clamp_satisfaction(score.satisfaction)
+                reasons[score.id] = score.reason.strip()
+    except AgentRuntimeUnavailable:
+        agent_pacer.release(MOTIVATION_ROOM)
+        scored_by = "heuristic"
+    except Exception as exc:
+        logger.warning("meaningful-today scoring failed: %s", exc)
+        scored_by = "heuristic"
+    return {
+        "scores": [{"id": item["id"], "satisfaction": scores[item["id"]],
+                    "reason": reasons.get(item["id"], "")}
+                   for item in candidates],
+        "scored_by": scored_by,
+        "range": [SATISFACTION_MIN, SATISFACTION_MAX],
+    }
 
 
 @app.post("/rooms/hygiene/archive")
@@ -1802,11 +3616,13 @@ async def room_arc(room_id: str, weeks: int = 8, narrate: bool = False):
             "and where it stands now. Be specific and do not invent anything.\n\n"
             f"Project/room: {room.get('name')}\n\n" + "\n".join(lines))
         try:
-            response = await client.chat.completions.create(
-                model=vlm_model, messages=[{"role": "user", "content": prompt}],
-                max_tokens=400,
-                **thinking_request_kwargs(False))
-            result["narrative"] = (response.choices[0].message.content or "").strip()
+            response = await _intelligent_complete(
+                room_id=room_id, room=room,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=400)
+            result["narrative"] = response.reply.strip()
+        except AgentRuntimeUnavailable:
+            raise
         except Exception as exc:
             logger.warning("room arc narration failed: %s", exc)
             result["narrative"] = None
@@ -2076,6 +3892,47 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
     relevant_lines = [
         f"[{item['number']}] ({item['kind']}) {item['text']}" for item in citations]
 
+    # What the user wrote about himself, retrieved against this actual question.
+    # Every room gets it, because the user answered these at length and it would
+    # be indefensible for the Research room to re-ask what he already explained
+    # in a reflection answer. Life Studio still gets the wide recent set: it
+    # coaches the whole person rather than one topic.
+    reflection_block = ""
+    try:
+        if room_id == "agent:creative-coach":
+            reflection_block = daily_reflections.prompt_context(
+                query=message, limit=40, days=14, max_chars=20000,
+                answer_chars=1600)
+        elif agent is not None:
+            reflection_block = daily_reflections.prompt_context(
+                query=f"{agent.description} {message}", limit=8, days=400,
+                max_chars=4500)
+        else:
+            # An ordinary topic room only wants an answer that genuinely bears
+            # on the question; a loose match here is noise, not grounding.
+            reflection_block = daily_reflections.prompt_context(
+                query=message, limit=3, days=400, max_chars=1800, strict=True)
+    except Exception as exc:
+        logger.warning("Loading reflection answers for %s failed: %s", room_id, exc)
+
+    # How long he has been sitting on his own commitments is cross-room
+    # evidence, so every personal agent gets it rather than the planner alone —
+    # the Roaster should be able to open with it, and Wisdom or the Quran room
+    # should not be the last to know that nothing has moved in a fortnight.
+    task_accountability = ""
+    # What he said the days were. Without it a room reading a week of gaps has
+    # exactly one story available to it — avoidance — and will tell that story
+    # about a week he spent ill or travelling. Every personal agent gets it for
+    # the same reason they all get the open-task ages: whichever room speaks
+    # first should already know, rather than being corrected by him afterwards.
+    calendar_block = ""
+    if agent is not None:
+        task_accountability = tomorrow_plan_store.accountability_context()
+        try:
+            calendar_block = calendar_store.prompt_context()
+        except Exception as exc:
+            logger.warning("Loading the calendar for %s failed: %s", room_id, exc)
+
     if agent is not None:
         grounding = (
             f"You are {agent.name}, one of the user's persistent personal agents. "
@@ -2084,7 +3941,17 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
             "but do not force every detail into every answer.\n\n"
             f"Your role:\n{agent.instructions}\n\n{INITIATIVE_PROMPT}\n\n"
             f"{personal_memory.context(query=message) or 'No personal profile facts learned yet.'}\n\n"
-            "Today's observed PC activity:\n- "
+            + (reflection_block + "\n\n" if reflection_block else "")
+            + ("Open task accountability (his own uncompleted commitments; "
+               "nothing here was auto-verified and nothing closes itself):\n"
+               + task_accountability + "\n\n" if task_accountability else "")
+            + ("His calendar — the routine he intends and the dated facts that "
+               "change what a day was. He wrote all of it himself; nothing here "
+               "was inferred, and the bracketed words are his own labels rather "
+               "than app categories, so read them as you would read anything "
+               "else he told you:\n" + calendar_block + "\n\n"
+               if calendar_block else "")
+            + "Today's observed PC activity:\n- "
             + "\n- ".join((daily_ctx or {}).get("events", []) or ["(none yet)"])
             + "\n\nMost relevant long-term activity or memory:\n- "
             + "\n- ".join(relevant_lines or ["(none)"])
@@ -2096,7 +3963,8 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
             f"You are the user's assistant, chatting inside the '{room.get('name', room_id)}' room. "
             "This room collects the user's activity, notes, and your past chat on this topic. "
             "Use the context to answer; be concise and specific. " + INITIATIVE_PROMPT + "\n\n"
-            f"Most relevant to this question:\n- " + "\n- ".join(relevant_lines or ["(none)"]) + "\n\n"
+            + (reflection_block + "\n\n" if reflection_block else "")
+            + f"Most relevant to this question:\n- " + "\n- ".join(relevant_lines or ["(none)"]) + "\n\n"
             f"Recent activity in this room:\n- " + "\n- ".join(ctx["events"][:8] or ["(none)"]) + "\n\n"
             f"User's notes here:\n- " + "\n- ".join(ctx["notes"][:8] or ["(none)"]) + "\n\n"
             f"Key things seen here: {', '.join(ctx['entities'][:15]) or '(none)'}"
@@ -2155,6 +4023,19 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
     return messages, citations, meta
 
 
+def _merge_agent_citations(citations, agent_meta):
+    """Merge evidence discovered during the tool loop into normal citations."""
+    merged = [dict(item) for item in (citations or [])]
+    seen = {(str(item.get("kind")), str(item.get("id"))) for item in merged}
+    for item in (agent_meta or {}).get("citations") or []:
+        key = (str(item.get("kind")), str(item.get("id")))
+        if not item.get("text") or key in seen:
+            continue
+        seen.add(key)
+        merged.append({**item, "number": len(merged) + 1})
+    return merged
+
+
 @app.get("/rooms/{room_id}/sources")
 async def room_sources(room_id: str, start: float = None, end: float = None):
     """The apps/cameras with events in this room — one filter chip each.
@@ -2203,6 +4084,9 @@ async def room_chat(room_id: str, request: Request):
             max_tokens=700 if get_agent(room_id) is not None else 500,
             thinking=turn["thinking"],
             thinking_budget=turn["thinking_budget"],
+            require_agent=turn["thinking"],
+            use_all_tools=turn["thinking"],
+            effort="high" if turn["thinking"] else None,
         )
         reply = result.reply
     except AgentRuntimeUnavailable as exc:
@@ -2212,7 +4096,8 @@ async def room_chat(room_id: str, request: Request):
         logger.warning("room_chat LLM failed: %s", exc)
         return JSONResponse(status_code=502, content={"error": f"chat failed: {exc}"})
 
-    neo4j_store.add_message(room_id, "assistant", reply)
+    citations = _merge_agent_citations(citations, result.agent)
+    neo4j_store.add_message(room_id, "assistant", reply, citations=citations)
     response = {
         "room_id": room_id,
         "reply": reply,
@@ -2222,6 +4107,16 @@ async def room_chat(room_id: str, request: Request):
     if result.execution == "agent":
         response.update({"execution": "agent", "agent": result.agent})
     return response
+
+
+def _check_in_prompt(prompt):
+    """Bend an unprompted check-in to the day the user says he is having."""
+    try:
+        directive = calendar_store.check_in_directive()
+    except Exception as exc:
+        logger.warning("Reading today's calendar for a check-in failed: %s", exc)
+        return prompt
+    return f"{directive}\n\n{prompt}" if directive else prompt
 
 
 async def _run_agent_check_in(room_id, prompt=None):
@@ -2239,11 +4134,14 @@ async def _run_agent_check_in(room_id, prompt=None):
     if neo4j_store.get_room(room_id) is None:
         neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
     messages, citations, meta = _room_chat_turn(
-        room_id, prompt if prompt is not None else agent.check_in)
-    result = await conversation_manager.complete(
+        room_id, _check_in_prompt(
+            prompt if prompt is not None else agent.check_in))
+    result = await _intelligent_complete(
         room_id=room_id, room=neo4j_store.get_room(room_id),
         messages=messages, max_tokens=750)
-    neo4j_store.add_message(room_id, "assistant", result.reply)
+    citations = _merge_agent_citations(citations, result.agent)
+    neo4j_store.add_message(
+        room_id, "assistant", result.reply, citations=citations)
     response = {"room_id": room_id, "reply": result.reply,
                 "citations": citations, **meta}
     if result.execution == "agent":
@@ -2284,11 +4182,13 @@ async def room_chat_stream(room_id: str, request: Request):
     except RoomScopeError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
-    def persist(reply):
-        return neo4j_store.add_message(room_id, "assistant", reply)
+    def persist(reply, resolved_citations=None):
+        return neo4j_store.add_message(
+            room_id, "assistant", reply,
+            citations=resolved_citations or citations)
 
     room = neo4j_store.get_room(room_id)
-    if conversation_manager.uses_agent(room_id, room):
+    if conversation_manager.uses_agent(room_id, room) or turn["thinking"]:
         return StreamingResponse(
             _stream_agent_reply(
                 room_id=room_id,
@@ -2674,38 +4574,106 @@ async def assistant_conversation_delete(conversation_id: str):
     return {"deleted": True}
 
 
-def _assistant_scope(conversation):
+def _assistant_scope(conversation, message=None):
     """(start, end, room_id) for a conversation's declared memory scope."""
     start, end, room_id = conversation.get("from_ts"), conversation.get("to_ts"), None
-    if conversation.get("scope") == "today":
+    scope = conversation.get("scope")
+    if scope == "today":
         start = datetime.datetime.combine(
             datetime.date.today(), datetime.time.min).timestamp()
         end = start + 86400
-    elif conversation.get("scope") == "room":
+    elif scope == "room":
         room_id = conversation.get("room_id")
+    # A conversation's broad scope is its maximum permission, not a reason to
+    # ignore a narrower date in the current question.  Resolve ordinary date
+    # language for both all-memory and room conversations.
+    if message and scope in {"all", "room"}:
+        requested_start, requested_end, _ = temporal_window(message)
+        if requested_start is not None:
+            start, end = requested_start, requested_end
     return start, end, room_id
 
 
 def _assistant_turn(conversation, message):
     """Retrieve evidence and build the prompt. Shared by the blocking and
     streaming endpoints so both answer identically."""
-    start, end, room_id = _assistant_scope(conversation)
+    start, end, room_id = _assistant_scope(conversation, message)
     evidence = evidence_retriever.retrieve(
-        message, limit=10, kinds=["event", "note", "claim"],
+        message, limit=15,
         start=start, end=end, room_id=room_id)
+
+    # Proactive remarks are durable Nudge nodes, while alerts from capture and
+    # scheduled agents live in NotificationCenter.  Keep a small recent slice in
+    # every broad grounded conversation so follow-ups such as "what did that
+    # notification mean?" work even when those words are absent from its body.
+    seen = {(item.get("kind"), item.get("id")) for item in evidence}
+    if room_id is None:
+        try:
+            nudges = neo4j_store.recent_nudges(start=start, end=end, limit=5)
+        except Exception as exc:
+            logger.warning("assistant proactive-insight retrieval failed: %s", exc)
+            nudges = []
+        for item in nudges:
+            key = (item.get("kind"), item.get("id"))
+            if key not in seen:
+                evidence.append(item)
+                seen.add(key)
+
+    try:
+        notifications = notification_center.list(limit=20).get("notifications", [])
+    except Exception as exc:
+        logger.warning("assistant notification retrieval failed: %s", exc)
+        notifications = []
+    kept_notifications = 0
+    for notice in notifications:
+        ts = notice.get("timestamp")
+        if ts is None or (start is not None and ts < start) or (end is not None and ts >= end):
+            continue
+        notice_room = notice.get("room_id")
+        if room_id is not None and notice_room != room_id:
+            continue
+        item = {
+            "kind": "notification", "id": notice.get("id"),
+            "title": notice.get("title") or "Notification",
+            "text": notice.get("body") or "", "ts": ts,
+            "span_start": ts, "span_end": ts,
+            "rooms": ([{"room_id": notice_room}] if notice_room else []),
+        }
+        key = (item["kind"], item["id"])
+        if key not in seen:
+            evidence.append(item)
+            seen.add(key)
+            kept_notifications += 1
+        if kept_notifications >= 5:
+            break
+
     citations = [{
         "number": index + 1, "kind": item.get("kind"), "id": item.get("id"),
         "title": item.get("title"), "text": item.get("text"),
-        "ts": item.get("ts"), "rooms": item.get("rooms") or [],
+        "ts": item.get("ts"),
+        "span_start": (item.get("span_start")
+                       if item.get("span_start") is not None else item.get("ts")),
+        "span_end": item.get("span_end"),
+        "rooms": item.get("rooms") or [],
     } for index, item in enumerate(evidence)]
-    evidence_text = "\n".join(
-        f"[{item['number']}] ({item['kind']}) {item['text']}"
-        for item in citations) or "(No matching stored memory was found.)"
+    evidence_text = "\n".join(format_evidence_line(item) for item in citations)
+    evidence_text = evidence_text or "(No matching stored memory was found.)"
+    now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    scope_text = "all stored memory"
+    if start is not None or end is not None:
+        start_text = (datetime.datetime.fromtimestamp(start).isoformat(sep=" ")
+                      if start is not None else "the beginning")
+        end_text = (datetime.datetime.fromtimestamp(end).isoformat(sep=" ")
+                    if end is not None else "now")
+        scope_text = f"the local-time window {start_text} through {end_text} (end exclusive)"
     system = (
         "You are the user's private, local-first assistant. Answer only from the "
         "provided memory evidence and ordinary reasoning. Never invent remembered "
         "facts. Cite supporting memories inline using [1], [2], etc. If evidence "
-        "is insufficient, say so clearly. " + INITIATIVE_PROMPT
+        "is insufficient, say so clearly. Event start/end ranges and notification "
+        "timestamps below are authoritative local times. "
+        f"Current local time: {now_text}. Retrieval scope: {scope_text}. "
+        + INITIATIVE_PROMPT
         + "\n\nMemory evidence:\n" + evidence_text
     )
     if room_id:
@@ -2720,18 +4688,63 @@ def _assistant_turn(conversation, message):
     return messages, citations
 
 
-async def _read_message(request):
-    """(message, error_response) from a JSON body with a `message` field."""
+ASSISTANT_MODES = {"direct", "thinking", "agent"}
+AGENT_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+async def _read_assistant_turn(request):
+    """(turn, error_response) for a grounded-assistant request.
+
+    Besides the message, a turn carries how the user wants it answered:
+    `direct` (local model, no reasoning trace), `thinking` (local model with the
+    Qwen thinking template on), or `agent` (Claude Agent SDK at `effort`).
+    """
     try:
         data = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         return None, JSONResponse(status_code=400,
                                   content={"error": f"invalid JSON: {exc}"})
-    message = (data.get("message") or "").strip() if isinstance(data, dict) else ""
+    if not isinstance(data, dict):
+        data = {}
+    message = (data.get("message") or "").strip()
     if not message:
         return None, JSONResponse(status_code=400,
                                   content={"error": "message is required"})
-    return message, None
+
+    mode = str(data.get("mode") or "").strip().lower()
+    if not mode:
+        # Older clients only sent a boolean; keep them working.
+        mode = "thinking" if data.get("thinking") else "direct"
+    if mode not in ASSISTANT_MODES:
+        return None, JSONResponse(
+            status_code=400,
+            content={"error": f"mode must be one of {sorted(ASSISTANT_MODES)}"})
+
+    effort = str(data.get("effort") or "high").strip().lower()
+    if mode == "agent" and effort not in AGENT_EFFORTS:
+        return None, JSONResponse(
+            status_code=400,
+            content={"error": f"effort must be one of {list(AGENT_EFFORTS)}"})
+
+    return {
+        "message": message,
+        "mode": mode,
+        "thinking": mode == "thinking",
+        "thinking_budget": data.get("thinking_budget"),
+        "effort": effort if mode == "agent" else None,
+    }, None
+
+
+def _assistant_agent_room(conversation):
+    """(room_id, room) the agent should run as for this conversation.
+
+    A room-scoped conversation inherits that room's tool allowlist, workspace
+    and run limits; an unscoped one runs under the generic assistant identity.
+    """
+    _, _, room_id = _assistant_scope(conversation)
+    if not room_id:
+        return "assistant", None
+    return str(room_id), neo4j_store.get_room(str(room_id))
 
 
 @app.post("/assistant/conversations/{conversation_id}/messages")
@@ -2739,31 +4752,56 @@ async def assistant_conversation_message(conversation_id: str, request: Request)
     """Answer from an explicit memory scope and return inspectable citations."""
     if neo4j_store is None:
         return JSONResponse(status_code=400, content={"error": "graph not enabled"})
-    message, error = await _read_message(request)
+    turn, error = await _read_assistant_turn(request)
     if error is not None:
         return error
     conversation = neo4j_store.get_conversation(conversation_id, message_limit=30)
     if conversation is None:
         return JSONResponse(status_code=404, content={"error": "conversation not found"})
 
-    messages, citations = _assistant_turn(conversation, message)
-    neo4j_store.add_conversation_message(conversation_id, "user", message)
+    messages, citations = _assistant_turn(conversation, turn["message"])
+    neo4j_store.add_conversation_message(conversation_id, "user", turn["message"])
+
+    if turn["mode"] == "agent":
+        room_id, room = _assistant_agent_room(conversation)
+        try:
+            result = await conversation_manager.complete(
+                room_id=room_id, room=room, messages=messages, max_tokens=700,
+                require_agent=True, use_all_tools=True,
+                thinking=True, thinking_budget=None, effort=turn["effort"])
+        except AgentRuntimeUnavailable as exc:
+            logger.warning("grounded assistant agent unavailable: %s", exc)
+            return JSONResponse(status_code=503, content={"error": str(exc)})
+        except Exception as exc:
+            logger.warning("grounded assistant agent failed: %s", exc)
+            return JSONResponse(status_code=502,
+                                content={"error": f"assistant failed: {exc}"})
+        citations = _merge_agent_citations(citations, result.agent)
+        saved = neo4j_store.add_conversation_message(
+            conversation_id, "assistant", result.reply, citations=citations)
+        return {"reply": result.reply, "citations": citations, "message": saved,
+                "execution": "agent", "agent": result.agent}
+
     try:
         response = await client.chat.completions.create(
-            model=vlm_model, messages=messages, max_tokens=700,
-            **thinking_request_kwargs(False))
+            job_label="Assistant reply",
+            model=vlm_model, messages=messages,
+            max_tokens=(max(700, env_int("THINKING_MAX_TOKENS", 18000))
+                        if turn["thinking"] else 700),
+            **thinking_request_kwargs(turn["thinking"], turn["thinking_budget"]))
         reply = (response.choices[0].message.content or "").strip()
     except Exception as exc:
         logger.warning("grounded assistant failed: %s", exc)
         return JSONResponse(status_code=502, content={"error": f"assistant failed: {exc}"})
     saved = neo4j_store.add_conversation_message(
         conversation_id, "assistant", reply, citations=citations)
-    return {"reply": reply, "citations": citations, "message": saved}
+    return {"reply": reply, "citations": citations, "message": saved,
+            "execution": "direct", "thinking": turn["thinking"]}
 
 
 async def _stream_agent_reply(
         room_id, room, messages, citations, on_complete, max_tokens=700, meta=None,
-        thinking=False, thinking_budget=None):
+        thinking=False, thinking_budget=None, effort=None):
     """NDJSON-compatible agent response including MCP tool results.
 
     The agent loop may make several model/tool round trips before text exists.
@@ -2777,6 +4815,7 @@ async def _stream_agent_reply(
         room_id,
         (room or {}).get("agent_request_limit"),
         (room or {}).get("agent_tool_calls_limit"),
+        (room or {}).get("execution_profile", "investigate"),
     )
     yield json.dumps({
         "type": "agent_progress",
@@ -2801,6 +4840,9 @@ async def _stream_agent_reply(
         max_tokens=max_tokens,
         thinking=thinking,
         thinking_budget=thinking_budget,
+        require_agent=thinking,
+        use_all_tools=thinking,
+        effort=effort or ("high" if thinking else None),
         progress=report,
     ))
     last_update = time.monotonic()
@@ -2831,11 +4873,12 @@ async def _stream_agent_reply(
             task.cancel()
 
     reply = result.reply
+    citations = _merge_agent_citations(citations, result.agent)
     if reply:
         yield json.dumps({"type": "delta", "text": reply}) + "\n"
     saved = None
     try:
-        saved = on_complete(reply)
+        saved = on_complete(reply, citations)
     except Exception as exc:
         logger.warning("persisting streamed agent reply failed: %s", exc)
     yield json.dumps({
@@ -2844,6 +4887,7 @@ async def _stream_agent_reply(
         "message": saved,
         "execution": result.execution,
         "agent": result.agent or None,
+        "citations": citations,
     }) + "\n"
 
 
@@ -2863,6 +4907,7 @@ async def _stream_reply(messages, citations, on_complete, max_tokens=700, meta=N
     parts = []
     try:
         stream = await client.chat.completions.create(
+            job_label="Assistant reply (streaming)",
             model=vlm_model, messages=messages,
             max_tokens=(max(max_tokens, env_int("THINKING_MAX_TOKENS", 18000))
                         if thinking else max_tokens), stream=True,
@@ -2894,22 +4939,32 @@ async def assistant_conversation_message_stream(conversation_id: str, request: R
     """Same answer as the blocking endpoint, streamed: citations, then tokens."""
     if neo4j_store is None:
         return JSONResponse(status_code=400, content={"error": "graph not enabled"})
-    message, error = await _read_message(request)
+    turn, error = await _read_assistant_turn(request)
     if error is not None:
         return error
     conversation = neo4j_store.get_conversation(conversation_id, message_limit=30)
     if conversation is None:
         return JSONResponse(status_code=404, content={"error": "conversation not found"})
 
-    messages, citations = _assistant_turn(conversation, message)
-    neo4j_store.add_conversation_message(conversation_id, "user", message)
+    messages, citations = _assistant_turn(conversation, turn["message"])
+    neo4j_store.add_conversation_message(conversation_id, "user", turn["message"])
 
-    def persist(reply):
+    def persist(reply, resolved_citations=None):
         return neo4j_store.add_conversation_message(
-            conversation_id, "assistant", reply, citations=citations)
+            conversation_id, "assistant", reply,
+            citations=resolved_citations or citations)
+
+    if turn["mode"] == "agent":
+        room_id, room = _assistant_agent_room(conversation)
+        return StreamingResponse(
+            _stream_agent_reply(room_id, room, messages, citations, persist,
+                                thinking=True, effort=turn["effort"]),
+            media_type="application/x-ndjson")
 
     return StreamingResponse(
-        _stream_reply(messages, citations, persist),
+        _stream_reply(messages, citations, persist,
+                      thinking=turn["thinking"],
+                      thinking_budget=turn["thinking_budget"]),
         media_type="application/x-ndjson")
 
 
@@ -2941,7 +4996,8 @@ PERIOD_HEADINGS = {"daily": "Daily report", "weekly": "Weekly report",
 async def report_activity(period: str = "daily", date: str = None,
                          compare: bool = True, include_home: bool = False,
                          baseline: str = "previous", baseline_date: str = None,
-                         baseline_start: str = None, baseline_end: str = None):
+                         baseline_start: str = None, baseline_end: str = None,
+                         narrate: bool = False):
     """One activity report: metrics, per-day/per-activity series, and text.
 
     The single endpoint behind the Reports view. `period` picks the window
@@ -2958,7 +5014,8 @@ async def report_activity(period: str = "daily", date: str = None,
     """
     if neo4j_store is None:
         return JSONResponse(status_code=400, content={"error": "graph not enabled"})
-    from memory.summary.coach import format_report
+    from memory.summary.accomplishments import rank_claims
+    from memory.summary.coach import format_report, report_prompt
 
     try:
         start, end = period_window(period, date or _today_iso())
@@ -2988,29 +5045,151 @@ async def report_activity(period: str = "daily", date: str = None,
     # gathers them across its days, newest first. Only days the series shows as
     # active are queried — a 30-day window is otherwise 60 round trips, most of
     # them asking empty days for nothing.
+    #
+    # A narrated report gets a far wider slice than the charts need. The writer
+    # is asked to judge the period, and a judgement formed on the top eight of
+    # anything is a judgement about the truncation.
+    claim_target = 60 if narrate else 12
+    entity_target = 40 if narrate else 12
     claims, entities = [], []
     active_days = [d["date"] for d in series if d["total_minutes"] > 0]
     for day in reversed(active_days):
-        if len(claims) >= 12 and len(entities) >= 12:
+        if len(claims) >= claim_target and len(entities) >= entity_target:
             break
-        claims.extend(neo4j_store.day_claims(day, limit=6, domain=domain))
-        entities.extend(neo4j_store.day_entities(day, limit=8, domain=domain))
+        claims.extend(neo4j_store.day_claims(
+            day, limit=20 if narrate else 6, domain=domain))
+        entities.extend(neo4j_store.day_entities(
+            day, limit=20 if narrate else 8, domain=domain))
     seen = set()
     entities = [e for e in entities
-                if not (e["name"] in seen or seen.add(e["name"]))][:12]
+                if not (e["name"] in seen or seen.add(e["name"]))][:entity_target]
 
-    return {
+    # Ranked before anything reads them: the raw claim list is dominated by
+    # bare observations ("checked this graph"), which made the old
+    # Accomplishments section actively misleading.
+    ranked_claims, claim_summary = rank_claims(
+        claims, limit=30 if narrate else 8)
+
+    # Hour of day, and the written reports around this window. Both are cheap
+    # and both are charted, so they are on every response rather than only on a
+    # narrated one.
+    hours = hour_histogram(neo4j_store.event_spans(start, end, domain=domain))
+    history_start, history_end = history_window(end)
+    try:
+        # Read through to this window's own end date so the score chart can
+        # include it. The *prompt* gets only the reports strictly before, so a
+        # rewrite is never handed its own previous draft to agree with.
+        stored_reports = neo4j_store.written_reports(history_start, end,
+                                                     period=period)
+    except Exception as exc:
+        # A missing label or an old graph must not take the report down.
+        logger.warning("Could not read written-report history: %s", exc)
+        stored_reports = []
+    history = [entry for entry in stored_reports
+               if (entry.get("end_date") or "") <= history_end]
+
+    raw_report = format_report(
+        metrics, claims=ranked_claims, entities=entities,
+        heading=PERIOD_HEADINGS[period], comparison=comparison, series=series)
+
+    payload = {
         "period": period, "period_days": PERIOD_DAYS[period],
         "start_date": start, "end_date": end,
         "domain": domain, "metrics": metrics,
         "series": series, "activities": series_activities(series),
         "by_activity": metrics.get("by_activity", []),
-        "comparison": comparison, "claims": claims[:12], "entities": entities,
-        "report": format_report(
-            metrics, claims=claims[:12], entities=entities,
-            heading=PERIOD_HEADINGS[period], comparison=comparison,
-            series=series),
+        "by_app": metrics.get("by_app", []),
+        "by_project": metrics.get("by_project", []),
+        "comparison": comparison,
+        "claims": ranked_claims,
+        "claim_summary": claim_summary,
+        "entities": entities,
+        "hours": hours,
+        "score_history": score_series(stored_reports),
+        "history_days": REPORT_HISTORY_DAYS,
+        "report": raw_report,
     }
+
+    # The report already written for this exact window, so reopening the day
+    # shows what it said instead of an empty tab and a button.
+    already = next((entry for entry in stored_reports
+                    if entry.get("end_date") == end), None)
+    if already:
+        payload["narrative"] = already.get("report") or None
+        payload["narrative_meta"] = {
+            "model": already.get("model"),
+            "effort": already.get("effort"),
+            "written_at": already.get("written_at"),
+            "stored": True,
+        }
+
+    if narrate:
+        # The deterministic report can only restate its inputs. Interpretation
+        # runs on the full Claude profile — adaptive thinking, effort xhigh,
+        # every tool, the whole period's evidence, and the last fortnight of its
+        # own reports for calibration. This is the one place in the reports path
+        # worth spending that on.
+        try:
+            result = await _creative_coach_report_complete(
+                report_prompt(
+                    metrics, claims=ranked_claims, entities=entities,
+                    comparison=comparison, series=series,
+                    period=PERIOD_HEADINGS[period].lower(),
+                    claim_summary=claim_summary,
+                    history=list(reversed(history)),
+                    hours=hours,
+                    raw_report=raw_report,
+                    # Why the period looked the way it did is something only he
+                    # can supply; the metrics only show that it did.
+                    reflection_context=_reflection_block(
+                        query=" ".join(
+                            project.get("label") or project.get("project", "")
+                            for project in metrics.get("by_project", [])[:6])
+                        + " work focus plans priorities energy",
+                        limit=14,
+                        days=max(14, PERIOD_DAYS.get(period, 1) * 2),
+                        max_chars=8000, answer_chars=1200)),
+                effort=os.getenv("REPORT_NARRATION_EFFORT", "xhigh"),
+                max_tokens=8000,
+                output_type=ActivityReport,
+            )
+            written = result.output.model_dump()
+            payload["narrative"] = written
+            payload["narrative_meta"] = {
+                "model": getattr(result, "model", None),
+                "effort": getattr(result, "effort", None),
+                "stored": False,
+            }
+            # The score chart was built before this run; put the score that was
+            # just given on it, replacing any earlier draft for the same window,
+            # so the reader does not have to reload to see their own day.
+            payload["score_history"] = score_series(
+                [entry for entry in stored_reports
+                 if entry.get("end_date") != end]
+                + [{"end_date": end, "headline": written.get("headline"),
+                    "overall_score": written.get("overall_score"),
+                    "report": written}])
+            # Stored so tomorrow's report can be calibrated against this one —
+            # which is the whole point of scoring a day.
+            try:
+                neo4j_store.save_written_report(
+                    end, period, written,
+                    model=getattr(result, "model", None),
+                    effort=getattr(result, "effort", None), start_date=start)
+                payload["narrative_meta"]["stored"] = True
+            except Exception as exc:
+                logger.warning("Could not store the written report: %s", exc)
+                payload["narrative_meta"]["store_error"] = str(exc)
+        except AgentRuntimeUnavailable as exc:
+            payload["narrative"] = None
+            payload["narrative_error"] = (
+                f"The writing agent is not available: {exc}")
+        except Exception as exc:
+            logger.exception("activity report narration failed")
+            payload["narrative"] = None
+            payload["narrative_error"] = str(exc)
+
+    return payload
 
 
 @app.get("/reviews/daily")
@@ -3126,13 +5305,17 @@ async def build_focus_recap(focus, post=False):
 
     labels = {}
     try:
-        response = await client.chat.completions.create(
-            model=vlm_model, max_tokens=600,
+        response = await _intelligent_complete(
+            room_id=focus.get("room_id") or "agent:creative-coach",
+            room=neo4j_store.get_room(
+                focus.get("room_id") or "agent:creative-coach"),
+            max_tokens=600,
             messages=[{"role": "user",
-                       "content": recap_mod.classify_prompt(goal, events)}],
-            **thinking_request_kwargs(False))
+                       "content": recap_mod.classify_prompt(goal, events)}])
         labels = recap_mod.parse_labels(
-            response.choices[0].message.content, len(events))
+            response.reply, len(events))
+    except AgentRuntimeUnavailable:
+        raise
     except Exception as exc:
         # Unlabelled events fall into "unknown", which the recap reports honestly
         # rather than scoring the session as a failure.
@@ -3143,12 +5326,16 @@ async def build_focus_recap(focus, post=False):
     feedback = ""
     if breakdown["on_task_pct"] is not None:
         try:
-            response = await client.chat.completions.create(
-                model=vlm_model, max_tokens=250,
+            response = await _intelligent_complete(
+                room_id=focus.get("room_id") or "agent:creative-coach",
+                room=neo4j_store.get_room(
+                    focus.get("room_id") or "agent:creative-coach"),
+                max_tokens=250,
                 messages=[{"role": "user",
-                           "content": recap_mod.feedback_prompt(breakdown)}],
-                **thinking_request_kwargs(False))
-            feedback = (response.choices[0].message.content or "").strip()
+                           "content": recap_mod.feedback_prompt(breakdown)}])
+            feedback = response.reply.strip()
+        except AgentRuntimeUnavailable:
+            raise
         except Exception as exc:
             logger.warning("focus feedback LLM failed: %s", exc)
 
@@ -3259,10 +5446,18 @@ async def clear_memory_endpoint():
 
 
 @app.get("/proactive")
-async def proactive_insights(since: int = 0):
+async def proactive_insights(since: int = 0, limit: int = 0,
+                             include_audio: bool = True):
     """Proactive insights newer than `since` (by id), each with base64 TTS audio
     so the end device can play them. The client tracks the last id it has seen
-    and passes it as `since` to receive only new insights."""
+    and passes it as `since` to receive only new insights.
+
+    `limit` (most recent N) and `include_audio=false` exist for the home screen,
+    which backfills a short digest on connect. Sending twenty WAVs to fill a
+    panel nobody asked to hear would cost megabytes per reconnect; the audio for
+    any one of them is available from `/proactive/{id}/tts` when the user asks
+    to hear it.
+    """
     # Clip state is re-read here rather than trusted from when the insight was
     # made: retention may have removed the footage in the meantime.
     items = []
@@ -3274,7 +5469,32 @@ async def proactive_insights(since: int = 0):
                       "clip_id": clip["clip_id"] if clip else None,
                       "clip_url": clip["url"] if clip else None,
                       "can_ask": bool(clip)})
+    if limit > 0:
+        items = items[-limit:]
+    if not include_audio:
+        items = [{**item, "audio": None} for item in items]
     return {"enabled": proactive is not None, "latest_id": _proactive_seq, "insights": items}
+
+
+@app.get("/proactive/{insight_id}/tts")
+async def proactive_insight_tts(insight_id: int):
+    """Speak one insight on demand — replay, or a first hearing for an insight
+    the client received without audio."""
+    insight = next((item for item in _proactive_insights
+                    if item["id"] == insight_id), None)
+    if insight is None:
+        return JSONResponse(status_code=404, content={"error": "insight not found"})
+    audio_b64 = insight.get("audio")
+    if audio_b64:
+        return Response(content=base64.b64decode(audio_b64), media_type="audio/wav")
+    try:
+        audio = await asyncio.to_thread(run_kokoro, insight.get("text") or "")
+    except Exception as exc:
+        logger.warning("Proactive insight TTS failed: %s", exc)
+        return JSONResponse(status_code=502, content={"error": "TTS failed"})
+    # Cache it so a second replay does not occupy the GPU again.
+    insight["audio"] = base64.b64encode(audio).decode("utf-8")
+    return Response(content=audio, media_type="audio/wav")
 
 
 def _with_clip(item):
@@ -3314,6 +5534,24 @@ async def notification_mark_read(notification_id: str):
     if item is None:
         return JSONResponse(status_code=404, content={"error": "notification not found"})
     return {"notification": _with_clip(item)}
+
+
+@app.get("/notifications/{notification_id}/tts")
+async def notification_tts(notification_id: str):
+    """Synthesize one speak-enabled reminder for foreground non-Android clients."""
+    payload = notification_center.list(limit=300)
+    item = next((entry for entry in payload["notifications"]
+                 if entry.get("id") == notification_id), None)
+    if item is None:
+        return JSONResponse(status_code=404, content={"error": "notification not found"})
+    if not item.get("speak"):
+        return JSONResponse(status_code=409, content={"error": "notification is silent"})
+    try:
+        audio = await asyncio.to_thread(run_kokoro, item.get("body") or item.get("title"))
+    except Exception as exc:
+        logger.warning("Notification TTS failed: %s", exc)
+        return JSONResponse(status_code=502, content={"error": "TTS failed"})
+    return Response(content=audio, media_type="audio/wav")
 
 
 @app.post("/notifications/actions/read-all")
@@ -3433,6 +5671,7 @@ async def clip_ask(clip_id: str, request: Request):
     ]
     try:
         response = await client.chat.completions.create(
+            job_label="Clip question",
             model=vlm_model,
             messages=[{"role": "system", "content": CLIP_ASK_SYSTEM_PROMPT},
                       {"role": "user", "content": content}],
@@ -3636,6 +5875,7 @@ async def reflect_now(request: Request):
 
     try:
         response = await client.chat.completions.create(
+            job_label="Reflection",
             model=vlm_model,
             messages=[{"role": "system", "content": REFLECT_SYSTEM_PROMPT},
                       {"role": "user", "content": content}],
@@ -3776,6 +6016,7 @@ async def describe_mobile_frames(source, frames):
             "image_url": {"url": f"data:image/jpeg;base64,{encode_image_base64(frame)}"},
         })
     response = await client.chat.completions.create(
+        job_label=f"Mobile {source} description",
         model=vlm_model,
         messages=[{"role": "user", "content": content}],
         max_tokens=800,
@@ -3789,6 +6030,8 @@ async def process_mobile_activity():
     interval = env_int("MOBILE_ACTIVITY_INTERVAL_SECONDS", 60, minimum=5)
     while True:
         await asyncio.sleep(interval)
+        if maintenance_window_active():
+            continue
         source, frames = mobile_stream.processing_window()
         if not frames or vlm_model is None:
             continue
@@ -4026,6 +6269,7 @@ async def gather_tool_context(transcription):
         return None, info
 
     response = await client.chat.completions.create(
+        job_label="Choosing memory tools",
         model=vlm_model,
         messages=[
             {"role": "system",
@@ -4076,7 +6320,7 @@ async def gather_tool_context(transcription):
 
 
 def build_messages(concise, memory_text, chat_history, user_content,
-                   personal_context=None):
+                   personal_context=None, reflection_context=None):
     system_prompt = (
         CONCISE_SYSTEM_PROMPT if concise
         else "You are the user's personal assistant.\n\n" + INITIATIVE_PROMPT
@@ -4087,6 +6331,8 @@ def build_messages(concise, memory_text, chat_history, user_content,
             "role": "system",
             "content": personal_context,
         })
+    if reflection_context:
+        messages.append({"role": "system", "content": reflection_context})
     if memory_text:
         messages.append({
             "role": "user",
@@ -4170,10 +6416,17 @@ async def generate_response(wav_bytes_audio, wav_bytes_image, chat_history,
     personal_context = (
         personal_memory.context(query=transcription)
         if env_bool("PERSONAL_MEMORY_ENABLED", True) else "")
+    # The main assistant answers about his life too, so it gets the same ground
+    # truth the rooms do — strictly matched, since most turns are not personal.
+    reflection_context = _reflection_block(
+        query=transcription, limit=4, days=400, max_chars=2400,
+        answer_chars=800, strict=True)
     messages = build_messages(
-        concise, memory_text, chat_history, user_content, personal_context)
+        concise, memory_text, chat_history, user_content, personal_context,
+        reflection_context)
     try:
         chat_response = await client.chat.completions.create(
+            job_label="Chat reply (streaming)",
             model=vlm_model, messages=messages, stream=True,
             max_tokens=(env_int("THINKING_MAX_TOKENS", 18000)
                         if thinking else env_int("CHAT_MAX_TOKENS", 2000)),

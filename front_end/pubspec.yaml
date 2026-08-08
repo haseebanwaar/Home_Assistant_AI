@@ -42,7 +42,9 @@ dependencies:
   path_provider: ^2.0.15
   fetch_client: ^1.0.2
   loading_indicator: ^3.1.1
-  syncfusion_flutter_charts: ^27.1.52
+  # 27.x mutates a disposed RenderObject when a chart leaves the tree, which
+  # crashes any widget test that pumps one. Fixed upstream.
+  syncfusion_flutter_charts: ^34.2.2
   audioplayers: ^6.1.0
   nsd: ^5.0.0
   async: ^2.9.0
@@ -56,6 +58,7 @@ dependencies:
   media_kit_libs_video: ^1.0.7
   local_notifier: ^0.1.6
   pasteboard: any
+  flutter_markdown_plus: ^1.0.12
 dev_dependencies:
   flutter_test:
     sdk: flutter

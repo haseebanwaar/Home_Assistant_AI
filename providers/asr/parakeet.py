@@ -9,6 +9,8 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 
+from utils.jobs import ASR, jobs
+
 
 def _server_url() -> str:
     # Resolve this at request time because app.py loads .env after importing us.
@@ -42,10 +44,12 @@ def nemo_transcribe(data) -> str:
         method="POST",
     )
     timeout = float(os.getenv("PARAKEET_SERVER_TIMEOUT", "120"))
+    seconds = len(audio) / 16000.0
 
     try:
-        with urlopen(request, timeout=timeout) as response:
-            payload = json.load(response)
+        with jobs.track(ASR, "Transcription", f"{seconds:.1f}s of audio"):
+            with urlopen(request, timeout=timeout) as response:
+                payload = json.load(response)
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Parakeet server returned HTTP {exc.code}: {detail}") from exc

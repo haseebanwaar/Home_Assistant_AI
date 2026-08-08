@@ -9,6 +9,16 @@ that through the shared MemoryPipeline. That writes an Event + entities/claims t
 Neo4j and Qdrant exactly like the screen path, and routes the event into this
 camera's own Room so its feed reads like a channel of what the camera saw.
 
+Windows are not independent, though. Each one is extracted against the camera's
+persistent scene — the slots it is already tracking, with how long each has been
+in its current state — and folded back into it afterwards (see
+sources.camera_state). That changes what a clip is worth saying: a window where
+every slot is exactly as it was is a *confirmation*, counted and used to extend
+the duration but never written to the room, and a window where something moved
+is narrated against what came before ("the black gate opened after 7h 20m; it
+usually opens around 09:00"). Without that, every second clip said "the gate is
+closed" and the one clip that mattered was buried under them.
+
 Boundaries here come from visual change (a scene actually changing), never from
 app switches — see MemoryPipeline. Pausing halts extraction without dropping the
 RTSP connection, so it resumes instantly.
@@ -32,6 +42,7 @@ from sources.video_writer import open_mp4_writer
 from sources.frame_budget import frames_as_image_parts
 from sources.motion_gate import MotionGate
 from sources.camera_validation import HEALTH, classify
+from sources.camera_state import is_infrared
 from sources.capture_settings import (
     expected_frame_count,
     validate_capture_profile,
@@ -40,6 +51,7 @@ from memory.models.extraction import ENTITY_TYPE_SUGGESTIONS
 from memory.extraction.validator import run_extraction
 from memory.pipeline import MemoryPipeline
 from providers.local_openAI import new_vlm_client, thinking_request_kwargs
+from utils.maintenance import maintenance_window_active
 
 logger = logging.getLogger("home_assistant")
 
@@ -51,10 +63,11 @@ _CAMERA_ENTITY_TYPES = [
     "animal", "package", "door", "bag", "tool", "object",
 ] + ENTITY_TYPE_SUGGESTIONS
 
-_CAMERA_SYSTEM_PROMPT = f"""You are a security-camera episodic-memory extractor. You \
-watch a short clip from ONE fixed camera and output ONE JSON object describing what \
-is in view and what happened. Your output is stored so the owner can later ask \
-questions like "who took the orange car and when".
+_CAMERA_SYSTEM_PROMPT = f"""You are a fixed-camera episodic-memory extractor. You \
+watch a chronological clip from ONE fixed camera and output ONE JSON object that \
+preserves a continuous, queryable account of the property. The owner must later be \
+able to ask questions such as "describe the person who took the red car", "how many \
+cars were parked", and "who entered the house and how many people came in".
 
 Return ONLY the JSON object — no markdown, no code fences, no commentary.
 
@@ -74,22 +87,107 @@ leaving is high, an empty static scene is low),
 was driven out of the garage", "a person walked to the front door and left a package"), \
 "confidence": 0.0-1.0}}],
   "tasks": [],
+  "states": [{{"key": the existing slot key from "Persistent scene state" when this \
+is that same physical thing, otherwise null, "subject": what it is ("black gate", \
+"orange car"), "state": the condition it is in AT THE END of this clip, as one short \
+phrase ("closed", "parked in the driveway facing out"), "confidence": 0.0-1.0}}],
+  "gone": [slot keys from the tracked list that this clip shows are genuinely no \
+longer there],
   "boundary_signal": one of [continuation, new_event, boundary]
 }}
 
 Rules:
+- Treat the images as ordered samples from one continuous clip. Reconstruct the \
+sequence from earliest to latest; do not describe them as unrelated screenshots.
+- Focus on observable property activity and scene state, not camera/stream health. \
+Record people, entrances/exits, gate movement, vehicles arriving/leaving, people \
+interacting with vehicles, carried items, and useful before/after state.
+- Make every record independently useful later: state visible person/vehicle \
+descriptions, direction of travel, relevant location, and counts when supportable.
+- Put every relevant visible person and vehicle in entities, even when stationary. \
+Do not list permanent background fixtures or ordinary plant movement as entities.
+- Maintain identity continuity within the clip using stable appearance descriptions. \
+Never identify a person by name unless the supplied context establishes the name.
+- Distinguish observed facts from uncertainty. Never invent an arrival, departure, \
+entry, exit, ownership, identity, or causal link that the clip does not show.
+- For vehicles, include color, type, distinguishing features and parking position; \
+for people, include clothing colors, apparent build and carried items when visible.
+- When someone interacts with, enters, exits, drives, or walks away with a vehicle, \
+connect that same appearance description to the vehicle in summary and claims.
 - Name people and vehicles concretely by their visible appearance (color, type, \
 clothing) — never vague tokens like "object" or "thing" when you can be specific.
 - claims are the timeline of what HAPPENED (arrivals, departures, someone taking or \
 moving something). If nothing changed, use an empty list [].
-- If the scene is empty/static, say so in summary, importance low, entities/claims [].
+- states is the opposite of claims: what is STILL TRUE when the clip ends. List every \
+tracked slot you can still see plus anything else standing that is worth following \
+(gates, doors, parked vehicles, objects left out). It is normal for states to be full \
+while claims is empty — that is a quiet scene, not an empty one.
+- The persistent slots you are given already are the memory of this camera across \
+hours and days. Reuse a slot's key for the same physical thing and echo its stored \
+state text back exactly when nothing about it changed. Opening a second slot for \
+something already tracked destroys the history of how long it has been that way.
+- If the scene is static, summarize the current useful inventory (including counts \
+and locations of people/vehicles) with low importance and claims [].
+- Do not turn image corruption, blur, or connectivity into the main observation. If \
+the scene cannot be interpreted reliably, say that briefly and lower confidence.
 - summary must always be present and non-empty.
 - project is always null.
 """
 
-_CAMERA_USER_PROMPT = (
-    "Extract the structured JSON record for this camera clip. Output only the JSON object."
-)
+_CAMERA_SCENE_CONTEXTS = {
+    "ipc-a42-l": """This camera is IPC-A42-L, fixed above the black gate. The center \
+of the image is the black gate; the left side looks inward toward the garage/home; \
+the right side looks outward toward the road. Prioritize gate opening/closing and \
+people waiting or standing outside on the road/right side. Track whether people and \
+vehicles move from outside/right through the gate toward inside/left or the reverse. \
+Do not confuse merely standing outside with entering the property.""",
+    "ipc-s42-f": """This camera is IPC-S42-F, fixed in the open garage. The black \
+gate, parked cars, and garden plants are visible. Keep an explicit inventory and \
+count of parked cars, with colors/types/positions. Prioritize cars arriving, leaving, \
+or changing position and connect visible people to those vehicle interactions. Plant \
+movement alone is background motion, not a property event, but meaningful changes to \
+the plants or a person tending them should be recorded.""",
+}
+
+
+def camera_scene_context(name):
+    """Return stable layout knowledge for a specifically positioned fixed camera."""
+    return _CAMERA_SCENE_CONTEXTS.get(str(name or "").strip().lower(), "")
+
+
+_INFRARED_NOTE = """This clip is in infrared/night mode: the picture has no real \
+colour, so everything reads as white, grey or black. Do NOT name or re-name anything \
+by the colour it appears here, and do not open a new slot because a tracked thing \
+looks a different colour than it did in daylight — match it by shape, size and \
+position and keep the name it already has. Describe colour only as unknown under \
+night vision."""
+
+
+def camera_user_prompt(name, previous_observation=None, state_block="",
+                       infrared=False):
+    """Build per-window instructions with scene layout and timeline continuity."""
+    parts = [
+        f"Camera: {name or 'unknown fixed camera'}.",
+        camera_scene_context(name),
+    ]
+    if infrared:
+        parts.append(_INFRARED_NOTE)
+    if state_block:
+        parts.append(state_block)
+    if previous_observation:
+        parts.append(
+            "Previous stored observation (continuity context, not proof of a new "
+            f"event): {previous_observation}"
+        )
+        parts.append(
+            "Compare the current clip with that prior state when useful, but only "
+            "claim a transition when the current visual evidence supports it."
+        )
+    parts.append(
+        "Extract the structured JSON record for this chronological camera clip. "
+        "Output only the JSON object."
+    )
+    return "\n\n".join(part for part in parts if part)
 
 
 class CameraCaptureWorker:
@@ -98,7 +196,7 @@ class CameraCaptureWorker:
     def __init__(self, camera_id, name, rtsp_url, model_name_vlm,
                  neo4j_store=None, activity_logger=None,
                  window_seconds=120, fps=0.5, notification_sink=None,
-                 insight_callback=None, clip_store=None):
+                 insight_callback=None, clip_store=None, state_store=None):
         self.camera_id = camera_id
         self.name = name
         self.rtsp_url = rtsp_url
@@ -111,6 +209,9 @@ class CameraCaptureWorker:
         # Evidence clip for this window. Written only for windows we keep, so an
         # alert or a nudge about this camera can be watched and asked about.
         self.clip_store = clip_store
+        # The scene between the clips: what this camera is tracking, since when,
+        # and what it usually does. See sources.camera_state.
+        self.state_store = state_store
 
         # Keep a little more than one window of frames so a batch is never starved.
         self.stream = RealtimeCameraStream(
@@ -135,7 +236,17 @@ class CameraCaptureWorker:
         self.events_logged = 0
         self.last_processed_at = None
         self.last_summary = None
+        # Last observation actually committed to memory. Passing it into the next
+        # extraction preserves scene continuity without promoting rejected health
+        # diagnostics into evidence.
+        self._previous_observation = None
         self.last_error = None
+        # Windows where every tracked slot was found exactly as it was. Not an
+        # error and not a health problem — the camera did its job and the scene
+        # simply had not moved — so they are counted apart from both.
+        self.steady_windows = 0
+        self.last_continuity = []
+        self.last_infrared = None
         # Extractions that were not worth remembering. Kept (bounded) rather than
         # dropped on the floor: a camera whose feed has degraded shows up here as
         # a rising 'picture distorted' rate long before anyone notices the room
@@ -198,6 +309,10 @@ class CameraCaptureWorker:
                 logger.exception("camera %s processing failed: %s", self.camera_id, exc)
 
     def _process_once(self):
+        if maintenance_window_active():
+            logger.debug("Camera %s: maintenance window, skipping inference.",
+                         self.camera_id)
+            return
         pil_frames = self.stream.frames()
         if len(pil_frames) < 2:
             return
@@ -222,7 +337,12 @@ class CameraCaptureWorker:
                         self.camera_id, self._idle_windows)
         self._idle_windows = 0
 
-        result, status = asyncio.run(self._extract(frames))
+        # Night vision kills colour, and colour is how the extractor recognises
+        # a car it is already tracking. Detect it from the pixels and say so in
+        # the prompt rather than letting the orange car become a white one.
+        infrared = is_infrared(frames)
+        self.last_infrared = infrared
+        result, status = asyncio.run(self._extract(frames, infrared))
         full_summary = (result.summary or "").strip()
         # Short preview for the UI status line (the full text is stored in memory).
         self.last_summary = full_summary[:200]
@@ -240,12 +360,44 @@ class CameraCaptureWorker:
             confidence=result.confidence, heartbeat=heartbeat,
             min_confidence=self._min_confidence)
         if verdict == HEALTH:
+            # Deliberately before the state update: a broken picture must never
+            # be allowed to rewrite what the camera believes about the scene.
             self._record_health(reason, full_summary, timestamp)
             logger.info("Camera %s: extraction not stored (%s).",
                         self.camera_id, reason)
             self.frames_processed += len(frames)
             self.last_processed_at = timestamp
             return
+
+        # Fold this window into the standing scene, then say what moved. The
+        # continuity lines are the difference between "the gate is closed" and
+        # "the gate has not opened since 06:12 this morning".
+        delta, continuity = self._update_state(result, timestamp)
+        self.last_continuity = continuity
+
+        # A window that found every tracked slot exactly as it was is a state
+        # confirmation, not an event. Storing those is what made the room read
+        # as the same sentence every two minutes; the durations they extend are
+        # kept, and the periodic heartbeat still records an idle scene on
+        # purpose so a quiet camera is not invisible.
+        if delta is not None and delta.confirmed_only and not heartbeat:
+            self.steady_windows += 1
+            self._previous_observation = full_summary
+            logger.info("Camera %s: scene unchanged (%d slot(s) confirmed) — %s",
+                        self.camera_id, len(delta.unchanged),
+                        "; ".join(continuity) or "no change")
+            self.frames_processed += len(frames)
+            self.last_processed_at = timestamp
+            return
+
+        # What gets remembered is the observation plus its continuity, so the
+        # clip read back tomorrow still carries how long things had been that
+        # way. The raw summary stays the continuity context for the next window
+        # — feeding computed durations back in would let them compound.
+        stored_summary = full_summary
+        if continuity:
+            stored_summary = (full_summary + "\n\nContinuity: "
+                              + "; ".join(continuity) + ".")
 
         # `application` becomes the event's source tag in the Cameras room, so it
         # carries the camera's display name ("IPC-A22E-G") rather than its id —
@@ -257,8 +409,16 @@ class CameraCaptureWorker:
         if self.clip_store is not None:
             clip_id = self.clip_store.save(
                 frames, source="camera", label=self.name or self.camera_id,
-                timestamp=timestamp, capture_fps=self.fps, summary=full_summary,
+                timestamp=timestamp, capture_fps=self.fps, summary=stored_summary,
                 extra={"camera_id": self.camera_id, "camera_name": self.name})
+        # Hang the footage on the transitions this window recorded, so "when did
+        # the gate open" can be answered with the clip of it opening.
+        if clip_id and self.state_store is not None and delta is not None:
+            try:
+                self.state_store.attach_clip(self.camera_id, timestamp, clip_id)
+            except Exception as exc:
+                logger.debug("Camera %s: could not attach clip to transitions: %s",
+                             self.camera_id, exc)
 
         batch = {
             "timestamp": timestamp,
@@ -266,9 +426,11 @@ class CameraCaptureWorker:
             "process_names": [self.name or self.camera_id],
             "repr_frame": frames[-1],
             "clip_id": clip_id,
-            "extraction": {**result.model_dump(), "selected_profile": "camera"},
+            "extraction": {**result.model_dump(), "summary": stored_summary,
+                           "selected_profile": "camera"},
         }
         ingested = self.pipeline.ingest(batch)
+        self._previous_observation = full_summary
         # Now the window has an event id, so the clip can be found from the
         # timeline as well as from the alert that referenced it.
         if clip_id and self.clip_store is not None:
@@ -280,9 +442,11 @@ class CameraCaptureWorker:
         if self.insight_callback is not None and full_summary:
             try:
                 self.insight_callback(
-                    full_summary, timestamp, f"camera:{self.name}",
+                    stored_summary, timestamp, f"camera:{self.name}",
                     {"camera_id": self.camera_id, "camera_name": self.name,
-                     "motion": motion, "clip_id": clip_id})
+                     "motion": motion, "clip_id": clip_id,
+                     "infrared": infrared, "continuity": continuity,
+                     "state": delta.as_dict() if delta is not None else None})
             except Exception as exc:
                 logger.warning("Camera %s proactive callback failed: %s",
                                self.camera_id, exc)
@@ -290,12 +454,60 @@ class CameraCaptureWorker:
         self.events_logged += 1
         self.last_processed_at = timestamp
 
-    async def _extract(self, frames):
+    def _update_state(self, result, timestamp):
+        """Fold the extraction into this camera's standing scene.
+
+        Returns (delta, continuity lines). A window the extractor gave no states
+        for yields `None` rather than an empty delta: "reported nothing" and
+        "reported that nothing changed" are different claims, and only the second
+        one may be used to suppress an event.
+        """
+        if self.state_store is None or not getattr(result, "states", None):
+            return None, []
+        try:
+            delta = self.state_store.apply(
+                self.camera_id, result.states, gone=getattr(result, "gone", ()),
+                timestamp=timestamp)
+            return delta, self.state_store.continuity_lines(
+                self.camera_id, delta, now=timestamp)
+        except Exception as exc:
+            # State tracking is an enrichment; losing it must not lose the event.
+            logger.warning("Camera %s state tracking failed: %s",
+                           self.camera_id, exc, exc_info=True)
+            return None, []
+
+    def _tracked_count(self):
+        """How many slots this camera is carrying — never fails a status poll."""
+        if self.state_store is None:
+            return 0
+        try:
+            return len(self.state_store.slots(self.camera_id))
+        except Exception:
+            return 0
+
+    def state(self):
+        """Everything this camera currently believes is true of its scene."""
+        if self.state_store is None:
+            return {"camera_id": self.camera_id, "name": self.name,
+                    "enabled": False, "states": [], "rhythms": [],
+                    "overdue": [], "recent_transitions": []}
+        return {**self.state_store.snapshot(self.camera_id), "name": self.name}
+
+    async def _extract(self, frames, infrared=False):
         image_parts, frame_info = frames_as_image_parts(frames)
         if not image_parts:
             raise ValueError("could not prepare camera frames for inference")
+        state_block = ""
+        if self.state_store is not None:
+            try:
+                state_block = self.state_store.prompt_block(self.camera_id)
+            except Exception as exc:
+                logger.warning("Camera %s could not load tracked state: %s",
+                               self.camera_id, exc)
         base_content = [
-            {"type": "text", "text": _CAMERA_USER_PROMPT},
+            {"type": "text", "text": camera_user_prompt(
+                self.name, self._previous_observation, state_block=state_block,
+                infrared=infrared)},
             *image_parts,
         ]
         logger.info("Camera %s inference using %d/%d temporal images at %sx%s",
@@ -311,6 +523,7 @@ class CameraCaptureWorker:
                 {"role": "user", "content": user_content},
             ]
             resp = await self._client.chat.completions.create(
+                job_label=f"Camera extraction — {self.name or self.camera_id}",
                 model=self.model_name_vlm, messages=messages,
                 max_tokens=self._max_tokens,
                 **thinking_request_kwargs(False),
@@ -335,6 +548,8 @@ class CameraCaptureWorker:
             "name": self.name,
             "stored": self.events_logged,
             "discarded": self.discarded,
+            # Not a discard: the scene was read successfully and had not moved.
+            "steady_windows": self.steady_windows,
             "discard_pct": (round(100.0 * self.discarded / attempted, 1)
                             if attempted else None),
             "by_reason": dict(self.discarded_by_reason),
@@ -364,6 +579,10 @@ class CameraCaptureWorker:
             "last_processed_at": self.last_processed_at,
             "last_summary": self.last_summary,
             "last_motion": self.last_motion,
+            "steady_windows": self.steady_windows,
+            "tracked_states": self._tracked_count(),
+            "continuity": self.last_continuity,
+            "infrared": self.last_infrared,
             "sample_fps": self.fps,
             "inference_interval_seconds": self.window_seconds,
             "thinking": False,

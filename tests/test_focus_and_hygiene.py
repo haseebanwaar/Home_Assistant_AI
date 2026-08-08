@@ -9,8 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from agents.proactive import (
-    ProactiveNarrator, _SYSTEM_PROMPT, _repeats_opening, _similar,
+    INSIGHT_REQUEST_LIMIT, INSIGHT_TOOL_CALLS_LIMIT, ProactiveNarrator,
+    _SYSTEM_PROMPT, _repeats_opening, _similar,
 )
+from agents.schemas import ProactiveInsightDecision
 from memory.extraction.prompts import _naming_block, build_system_prompt
 from memory.rooms.hygiene import merge_suggestions, stale_rooms
 from memory.summary import focus_recap
@@ -158,13 +160,13 @@ def test_reused_opening_is_detected_independently_of_the_rest_of_the_message():
 
 
 def test_proactive_prompt_uses_open_ended_model_judgment():
-    assert "full judgment and creativity" in _SYSTEM_PROMPT
-    assert "not a list of allowed reasons" in _SYSTEM_PROMPT
+    assert "full judgment, imagination, and creativity" in _SYSTEM_PROMPT
+    assert "Privately brainstorm several possible" in _SYSTEM_PROMPT
     assert "linked memory" in _SYSTEM_PROMPT
     assert "Adapt your tone to the moment" in _SYSTEM_PROMPT
     assert "Vary the opening words" in _SYSTEM_PROMPT
-    assert "Speak up ONLY" not in _SYSTEM_PROMPT
-    assert "Most of the time you should stay silent" not in _SYSTEM_PROMPT
+    assert "Do not proactively discuss logs" in _SYSTEM_PROMPT
+    assert "critically score" in _SYSTEM_PROMPT
 
 
 def test_proactive_context_includes_source_without_prescribing_a_verdict():
@@ -189,6 +191,87 @@ def test_proactive_prompt_includes_personal_context_and_openings_to_avoid():
     assert "it looks like the" in prompt
     assert "do not repeat or closely imitate" in prompt
     assert "tone that fits the live moment" in prompt
+    assert "graph-memory tools" in prompt
+    assert "installers/MSI activity" in prompt
+
+
+def test_quality_gate_rejects_weak_and_operational_candidates():
+    weak = ProactiveInsightDecision(
+        publish=True, insight="Maybe consider a different approach.",
+        relevance=4, novelty=2, usefulness=3, insightfulness=3)
+    noisy = ProactiveInsightDecision(
+        publish=True, insight="The MSI installer log shows another runtime error.",
+        relevance=5, novelty=5, usefulness=5, insightfulness=5)
+
+    assert not ProactiveNarrator._passes_quality(weak)
+    assert not ProactiveNarrator._passes_quality(noisy)
+
+
+def test_claude_agent_uses_graph_memory_and_only_passes_high_quality():
+    class Runtime:
+        def __init__(self):
+            self.calls = []
+
+        async def run(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(output=ProactiveInsightDecision(
+                publish=True,
+                insight=("The recurring wish to simplify this project could become a "
+                         "design rule: make the next feature remove one decision."),
+                relevance=5, novelty=4, usefulness=5, insightfulness=5,
+                memory_used=True,
+                rationale="Connects the current project to a durable preference."))
+
+    runtime = Runtime()
+    narrator = ProactiveNarrator(
+        "claude-model", client=None, agent_runtime=runtime,
+        cooldown_seconds=0, evaluation_interval_seconds=300)
+
+    result = asyncio.run(narrator.consider("Sketching the next project feature."))
+
+    assert result["text"].startswith("The recurring wish")
+    assert runtime.calls[0]["selected_tools"] is None
+    assert runtime.calls[0]["room_id"] == "agent:proactive-insight"
+    assert runtime.calls[0]["output_type"] is ProactiveInsightDecision
+    assert runtime.calls[0]["thinking"] is True
+    assert runtime.calls[0]["thinking_budget"] is None
+    assert runtime.calls[0]["effort"] == "high"
+    # The narrator is told to go and check memory before it speaks, so its
+    # budget has to cover the tool loop it was asked to run. Too small and the
+    # run ends on the budget instead of on an answer, which is silence.
+    assert runtime.calls[0]["configured_request_limit"] == INSIGHT_REQUEST_LIMIT
+    assert (runtime.calls[0]["configured_tool_calls_limit"]
+            == INSIGHT_TOOL_CALLS_LIMIT)
+    assert INSIGHT_REQUEST_LIMIT >= 8 and INSIGHT_TOOL_CALLS_LIMIT >= 12
+
+
+def test_discarded_candidate_waits_five_minutes_before_another_evaluation(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr("agents.proactive.time.time", lambda: now[0])
+
+    class Runtime:
+        def __init__(self):
+            self.calls = 0
+
+        async def run(self, **_kwargs):
+            self.calls += 1
+            return SimpleNamespace(output=ProactiveInsightDecision(
+                publish=False, insight="", relevance=2, novelty=2,
+                usefulness=2, insightfulness=2,
+                rationale="No worthwhile insight."))
+
+    runtime = Runtime()
+    narrator = ProactiveNarrator(
+        "claude-model", client=None, agent_runtime=runtime,
+        cooldown_seconds=0, evaluation_interval_seconds=300)
+
+    assert asyncio.run(narrator.consider("Routine work.")) is None
+    now[0] += 299
+    assert asyncio.run(narrator.consider("More routine work.")) is None
+    assert runtime.calls == 1
+    now[0] += 1
+    assert asyncio.run(narrator.consider("A new five-minute window.")) is None
+    assert runtime.calls == 2
 
 
 def test_proactive_decision_preserves_observation_source():

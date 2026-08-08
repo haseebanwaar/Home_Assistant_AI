@@ -34,9 +34,11 @@ def test_temporal_words_are_stripped_but_content_survives():
 
 
 # -- fakes -----------------------------------------------------------------
-def _event(event_id, text, ts=100.0, score=100):
+def _event(event_id, text, ts=100.0, score=100, span_end=None):
     return {"kind": "event", "id": event_id, "title": "Code", "text": text,
-            "ts": ts, "rooms": [], "score": score}
+            "ts": ts, "span_start": ts,
+            "span_end": span_end if span_end is not None else ts + 10,
+            "rooms": [], "score": score}
 
 
 class FakeGraph:
@@ -87,7 +89,8 @@ class FakeQdrant:
 
 def _semantic_hit(event_id, text):
     return FakeHit({"event_id": event_id, "document": text,
-                    "span_start": 50.0, "profile": "coding"})
+                    "span_start": 50.0, "span_end": 75.0,
+                    "profile": "coding"})
 
 
 def test_memory_domain_is_forwarded_to_graph_retrieval():
@@ -111,6 +114,8 @@ def test_keyword_and_semantic_hits_merge_without_duplicates():
     assert [r["id"] for r in results] == ["e1", "e2"]
     assert results[0]["match"] == "keyword"   # the duplicate keeps its origin
     assert results[1]["match"] == "semantic"
+    assert results[1]["span_start"] == 50.0
+    assert results[1]["span_end"] == 75.0
 
 
 def test_semantic_search_still_runs_when_a_room_scope_is_set():

@@ -20,14 +20,17 @@ CODING_PROFILE = Profile(
         "file", "function", "class", "method", "variable", "module",
         "library", "framework", "package", "api", "endpoint", "database",
         "table", "error", "exception", "command", "repository", "project",
-        "language", "tool",
+        "feature", "component", "test", "language", "tool",
     ),
     focus=(
         "This is a CODING session. Name concrete code entities precisely: "
         "specific file names (e.g. screen.py), function/method/class names, "
-        "libraries/packages, APIs/endpoints, error or exception types, shell "
-        "commands, and the project/repository. NEVER use vague entities like "
+        "features/components, libraries/packages, APIs/endpoints, relevant tests, "
+        "shell commands, and the project/repository. NEVER use vague entities like "
         "\"code\", \"script\", \"screen\", or \"editor\". Capture what the user "
-        "is building or debugging and any errors visible."
+        "is building, the current implementation/debugging/testing step, and the "
+        "meaningful result. Treat logs and errors as secondary evidence; include a "
+        "specific error only when it is an active blocker or materially explains "
+        "the result, never merely because it is visible."
     ),
 )

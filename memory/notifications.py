@@ -185,6 +185,40 @@ class NotificationCenter:
             self._save()
             return dict(item)
 
+    def publish(self, title, body, *, severity="important", category="schedule",
+                source="planner", room_id=None, speak=False, metadata=None,
+                timestamp=None):
+        """Publish an explicit durable alert without event-classification cooldowns."""
+        title = str(title or "").strip()
+        body = str(body or "").strip()
+        if not title or not body:
+            raise ValueError("notification title and body are required")
+        now = float(timestamp or time.time())
+        with self._lock:
+            self._sequence += 1
+            item = {
+                "id": uuid.uuid4().hex,
+                "sequence": self._sequence,
+                "event_id": None,
+                "severity": severity if severity in {"important", "critical"}
+                else "important",
+                "category": str(category or "schedule"),
+                "title": title,
+                "body": body,
+                "source": str(source or "planner"),
+                "application": None,
+                "room_id": room_id,
+                "clip_id": None,
+                "timestamp": now,
+                "read": False,
+                "signature": _signature(body),
+                "speak": bool(speak),
+                "metadata": dict(metadata or {}),
+            }
+            self._items.append(item)
+            self._save()
+            return dict(item)
+
     def list(self, since=0, limit=100, unread_only=False):
         with self._lock:
             items = [

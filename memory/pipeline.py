@@ -98,6 +98,10 @@ class MemoryPipeline:
         self._naming_hints = []
         self._naming_hints_at = 0.0
         self.naming_hints_ttl = 300.0
+        # The user's confirmed personal facts, cached the same way and for the
+        # same reason: what he has settled should not be re-guessed from pixels.
+        self._confirmed_facts = []
+        self._confirmed_facts_at = 0.0
         # Per-event accumulators (event_id -> ...).
         self._ev_entities = {}   # -> {norm: rec}
         self._ev_claims = {}     # -> {claim_id: rec}
@@ -124,6 +128,25 @@ class MemoryPipeline:
                 logger.debug("naming hints unavailable: %s", exc)
                 self._naming_hints = []
         return self._naming_hints
+
+    def confirmed_facts(self, limit=12):
+        """Personal facts the user has confirmed in his own words.
+
+        Fed into the extraction prompt so the watcher stops re-inferring what he
+        has already stated, and phrases a genuine contradiction as a change.
+        """
+        import time as _time
+        if self.personal_memory is None:
+            return []
+        now = _time.time()
+        if now - self._confirmed_facts_at >= self.naming_hints_ttl:
+            self._confirmed_facts_at = now
+            try:
+                self._confirmed_facts = self.personal_memory.verified_facts(limit)
+            except Exception as exc:
+                logger.debug("confirmed personal facts unavailable: %s", exc)
+                self._confirmed_facts = []
+        return self._confirmed_facts
 
     # -- ingest ------------------------------------------------------------
     def ingest(self, batch):

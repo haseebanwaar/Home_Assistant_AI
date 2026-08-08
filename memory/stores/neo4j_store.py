@@ -11,10 +11,12 @@ import datetime
 import logging
 import os
 import re
+import time
 
 from neo4j import GraphDatabase
 
 from memory.retrieval.terms import tokenize
+from memory.summary.naming import fold_apps, fold_projects
 from memory.summary.reports import PRODUCTIVITY_DOMAIN
 
 logger = logging.getLogger("home_assistant")
@@ -40,6 +42,9 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT rollup_id IF NOT EXISTS FOR (r:Rollup) REQUIRE r.rollup_id IS UNIQUE",
     "CREATE CONSTRAINT project_key IF NOT EXISTS FOR (p:Project) REQUIRE p.project_key IS UNIQUE",
     "CREATE CONSTRAINT goal_key IF NOT EXISTS FOR (g:Goal) REQUIRE g.goal_key IS UNIQUE",
+    # Written reports, one per (period, end date), so today's writer can read
+    # what the last fortnight's reports said and scored.
+    "CREATE CONSTRAINT written_report_id IF NOT EXISTS FOR (r:WrittenReport) REQUIRE r.report_id IS UNIQUE",
 ]
 
 # Secondary indexes for span-aware and lookup queries.
@@ -54,6 +59,7 @@ INDEXES = [
     "CREATE INDEX rollup_kind IF NOT EXISTS FOR (r:Rollup) ON (r.kind)",
     "CREATE INDEX rollup_end IF NOT EXISTS FOR (r:Rollup) ON (r.end_date)",
     "CREATE INDEX project_status IF NOT EXISTS FOR (p:Project) ON (p.status)",
+    "CREATE INDEX written_report_end IF NOT EXISTS FOR (r:WrittenReport) ON (r.end_date)",
 ]
 
 
@@ -248,7 +254,8 @@ class Neo4jStore:
         terms = tokenize(query)
         if not needle or not terms:
             return []
-        allowed = set(kinds or ("event", "note", "message", "entity", "claim", "room"))
+        allowed = set(kinds or (
+            "event", "note", "message", "entity", "claim", "room", "insight"))
         params = {
             "needle": needle, "terms": terms,
             "limit": max(1, min(int(limit), 200)),
@@ -262,6 +269,7 @@ class Neo4jStore:
             "entity": _SEARCH_ENTITIES_CYPHER,
             "claim": _SEARCH_CLAIMS_CYPHER,
             "room": _SEARCH_ROOMS_CYPHER,
+            "insight": _SEARCH_NUDGES_CYPHER,
         }
         for kind, cypher in searches.items():
             if kind not in allowed:
@@ -280,6 +288,12 @@ class Neo4jStore:
             _RECENT_EVENTS_CYPHER, start=start, end=end, room_id=room_id,
             domain=domain,
             limit=max(1, min(int(limit), 200)))]
+
+    def recent_nudges(self, start=None, end=None, limit=10):
+        """Newest durable proactive insights inside an optional time window."""
+        return [dict(row) for row in self.run(
+            _RECENT_NUDGES_CYPHER, start=start, end=end,
+            limit=max(1, min(int(limit), 50)))]
 
     def events_in_room(self, event_ids, room_id):
         """Subset of `event_ids` that the room contains — post-filter for vector hits.
@@ -738,6 +752,7 @@ class Neo4jStore:
                 "r.kind AS kind, r.auto AS auto, r.matcher_json AS matcher_json, "
                 "r.description AS description, r.color AS color, r.icon AS icon, "
                 "r.instructions AS instructions, r.assistant_mode AS assistant_mode, "
+                "r.execution_profile AS execution_profile, "
                 "r.agent_tools_json AS agent_tools_json, "
                 "r.agent_workspace AS agent_workspace, "
                 "r.agent_request_limit AS agent_request_limit, "
@@ -754,12 +769,14 @@ class Neo4jStore:
                 agent_tools = _json.loads(r.get("agent_tools_json") or "[]")
             except (TypeError, ValueError):
                 agent_tools = []
+            agent_tools = list(dict.fromkeys(["graph", *agent_tools]))
             rooms.append(Room(room_id=r["room_id"], name=r.get("name") or r["room_id"],
                                kind=r.get("kind") or "topic",
                                auto=bool(r.get("auto")), matcher=matcher,
                                description=r.get("description") or "",
                                instructions=r.get("instructions") or "",
-                               assistant_mode=r.get("assistant_mode") or "chat",
+                               assistant_mode="agent",
+                               execution_profile=r.get("execution_profile") or "investigate",
                                agent_tools=agent_tools,
                                agent_workspace=r.get("agent_workspace") or "",
                                agent_request_limit=int(
@@ -802,6 +819,7 @@ class Neo4jStore:
                 instructions=agent.instructions, color=agent.color,
                 icon=agent.icon, pinned=True, position=position,
                 assistant_mode=agent.assistant_mode,
+                execution_profile=agent.execution_profile,
                 agent_tools=list(agent.agent_tools),
                 agent_workspace=agent.workspace,
             )
@@ -830,7 +848,7 @@ class Neo4jStore:
         if room is None:
             return None
         allowed = {
-            "name", "description", "instructions", "assistant_mode",
+            "name", "description", "instructions", "execution_profile",
             "agent_tools", "agent_workspace", "color", "icon", "archived", "pinned",
             "agent_request_limit", "agent_tool_calls_limit",
             "position", "matcher",
@@ -841,6 +859,7 @@ class Neo4jStore:
         # Revalidate after applying a partial patch: `setattr` alone bypasses
         # Pydantic's Literal/list validation.
         room = Room.model_validate(room.model_dump())
+        room.agent_tools = list(dict.fromkeys(["graph", *room.agent_tools]))
         if room_id == "daily":
             room.name, room.kind, room.archived = "Daily", "daily", False
         rows = self.run(_UPDATE_ROOM_CYPHER, **_room_params(room, _json))
@@ -947,6 +966,8 @@ class Neo4jStore:
         rooms = [dict(r) for r in self.run(
             _LIST_ROOMS_CYPHER, include_archived=include_archived)]
         for room in rooms:
+            room["assistant_mode"] = "agent"
+            room["execution_profile"] = room.get("execution_profile") or "investigate"
             raw_tools = room.pop("agent_tools_json", None)
             room["agent_workspace"] = room.get("agent_workspace") or ""
             room["agent_request_limit"] = int(
@@ -954,12 +975,14 @@ class Neo4jStore:
             room["agent_tool_calls_limit"] = int(
                 room.get("agent_tool_calls_limit") or 0)
             if raw_tools is None:
-                room["agent_tools"] = None
+                room["agent_tools"] = ["graph"]
                 continue
             try:
                 room["agent_tools"] = _json.loads(raw_tools)
             except (TypeError, ValueError):
                 room["agent_tools"] = []
+            room["agent_tools"] = list(dict.fromkeys(
+                ["graph", *room["agent_tools"]]))
         return rooms
 
     def get_room(self, room_id):
@@ -968,6 +991,7 @@ class Neo4jStore:
                         "r.auto AS auto, r.description AS description, r.color AS color, "
                         "r.instructions AS instructions, "
                         "r.assistant_mode AS assistant_mode, "
+                        "r.execution_profile AS execution_profile, "
                         "r.agent_tools_json AS agent_tools_json, "
                         "r.agent_workspace AS agent_workspace, "
                         "r.agent_request_limit AS agent_request_limit, "
@@ -978,6 +1002,8 @@ class Neo4jStore:
         if not rows:
             return None
         out = dict(rows[0])
+        out["assistant_mode"] = "agent"
+        out["execution_profile"] = out.get("execution_profile") or "investigate"
         import json as _json
         try:
             out["matcher"] = _json.loads(out.pop("matcher_json") or "{}")
@@ -994,6 +1020,8 @@ class Neo4jStore:
                 out["agent_tools"] = _json.loads(raw_tools)
             except (TypeError, ValueError):
                 out["agent_tools"] = []
+        out["agent_tools"] = list(dict.fromkeys(
+            ["graph", *(out.get("agent_tools") or [])]))
         return out
 
     def set_event_room(self, event_id, room_id, mode="primary"):
@@ -1057,19 +1085,28 @@ class Neo4jStore:
         rows = self.run(_DELETE_NOTE_CYPHER, room_id=room_id, note_id=note_id)
         return bool(rows and rows[0]["deleted"])
 
-    def add_message(self, room_id, role, text, ts=None):
+    def add_message(self, room_id, role, text, ts=None, citations=None):
         """A room-scoped chat message (role: 'user' | 'assistant')."""
+        import json as _json
         import time as _t
         import uuid as _uuid
         message_id = _uuid.uuid4().hex
         ts = ts if ts is not None else _t.time()
         self.run(_ADD_MESSAGE_CYPHER, room_id=room_id, message_id=message_id,
-                 role=role, text=text, ts=ts)
-        return {"message_id": message_id, "room_id": room_id, "role": role, "text": text, "ts": ts}
+                 role=role, text=text, ts=ts,
+                 citations_json=_json.dumps(citations or []))
+        return {"message_id": message_id, "room_id": room_id, "role": role,
+                "text": text, "ts": ts, "citations": citations or []}
 
     def room_messages(self, room_id, limit=20):
         """Recent chat messages in chronological order (for chat history)."""
         rows = [dict(r) for r in self.run(_ROOM_MESSAGES_CYPHER, room_id=room_id, limit=limit)]
+        import json as _json
+        for row in rows:
+            try:
+                row["citations"] = _json.loads(row.pop("citations_json") or "[]")
+            except (TypeError, ValueError):
+                row["citations"] = []
         return list(reversed(rows))
 
     def room_applications(self, room_id, start=None, end=None):
@@ -1159,8 +1196,14 @@ class Neo4jStore:
         for n in self.run(_ROOM_NOTES_CYPHER, room_id=room_id, limit=fetch_limit):
             items.append({"kind": "note", "note_id": n["note_id"],
                           "ts": n["ts"], "text": n["text"]})
+        import json as _json
         for m in self.run(_ROOM_MESSAGES_CYPHER, room_id=room_id, limit=fetch_limit):
-            items.append({"kind": "message", "ts": m["ts"], "text": m["text"], "role": m["role"]})
+            try:
+                message_citations = _json.loads(m.get("citations_json") or "[]")
+            except (TypeError, ValueError):
+                message_citations = []
+            items.append({"kind": "message", "ts": m["ts"], "text": m["text"],
+                          "role": m["role"], "citations": message_citations})
         if date_str:
             day_start = datetime.datetime.fromisoformat(date_str).timestamp()
             day_end = day_start + 86400
@@ -1227,8 +1270,13 @@ class Neo4jStore:
         totals = self.run(_RANGE_TOTALS_CYPHER, **params)
         t = dict(totals[0]) if totals else {}
         by_activity = [dict(r) for r in self.run(_RANGE_BY_ACTIVITY_CYPHER, **params)]
-        by_app = [dict(r) for r in self.run(_RANGE_BY_APP_CYPHER, **params)]
-        by_project = [dict(r) for r in self.run(_RANGE_BY_PROJECT_CYPHER, **params)]
+        # Folded before truncation, not after: one project reaches the graph
+        # under several spellings, and each spelling is individually small
+        # enough to fall outside a top-10 cut. The queries therefore return a
+        # wide slice and the canonical rows are trimmed here instead.
+        by_app = fold_apps([dict(r) for r in self.run(_RANGE_BY_APP_CYPHER, **params)])[:10]
+        by_project = fold_projects(
+            [dict(r) for r in self.run(_RANGE_BY_PROJECT_CYPHER, **params)])[:10]
 
         active = t.get("active_seconds") or 0.0
         events = t.get("events") or 0
@@ -1269,6 +1317,63 @@ class Neo4jStore:
         """
         return [dict(r) for r in self.run(
             _ACTIVITY_SERIES_CYPHER, start=start_date, end=end_date, domain=domain)]
+
+    def event_spans(self, start_date, end_date, domain=PRODUCTIVITY_DOMAIN,
+                    limit=20000):
+        """Raw (span_start, span_seconds) rows — the hour-of-day view's input."""
+        return [dict(r) for r in self.run(
+            _EVENT_SPANS_CYPHER, start=start_date, end=end_date, domain=domain,
+            limit=max(1, min(int(limit), 50000)))]
+
+    # -- Written reports ---------------------------------------------------
+    #
+    # The deterministic report is recomputed from the graph on every read, so it
+    # never needed storing. A written one does: it is a model call at high
+    # effort, it carries scores that only mean something as a series, and the
+    # next day's writer is given the last fortnight of them so today's report is
+    # calibrated against its own history rather than against an imagined day.
+
+    def save_written_report(self, end_date, period, report, model=None,
+                            effort=None, start_date=None):
+        """Store (or replace) the written report for one period.
+
+        Keyed on period + end date, so re-writing a day overwrites it rather
+        than accumulating drafts. `report` is the model's structured output as a
+        plain dict; it is stored whole as JSON, with the score lifted out as a
+        property so a fortnight of them can be read without parsing every body.
+        """
+        import json as _json
+        scores = report.get("scores") or []
+        overall = report.get("overall_score")
+        rows = self.run(
+            _SAVE_WRITTEN_REPORT_CYPHER,
+            report_id=f"{period}:{end_date}",
+            date=end_date, period=period,
+            start_date=start_date or end_date,
+            headline=str(report.get("headline") or ""),
+            overall_score=int(overall) if overall is not None else None,
+            score_names=[str(s.get("name") or "") for s in scores],
+            body=_json.dumps(report, ensure_ascii=False),
+            model=model, effort=effort, ts=time.time())
+        return dict(rows[0]) if rows else None
+
+    def written_reports(self, start_date, end_date, period="daily", limit=30):
+        """Stored reports whose end date falls in the window, newest first."""
+        import json as _json
+        out = []
+        for row in self.run(_WRITTEN_REPORTS_CYPHER, start=start_date,
+                            end=end_date, period=period,
+                            limit=max(1, min(int(limit), 120))):
+            item = dict(row)
+            try:
+                item["report"] = _json.loads(item.pop("body") or "{}")
+            except (TypeError, ValueError):
+                # A body we cannot parse must not take the whole history down —
+                # the date and score are still worth returning.
+                item.pop("body", None)
+                item["report"] = {}
+            out.append(item)
+        return out
 
     def resolve_entities(self, fuzzy_threshold=0.9):
         """Step 12: propose POSSIBLY_SAME_AS links over all entities (idempotent).
@@ -1426,6 +1531,17 @@ class Neo4jStore:
             "goals": self.list_goals(limit=limit),
         }
 
+    def earliest_day(self):
+        """The first date the graph holds anything for, or None on an empty one.
+
+        The lifelong horizon needs a real starting point rather than an
+        arbitrary lookback: "since you started" is a different window on a
+        two-week-old install than on a three-year-old one.
+        """
+        rows = self.run(
+            "MATCH (d:Day) RETURN min(d.date) AS earliest")
+        return rows[0]["earliest"] if rows else None
+
     def rollup_counts(self):
         rows = self.run(
             "MATCH (r:Rollup) RETURN r.kind AS kind, count(r) AS n ORDER BY kind")
@@ -1497,6 +1613,7 @@ def _room_params(room, json_module):
         "description": room.description,
         "instructions": room.instructions,
         "assistant_mode": room.assistant_mode,
+        "execution_profile": room.execution_profile,
         "agent_tools_json": json_module.dumps(room.agent_tools),
         "agent_workspace": room.agent_workspace,
         "agent_request_limit": room.agent_request_limit,
@@ -1613,7 +1730,8 @@ WITH e, rooms, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
 WHERE hits > 0
 RETURN 'event' AS kind, e.event_id AS id,
        coalesce(e.application, e.activity_type, 'Activity') AS title,
-       e.summary AS text, e.span_start AS ts, rooms,
+       e.summary AS text, e.span_start AS ts,
+       e.span_start AS span_start, e.span_end AS span_end, rooms,
        100 + 8 * hits + CASE WHEN hay CONTAINS $needle THEN 25 ELSE 0 END AS score
 ORDER BY score DESC, ts DESC
 LIMIT $limit
@@ -1630,7 +1748,8 @@ WITH r, n, toLower(coalesce(n.text, '')) AS hay
 WITH r, n, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
 WHERE hits > 0
 RETURN 'note' AS kind, n.note_id AS id, r.name AS title, n.text AS text,
-       n.ts AS ts, [{room_id: r.room_id, name: r.name}] AS rooms,
+       n.ts AS ts, n.ts AS span_start, n.ts AS span_end,
+       [{room_id: r.room_id, name: r.name}] AS rooms,
        90 + 8 * hits + CASE WHEN hay CONTAINS $needle THEN 25 ELSE 0 END AS score
 ORDER BY score DESC, ts DESC
 LIMIT $limit
@@ -1643,12 +1762,16 @@ WHERE ($start IS NULL OR m.ts >= $start)
   AND ($room_id IS NULL OR r.room_id = $room_id)
   AND ($domain IS NULL OR
        CASE WHEN r.kind = 'camera' THEN 'home' ELSE 'personal' END = $domain)
-WITH r, m, toLower(coalesce(m.text, '')) AS hay
+WITH r, m, toLower(coalesce(r.name, '') + ' ' + coalesce(m.role, '') + ' ' +
+     coalesce(m.text, '') +
+     CASE WHEN m.role = 'insight'
+          THEN ' proactive insight notification notify notified alert nudge'
+          ELSE '' END) AS hay
 WITH r, m, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
 WHERE hits > 0
 RETURN 'message' AS kind, m.message_id AS id,
        r.name + ' · ' + coalesce(m.role, 'message') AS title,
-       m.text AS text, m.ts AS ts,
+       m.text AS text, m.ts AS ts, m.ts AS span_start, m.ts AS span_end,
        [{room_id: r.room_id, name: r.name}] AS rooms,
        80 + 8 * hits + CASE WHEN hay CONTAINS $needle THEN 25 ELSE 0 END AS score
 ORDER BY score DESC, ts DESC
@@ -1697,7 +1820,7 @@ WITH c, e, rooms, toLower(coalesce(c.text, '')) AS hay
 WITH c, e, rooms, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
 WHERE hits > 0
 RETURN 'claim' AS kind, c.claim_id AS id, 'Claim' AS title, c.text AS text,
-       e.span_start AS ts, rooms,
+       e.span_start AS ts, e.span_start AS span_start, e.span_end AS span_end, rooms,
        95 + 8 * hits + CASE WHEN hay CONTAINS $needle THEN 25 ELSE 0 END AS score
 ORDER BY score DESC, ts DESC
 LIMIT $limit
@@ -1715,6 +1838,23 @@ RETURN 'room' AS kind, r.room_id AS id, r.name AS title,
        [{room_id: r.room_id, name: r.name}] AS rooms,
        105 + 8 * hits + CASE WHEN hay CONTAINS $needle THEN 25 ELSE 0 END AS score
 ORDER BY score DESC, title
+LIMIT $limit
+"""
+
+_SEARCH_NUDGES_CYPHER = """
+MATCH (n:Nudge)
+WHERE ($start IS NULL OR n.ts >= $start)
+  AND ($end IS NULL OR n.ts < $end)
+  AND $room_id IS NULL
+WITH n, toLower(coalesce(n.text, '') + ' ' + coalesce(n.kind, '') +
+     ' proactive insight notification notify notified alert nudge') AS hay
+WITH n, hay, size([t IN $terms WHERE hay CONTAINS t]) AS hits
+WHERE hits > 0
+RETURN 'insight' AS kind, n.nudge_id AS id,
+       'Proactive insight' AS title, n.text AS text,
+       n.ts AS ts, n.ts AS span_start, n.ts AS span_end, [] AS rooms,
+       115 + 8 * hits + CASE WHEN hay CONTAINS $needle THEN 25 ELSE 0 END AS score
+ORDER BY score DESC, ts DESC
 LIMIT $limit
 """
 
@@ -1736,8 +1876,21 @@ WHERE ($start IS NULL OR e.span_start >= $start)
   AND coalesce(e.summary, '') <> ''
 RETURN 'event' AS kind, e.event_id AS id,
        coalesce(e.application, e.activity_type, 'Activity') AS title,
-       e.summary AS text, e.span_start AS ts, rooms, 60 AS score
+       e.summary AS text, e.span_start AS ts,
+       e.span_start AS span_start, e.span_end AS span_end, rooms, 60 AS score
 ORDER BY ts DESC
+LIMIT $limit
+"""
+
+_RECENT_NUDGES_CYPHER = """
+MATCH (n:Nudge)
+WHERE ($start IS NULL OR n.ts >= $start)
+  AND ($end IS NULL OR n.ts < $end)
+RETURN 'insight' AS kind, n.nudge_id AS id,
+       'Proactive insight' AS title, n.text AS text,
+       n.ts AS ts, n.ts AS span_start, n.ts AS span_end,
+       [] AS rooms, 65 AS score
+ORDER BY n.ts DESC
 LIMIT $limit
 """
 
@@ -2529,6 +2682,7 @@ MERGE (r:Room {room_id: $room_id})
                 r.matcher_json = $matcher_json, r.description = $description,
                  r.instructions = $instructions,
                  r.assistant_mode = $assistant_mode,
+                 r.execution_profile = $execution_profile,
                  r.agent_tools_json = $agent_tools_json,
                  r.agent_workspace = $agent_workspace,
                  r.agent_request_limit = $agent_request_limit,
@@ -2540,6 +2694,7 @@ MERGE (r:Room {room_id: $room_id})
                 r.description = coalesce(r.description, $description),
                 r.instructions = coalesce(r.instructions, $instructions),
                 r.assistant_mode = coalesce(r.assistant_mode, $assistant_mode),
+                r.execution_profile = coalesce(r.execution_profile, $execution_profile),
                 r.agent_tools_json = coalesce(r.agent_tools_json, $agent_tools_json),
                 r.agent_workspace = coalesce(r.agent_workspace, $agent_workspace),
                 r.agent_request_limit = coalesce(
@@ -2567,6 +2722,7 @@ RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind,
        r.auto AS auto, r.description AS description, r.color AS color,
        r.instructions AS instructions,
        r.assistant_mode AS assistant_mode,
+       coalesce(r.execution_profile, 'investigate') AS execution_profile,
        r.agent_tools_json AS agent_tools_json,
        r.agent_workspace AS agent_workspace,
        coalesce(r.agent_request_limit, 0) AS agent_request_limit,
@@ -2604,7 +2760,8 @@ MERGE (r)-[:HAS_NOTE]->(n)
 _ADD_MESSAGE_CYPHER = """
 MERGE (r:Room {room_id: $room_id})
   ON CREATE SET r.name = $room_id, r.kind = 'topic', r.auto = false, r.created_at = timestamp()
-CREATE (m:RoomMessage {message_id: $message_id, role: $role, text: $text, ts: $ts})
+CREATE (m:RoomMessage {message_id: $message_id, role: $role, text: $text,
+                       citations_json: $citations_json, ts: $ts})
 MERGE (r)-[:HAS_MESSAGE]->(m)
 """
 
@@ -2617,7 +2774,8 @@ LIMIT $limit
 
 _ROOM_MESSAGES_CYPHER = """
 MATCH (r:Room {room_id: $room_id})-[:HAS_MESSAGE]->(m:RoomMessage)
-RETURN m.message_id AS message_id, m.role AS role, m.text AS text, m.ts AS ts
+RETURN m.message_id AS message_id, m.role AS role, m.text AS text,
+       m.citations_json AS citations_json, m.ts AS ts
 ORDER BY m.ts DESC
 LIMIT $limit
 """
@@ -2713,6 +2871,7 @@ CREATE (r:Room {
   room_id: $room_id, name: $name, kind: $kind, auto: $auto,
   matcher_json: $matcher_json, description: $description, color: $color,
   instructions: $instructions, assistant_mode: $assistant_mode,
+  execution_profile: $execution_profile,
   agent_tools_json: $agent_tools_json,
   agent_workspace: $agent_workspace,
   agent_request_limit: $agent_request_limit,
@@ -2723,6 +2882,7 @@ CREATE (r:Room {
 RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind,
        r.description AS description, r.color AS color, r.icon AS icon,
        r.instructions AS instructions, r.assistant_mode AS assistant_mode,
+       r.execution_profile AS execution_profile,
        r.agent_tools_json AS agent_tools_json,
        r.agent_workspace AS agent_workspace,
        r.agent_request_limit AS agent_request_limit,
@@ -2734,6 +2894,7 @@ _UPDATE_ROOM_CYPHER = """
 MATCH (r:Room {room_id: $room_id})
 SET r.name = $name, r.description = $description, r.instructions = $instructions, r.color = $color,
     r.assistant_mode = $assistant_mode, r.agent_tools_json = $agent_tools_json,
+    r.execution_profile = $execution_profile,
     r.agent_workspace = $agent_workspace,
     r.agent_request_limit = $agent_request_limit,
     r.agent_tool_calls_limit = $agent_tool_calls_limit,
@@ -2743,6 +2904,7 @@ SET r.name = $name, r.description = $description, r.instructions = $instructions
 RETURN r.room_id AS room_id, r.name AS name, r.kind AS kind,
        r.description AS description, r.color AS color, r.icon AS icon,
        r.instructions AS instructions, r.assistant_mode AS assistant_mode,
+       r.execution_profile AS execution_profile,
        r.agent_tools_json AS agent_tools_json,
        r.agent_workspace AS agent_workspace,
        r.agent_request_limit AS agent_request_limit,
@@ -2942,7 +3104,7 @@ WHERE d.date >= $start AND d.date <= $end
   AND e.application IS NOT NULL{_DOMAIN_CLAUSE}
 RETURN e.application AS app, round(sum(e.span_seconds) / 60.0, 1) AS minutes
 ORDER BY minutes DESC
-LIMIT 10
+LIMIT 60
 """
 
 _RANGE_BY_PROJECT_CYPHER = f"""
@@ -2951,7 +3113,7 @@ WHERE d.date >= $start AND d.date <= $end
   AND s.project_id IS NOT NULL{_DOMAIN_CLAUSE}
 RETURN s.project_id AS project, round(sum(e.span_seconds) / 60.0, 1) AS minutes
 ORDER BY minutes DESC
-LIMIT 10
+LIMIT 60
 """
 
 # One row per (day, activity) — the shape the per-activity trend charts plot.
@@ -2962,6 +3124,47 @@ RETURN d.date AS date, coalesce(e.activity_type, 'other') AS activity,
        round(sum(e.span_seconds) / 60.0, 1) AS minutes,
        count(e) AS events
 ORDER BY date, minutes DESC
+"""
+
+# Raw spans for the hour-of-day view. Bucketing is done in Python rather than in
+# Cypher because the answer is "what hour was it where he was sitting" — the
+# graph stores epoch seconds, and converting them in the database would bucket
+# the day in UTC and shift every evening's work into the small hours.
+_EVENT_SPANS_CYPHER = f"""
+MATCH (d:Day)-[:HAS_SESSION]->(:Session)-[:HAS_EVENT]->(e:Event)
+WHERE d.date >= $start AND d.date <= $end{_DOMAIN_CLAUSE}
+  AND e.span_start IS NOT NULL
+RETURN d.date AS date, e.span_start AS span_start,
+       coalesce(e.span_seconds, 0.0) AS span_seconds,
+       coalesce(e.activity_type, 'other') AS activity
+ORDER BY span_start
+LIMIT $limit
+"""
+
+# Written reports: one node per (period, end date), replaced in place on rewrite.
+_SAVE_WRITTEN_REPORT_CYPHER = """
+MERGE (r:WrittenReport {report_id: $report_id})
+SET r.end_date = $date, r.start_date = $start_date, r.period = $period,
+    r.headline = $headline, r.overall_score = $overall_score,
+    r.score_names = $score_names, r.body = $body,
+    r.model = $model, r.effort = $effort, r.written_at = $ts
+WITH r
+MERGE (d:Day {date: $date})
+MERGE (d)-[:HAS_REPORT]->(r)
+RETURN r.report_id AS report_id, r.end_date AS end_date,
+       r.overall_score AS overall_score, r.written_at AS written_at
+"""
+
+_WRITTEN_REPORTS_CYPHER = """
+MATCH (r:WrittenReport)
+WHERE r.period = $period AND r.end_date >= $start AND r.end_date <= $end
+RETURN r.report_id AS report_id, r.end_date AS end_date,
+       r.start_date AS start_date, r.period AS period,
+       r.headline AS headline, r.overall_score AS overall_score,
+       r.model AS model, r.effort AS effort, r.written_at AS written_at,
+       r.body AS body
+ORDER BY r.end_date DESC
+LIMIT $limit
 """
 
 _DAY_CLAIMS_CYPHER = f"""

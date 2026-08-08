@@ -5,6 +5,7 @@ import io
 from threading import Lock
 
 from .voice_settings import KokoroVoiceSettings
+from utils.jobs import TTS, jobs
 
 _voice_settings = KokoroVoiceSettings()
 _pipeline_lock = Lock()
@@ -41,20 +42,23 @@ def _pipeline_for_voice(voice):
 def run_kokoro(text, voice=None, sr=24000):
     selected_voice = voice or _voice_settings.voice
     selected_pipeline = _pipeline_for_voice(selected_voice)
-    generator = selected_pipeline(
-        text, voice=selected_voice,
-        speed=1, split_pattern=r'\n+'
-    )
-    audio_buffer = io.BytesIO()
+    # Synthesis shares the GPU with the VLM, so it goes on the same jobs board:
+    # a spoken reply being rendered is a real reason inference is waiting.
+    with jobs.track(TTS, "Speech synthesis", f"{len(text or '')} chars"):
+        generator = selected_pipeline(
+            text, voice=selected_voice,
+            speed=1, split_pattern=r'\n+'
+        )
+        audio_buffer = io.BytesIO()
 
-    audio_chunks = [audio for (_, _, audio) in generator]
+        audio_chunks = [audio for (_, _, audio) in generator]
 
-    if len(audio_chunks) > 1:
-        audio = np.concatenate(audio_chunks, axis=0)
-    else:
-        audio = audio_chunks[0]
+        if len(audio_chunks) > 1:
+            audio = np.concatenate(audio_chunks, axis=0)
+        else:
+            audio = audio_chunks[0]
 
-    sf.write(audio_buffer, audio, sr, format='WAV')
-    audio_buffer.seek(0)
-    return audio_buffer.read()
+        sf.write(audio_buffer, audio, sr, format='WAV')
+        audio_buffer.seek(0)
+        return audio_buffer.read()
 

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 // C:\Users\haseeb\AppData\Local\Android\Sdk\platform-tools/adb pair 192.168.1.17:38535
@@ -22,6 +23,8 @@ import 'notifications/desktop_alert.dart';
 import 'notifications/local_notification_controller.dart';
 import 'notifications/notifications_screen.dart';
 import 'clips/clip_viewer.dart';
+import 'insights/insights_panel.dart';
+import 'jobs/jobs_panel.dart';
 import 'network/http_json.dart';
 import 'settings/global_hotkey_service.dart';
 import 'settings/settings_screen.dart';
@@ -149,8 +152,18 @@ class _MyAppState extends State<MyApp> {
   static const _disabledShortcutValue = 'disabled';
   static const _defaultHomeHub = String.fromEnvironment(
     'HOME_HUB_URL',
-    defaultValue: '192.168.1.37',
+    defaultValue: '100.89.9.84',
   );
+  static const _legacyHomeHub = '192.168.1.37';
+  // Enough for the conversation card's own header, composer and mic row plus a
+  // few message bubbles. Below this the transcript stops being worth reading.
+  static const double _mobileConversationMinHeight = 380;
+  // Roughly what the mobile header, hub status and control panel occupy. The
+  // conversation card is handed the rest, so on a normal phone the page still
+  // fits without scrolling; anything that pushes past this — the insights
+  // panel, a short screen, a large system font, the keyboard — scrolls rather
+  // than squeezing the transcript.
+  static const double _mobileChromeHeight = 400;
   static const _ink = Color(0xFF070B14);
   static const _panel = Color(0xFF111827);
   static const _panelRaised = Color(0xFF182235);
@@ -189,6 +202,11 @@ class _MyAppState extends State<MyApp> {
   // a backlog of stale insights.
   int _lastProactiveId = 0;
   bool _proactiveSynced = false;
+  // The home screen's standing record of what was said unprompted. Newest
+  // first; the chat feed keeps its own copy for replay in conversation order.
+  final List<ProactiveInsight> _insightFeed = [];
+  static const int _insightFeedLimit = 12;
+  int? _insightSpeakingId;
   bool _proactiveEnabled = true;
   bool _proactiveVoiceEnabled = true;
   bool _proactiveFeedEnabled = true;
@@ -208,6 +226,7 @@ class _MyAppState extends State<MyApp> {
   final LocalNotificationController _notificationController =
       LocalNotificationController();
   int _lastNotificationSequence = 0;
+  bool _notificationsSynced = false;
   int _unreadNotifications = 0;
 
   // On-demand reflection (Alt+Shift+W by default). Ten frames at the 1fps the
@@ -285,8 +304,14 @@ class _MyAppState extends State<MyApp> {
     final prefs = await SharedPreferences.getInstance();
     final saved = prefs.getString(_homeHubPreferenceKey)?.trim();
     if (!mounted) return;
-    if (saved != null && saved.isNotEmpty) {
+    if (saved != null && saved.isNotEmpty && saved != _legacyHomeHub) {
       _ipTextController.text = saved;
+    } else if (saved == _legacyHomeHub) {
+      // Older APKs persisted the former Wi-Fi address. Upgrading the app keeps
+      // SharedPreferences, so migrate that shipped default to the stable
+      // Tailscale address instead of remaining silently stuck on the old LAN.
+      _ipTextController.text = _defaultHomeHub;
+      await prefs.setString(_homeHubPreferenceKey, _defaultHomeHub);
     }
     await _pollBackendStatus();
     await _loadTtsSettings();
@@ -296,7 +321,7 @@ class _MyAppState extends State<MyApp> {
   Future<void> _connectToHomeHub() async {
     final value = _ipTextController.text.trim();
     if (value.isEmpty) {
-      _showSnack('Enter the PC Wi-Fi address first');
+      _showSnack('Enter the PC Tailscale or Wi-Fi address first');
       return;
     }
     if (mounted) {
@@ -1274,23 +1299,19 @@ class _MyAppState extends State<MyApp> {
   }
 
   /// Poll for unprompted proactive insights and play their speech on THIS
-  /// device. New insights also land in the chat list for replay.
+  /// device. New insights land on the home Insights panel, and — when the feed
+  /// preference is on — in the chat list for replay in conversation order.
   Future<void> _fetchProactiveInsights() async {
     if (_ipTextController.text.trim().isEmpty) return;
+    // First poll after (re)connect: adopt the latest id without replaying
+    // insights that were generated before the app was listening.
+    if (!_proactiveSynced) return _backfillInsightPanel();
     try {
       final response = await http
           .get(Uri.parse('$_apiBase/proactive?since=$_lastProactiveId'))
           .timeout(const Duration(seconds: 3));
       if (response.statusCode != 200) return;
       final data = decodeJsonResponse(response) as Map<String, dynamic>;
-
-      // First poll after (re)connect: adopt the latest id without replaying
-      // insights that were generated before the app was listening.
-      if (!_proactiveSynced) {
-        _lastProactiveId = (data['latest_id'] as num?)?.toInt() ?? 0;
-        _proactiveSynced = true;
-        return;
-      }
 
       final insights = (data['insights'] as List?) ?? const [];
       for (final item in insights) {
@@ -1300,29 +1321,36 @@ class _MyAppState extends State<MyApp> {
         _lastProactiveId = id;
         if (!_proactiveEnabled) continue;
 
+        // Decoded regardless of the voice preference: the panel's replay
+        // button should not have to re-synthesize speech the server already
+        // sent, even for a user who does not want it spoken automatically.
         Uint8List? audio;
         final audioB64 = map['audio'];
-        if ((_proactiveVoiceEnabled || _proactiveFeedEnabled) &&
-            audioB64 is String &&
-            audioB64.isNotEmpty) {
+        if (audioB64 is String && audioB64.isNotEmpty) {
           audio = base64.decode(audioB64);
         }
 
         final clip = map['clip'] as Map<String, dynamic>?;
-        if (mounted && _proactiveFeedEnabled) {
+        if (mounted) {
           setState(() {
-            _chatHistory.add(
-              ChatMessage(
-                sender: MessageSender.assistant,
-                text: 'Insight: ${map['text'] ?? ''}',
-                fullAudio: audio,
-                clipId:
-                    map['can_ask'] == true ? map['clip_id']?.toString() : null,
-                clipCoversSeconds:
-                    (clip?['covers_seconds'] as num?)?.toDouble(),
-                clipPlaysSeconds: (clip?['plays_seconds'] as num?)?.toDouble(),
-              ),
-            );
+            _addInsightToPanel(ProactiveInsight.fromJson(map, audio: audio));
+            if (_proactiveFeedEnabled) {
+              _chatHistory.add(
+                ChatMessage(
+                  sender: MessageSender.assistant,
+                  text: 'Insight: ${map['text'] ?? ''}',
+                  fullAudio: audio,
+                  clipId:
+                      map['can_ask'] == true
+                          ? map['clip_id']?.toString()
+                          : null,
+                  clipCoversSeconds:
+                      (clip?['covers_seconds'] as num?)?.toDouble(),
+                  clipPlaysSeconds:
+                      (clip?['plays_seconds'] as num?)?.toDouble(),
+                ),
+              );
+            }
           });
         }
 
@@ -1335,6 +1363,150 @@ class _MyAppState extends State<MyApp> {
     } catch (_) {
       // Transient/offline — connectivity is surfaced by the status poll.
     }
+  }
+
+  /// Fill the panel with what was already said, without speaking any of it.
+  /// A home screen that only fills up after the narrator's next five-minute
+  /// evaluation looks broken; the insights from before the app was listening
+  /// are still the most recent thing the assistant thought.
+  Future<void> _backfillInsightPanel() async {
+    try {
+      final response = await http
+          .get(
+            Uri.parse(
+              '$_apiBase/proactive?since=0&limit=6&include_audio=false',
+            ),
+          )
+          .timeout(const Duration(seconds: 4));
+      // Leave _proactiveSynced false so the next tick retries — adopting the
+      // id here would silently swallow whatever arrives in between.
+      if (response.statusCode != 200) return;
+      final data = decodeJsonResponse(response) as Map<String, dynamic>;
+      final recent = ((data['insights'] as List?) ?? const [])
+          .whereType<Map>()
+          .map(
+            (item) =>
+                ProactiveInsight.fromJson(Map<String, dynamic>.from(item)),
+          )
+          .toList()
+          .reversed
+          .toList(growable: false);
+      _lastProactiveId = (data['latest_id'] as num?)?.toInt() ?? 0;
+      _proactiveSynced = true;
+      if (!mounted) return;
+      setState(() {
+        _insightFeed
+          ..clear()
+          ..addAll(recent.take(_insightFeedLimit));
+      });
+    } catch (_) {
+      // Transient/offline — the status poll owns the connection indicator.
+    }
+  }
+
+  void _addInsightToPanel(ProactiveInsight insight) {
+    _insightFeed.removeWhere((item) => item.id == insight.id);
+    _insightFeed.insert(0, insight);
+    if (_insightFeed.length > _insightFeedLimit) {
+      _insightFeed.removeRange(_insightFeedLimit, _insightFeed.length);
+    }
+  }
+
+  void _updateInsight(
+    int id,
+    ProactiveInsight Function(ProactiveInsight) edit,
+  ) {
+    final index = _insightFeed.indexWhere((item) => item.id == id);
+    if (index < 0) return;
+    setState(() => _insightFeed[index] = edit(_insightFeed[index]));
+  }
+
+  /// Say it again on this device, fetching the Kokoro audio when the insight
+  /// was backfilled without it.
+  Future<void> _replayInsight(ProactiveInsight insight) async {
+    var audio = insight.audio;
+    if (audio == null) {
+      if (mounted) setState(() => _insightSpeakingId = insight.id);
+      try {
+        final response = await http
+            .get(Uri.parse('$_apiBase/proactive/${insight.id}/tts'))
+            .timeout(const Duration(seconds: 45));
+        if (response.statusCode != 200 || response.bodyBytes.isEmpty) {
+          throw Exception('backend returned ${response.statusCode}');
+        }
+        audio = response.bodyBytes;
+        if (mounted) {
+          _updateInsight(insight.id, (item) => item.copyWith(audio: audio));
+        }
+      } catch (error) {
+        _showSnack('Could not speak that insight: $error');
+        return;
+      } finally {
+        if (mounted) setState(() => _insightSpeakingId = null);
+      }
+    }
+    _audioQueue.add(audio);
+    if (!_isAudioPlaying) _playNextInQueue();
+  }
+
+  /// Teach the narrator. Applied locally first so the thumb responds at once;
+  /// reverted if the graph refuses it.
+  Future<void> _sendInsightFeedback(
+    ProactiveInsight insight,
+    String feedback,
+  ) async {
+    final nudgeId = insight.nudgeId;
+    if (nudgeId == null || nudgeId.isEmpty) return;
+    final previous = insight.feedback;
+    _updateInsight(insight.id, (item) => item.copyWith(feedback: feedback));
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$_apiBase/proactive/$nudgeId/feedback'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({'feedback': feedback}),
+          )
+          .timeout(const Duration(seconds: 8));
+      if (response.statusCode != 200) {
+        throw Exception('backend returned ${response.statusCode}');
+      }
+      _showSnack(
+        feedback == 'up'
+            ? 'Noted — more like that'
+            : 'Noted — fewer insights like that',
+      );
+    } catch (error) {
+      if (mounted) {
+        _updateInsight(
+          insight.id,
+          (item) => ProactiveInsight(
+            id: item.id,
+            text: item.text,
+            kind: item.kind,
+            source: item.source,
+            timestamp: item.timestamp,
+            nudgeId: item.nudgeId,
+            audio: item.audio,
+            clipId: item.clipId,
+            feedback: previous,
+          ),
+        );
+      }
+      _showSnack('Could not record that feedback: $error');
+    }
+  }
+
+  Widget _buildInsightsPanel({bool compact = false}) {
+    return InsightsPanel(
+      insights: _insightFeed,
+      enabled: _proactiveEnabled,
+      connected: _backendConnected,
+      speakingId: _insightSpeakingId,
+      maxItems: compact ? 2 : 4,
+      compact: compact,
+      onReplay: _replayInsight,
+      onFeedback: _sendInsightFeedback,
+    );
   }
 
   Future<void> _runGlobalReflection({
@@ -1793,6 +1965,43 @@ class _MyAppState extends State<MyApp> {
       if (response.statusCode != 200) return;
       final data = decodeJsonResponse(response) as Map<String, dynamic>;
       final latest = (data['latest_sequence'] as num?)?.toInt() ?? 0;
+      final notifications =
+          ((data['notifications'] as List?) ?? const [])
+              .whereType<Map>()
+              .map((item) => Map<String, dynamic>.from(item))
+              .toList()
+              .reversed;
+      if (_notificationsSynced && !_notificationsMuted) {
+        for (final item in notifications) {
+          final sequence = (item['sequence'] as num?)?.toInt() ?? 0;
+          if (sequence <= _lastNotificationSequence) continue;
+          // Only critical events earn a desktop toast; "important" ones are
+          // frequent enough to be noise and stay in the inbox instead.
+          final severity = '${item['severity'] ?? 'important'}';
+          if (desktopAlertsSupported &&
+              _eventNotificationsEnabled &&
+              severity == 'critical') {
+            await showDesktopAlert(
+              '${item['title'] ?? 'HomeMind'}',
+              '${item['body'] ?? ''}',
+            );
+          }
+          if (item['speak'] == true &&
+              defaultTargetPlatform != TargetPlatform.android) {
+            try {
+              final audio = await http
+                  .get(Uri.parse('$_apiBase/notifications/${item['id']}/tts'))
+                  .timeout(const Duration(seconds: 30));
+              if (audio.statusCode == 200 && audio.bodyBytes.isNotEmpty) {
+                _audioQueue.add(audio.bodyBytes);
+                if (!_isAudioPlaying) _playNextInQueue();
+              }
+            } catch (_) {
+              // The visible notification still succeeds if speech is unavailable.
+            }
+          }
+        }
+      }
       if (mounted) {
         setState(() {
           _unreadNotifications = (data['unread_count'] as num?)?.toInt() ?? 0;
@@ -1801,6 +2010,7 @@ class _MyAppState extends State<MyApp> {
       // The native foreground monitor owns system notifications. Flutter only
       // keeps the unread badge and inbox in sync.
       _lastNotificationSequence = latest;
+      _notificationsSynced = true;
     } catch (_) {
       // The connection indicator already reports backend availability.
     }
@@ -2346,7 +2556,7 @@ class _MyAppState extends State<MyApp> {
             onPressed: _connectToHomeHub,
             icon: const Icon(Icons.refresh_rounded, size: 19),
           ),
-          helperText: 'Use the PC Wi-Fi IP; localhost points to this phone',
+          helperText: 'Use the PC Tailscale IP; localhost points to this phone',
         ),
         onSubmitted: (_) => _connectToHomeHub(),
       ),
@@ -2646,87 +2856,107 @@ class _MyAppState extends State<MyApp> {
                 ],
               ),
             ),
-            _workspaceNavItem(
-              icon: Icons.home_rounded,
-              label: 'Home',
-              selected: _workspaceIndex == 0,
-              onTap: () {
-                if (drawer) {
-                  Navigator.pop(context);
-                } else {
-                  setState(() => _workspaceIndex = 0);
-                }
-              },
-            ),
-            _workspaceNavItem(
-              icon: Icons.auto_awesome,
-              label: 'Assistant',
-              selected: _workspaceIndex == 1,
-              onTap:
-                  () => _openWorkspace(1, AssistantScreen(apiBase: _apiBase)),
-            ),
-            _workspaceNavItem(
-              icon: Icons.forum_outlined,
-              label: 'Rooms',
-              selected: _workspaceIndex == 2,
-              onTap:
-                  () => _openWorkspace(2, RoomsListScreen(apiBase: _apiBase)),
-            ),
-            _workspaceNavItem(
-              icon: Icons.manage_search,
-              label: 'Memory',
-              selected: _workspaceIndex == 3,
-              onTap:
-                  () => _openWorkspace(
-                    3,
-                    MemoryTimelineScreen(apiBase: _apiBase),
-                  ),
-            ),
-            _workspaceNavItem(
-              icon: Icons.notifications_none_outlined,
-              label: 'Notifications',
-              badge: _unreadNotifications > 0 ? '$_unreadNotifications' : null,
-              selected: _workspaceIndex == 4,
-              onTap: _openNotifications,
-            ),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(21, 22, 20, 7),
-              child: Text(
-                'SYSTEM',
-                style: TextStyle(
-                  color: _muted,
-                  fontSize: 9,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 1.4,
+            // The nav list scrolls so a short screen (landscape, or a large
+            // system font) shrinks nothing: the header and the hub status stay
+            // pinned, and the items in between keep their full height.
+            Expanded(
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _workspaceNavItem(
+                      icon: Icons.home_rounded,
+                      label: 'Home',
+                      selected: _workspaceIndex == 0,
+                      onTap: () {
+                        if (drawer) {
+                          Navigator.pop(context);
+                        } else {
+                          setState(() => _workspaceIndex = 0);
+                        }
+                      },
+                    ),
+                    _workspaceNavItem(
+                      icon: Icons.auto_awesome,
+                      label: 'Assistant',
+                      selected: _workspaceIndex == 1,
+                      onTap:
+                          () => _openWorkspace(
+                            1,
+                            AssistantScreen(apiBase: _apiBase),
+                          ),
+                    ),
+                    _workspaceNavItem(
+                      icon: Icons.forum_outlined,
+                      label: 'Rooms',
+                      selected: _workspaceIndex == 2,
+                      onTap:
+                          () => _openWorkspace(
+                            2,
+                            RoomsListScreen(apiBase: _apiBase),
+                          ),
+                    ),
+                    _workspaceNavItem(
+                      icon: Icons.manage_search,
+                      label: 'Memory',
+                      selected: _workspaceIndex == 3,
+                      onTap:
+                          () => _openWorkspace(
+                            3,
+                            MemoryTimelineScreen(apiBase: _apiBase),
+                          ),
+                    ),
+                    _workspaceNavItem(
+                      icon: Icons.notifications_none_outlined,
+                      label: 'Notifications',
+                      badge:
+                          _unreadNotifications > 0
+                              ? '$_unreadNotifications'
+                              : null,
+                      selected: _workspaceIndex == 4,
+                      onTap: _openNotifications,
+                    ),
+                    const Padding(
+                      padding: EdgeInsets.fromLTRB(21, 22, 20, 7),
+                      child: Text(
+                        'SYSTEM',
+                        style: TextStyle(
+                          color: _muted,
+                          fontSize: 9,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 1.4,
+                        ),
+                      ),
+                    ),
+                    _workspaceNavItem(
+                      icon:
+                          _notificationsMuted
+                              ? Icons.notifications_off_outlined
+                              : Icons.record_voice_over_outlined,
+                      label: 'Initiative & alerts',
+                      badge: _notificationsMuted ? 'MUTED' : null,
+                      onTap: _showInitiativeSheet,
+                    ),
+                    _workspaceNavItem(
+                      icon: Icons.center_focus_strong,
+                      label: 'Capture & privacy',
+                      onTap: _showCaptureSheet,
+                    ),
+                    _workspaceNavItem(
+                      icon: Icons.tune_rounded,
+                      label: 'Settings',
+                      selected: _workspaceIndex == 5,
+                      onTap: () => _openWorkspace(5, _settingsScreen()),
+                    ),
+                    _workspaceNavItem(
+                      icon: Icons.hub_outlined,
+                      label: 'Home hub',
+                      onTap: _showConnectionSheet,
+                    ),
+                  ],
                 ),
               ),
             ),
-            _workspaceNavItem(
-              icon:
-                  _notificationsMuted
-                      ? Icons.notifications_off_outlined
-                      : Icons.record_voice_over_outlined,
-              label: 'Initiative & alerts',
-              badge: _notificationsMuted ? 'MUTED' : null,
-              onTap: _showInitiativeSheet,
-            ),
-            _workspaceNavItem(
-              icon: Icons.center_focus_strong,
-              label: 'Capture & privacy',
-              onTap: _showCaptureSheet,
-            ),
-            _workspaceNavItem(
-              icon: Icons.tune_rounded,
-              label: 'Settings',
-              selected: _workspaceIndex == 5,
-              onTap: () => _openWorkspace(5, _settingsScreen()),
-            ),
-            _workspaceNavItem(
-              icon: Icons.hub_outlined,
-              label: 'Home hub',
-              onTap: _showConnectionSheet,
-            ),
-            const Spacer(),
             Container(
               margin: const EdgeInsets.all(12),
               padding: const EdgeInsets.all(12),
@@ -3256,25 +3486,30 @@ class _MyAppState extends State<MyApp> {
           const Divider(height: 1, color: _line),
           if (_chatHistory.isEmpty)
             const Expanded(
+              // Centred when there is room, scrolled when there is not: a
+              // short card (landscape, or the keyboard up) should not clip
+              // the one line telling a new user what to do.
               child: Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.waves_rounded, color: _mint, size: 42),
-                    SizedBox(height: 14),
-                    Text(
-                      'Your home is listening',
-                      style: TextStyle(
-                        fontSize: 17,
-                        fontWeight: FontWeight.w700,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.waves_rounded, color: _mint, size: 42),
+                      SizedBox(height: 14),
+                      Text(
+                        'Your home is listening',
+                        style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
-                    ),
-                    SizedBox(height: 6),
-                    Text(
-                      'Hold the microphone, or type a message',
-                      style: TextStyle(color: _muted, fontSize: 12),
-                    ),
-                  ],
+                      SizedBox(height: 6),
+                      Text(
+                        'Hold the microphone, or type a message',
+                        style: TextStyle(color: _muted, fontSize: 12),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             )
@@ -3474,138 +3709,57 @@ class _MyAppState extends State<MyApp> {
     );
   }
 
-  Widget _buildQuickAccessPanel() {
-    Widget action({
-      required IconData icon,
-      required String title,
-      required String subtitle,
-      required Color color,
-      required VoidCallback onTap,
-    }) {
-      return Material(
-        color: _panelRaised.withValues(alpha: .72),
-        borderRadius: BorderRadius.circular(14),
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(14),
-          child: Padding(
-            padding: const EdgeInsets.all(13),
-            child: Row(
+  /// Reflect / Source / Prompts. Three icon buttons side by side need roughly
+  /// 330dp before their labels start clipping, so narrower phones stack them
+  /// full width instead of squeezing three onto one line.
+  Widget _buildMobileReflectionActions() {
+    final reflect = FilledButton.tonalIcon(
+      onPressed: _reflecting ? null : _reflectOnScreen,
+      icon: Icon(
+        _reflecting ? Icons.hourglass_top : Icons.psychology_outlined,
+        size: 17,
+      ),
+      label: Text(_reflecting ? 'Working…' : 'Reflect'),
+    );
+    final source = OutlinedButton.icon(
+      onPressed: _reflecting ? null : _showReflectionSourcePicker,
+      icon: const Icon(Icons.add_to_photos_outlined, size: 17),
+      label: const Text('Source'),
+    );
+    final prompts = OutlinedButton.icon(
+      key: const Key('mobile-guided-reflection-button'),
+      onPressed: _reflecting ? null : _showPromptActionPicker,
+      icon: const Icon(Icons.auto_awesome_outlined, size: 17),
+      label: const Text('Prompts'),
+    );
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (constraints.maxWidth >= 330) {
+          return Row(
+            children: [
+              Expanded(child: reflect),
+              const SizedBox(width: 6),
+              Expanded(child: source),
+              const SizedBox(width: 6),
+              Expanded(child: prompts),
+            ],
+          );
+        }
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            reflect,
+            const SizedBox(height: 6),
+            Row(
               children: [
-                Container(
-                  width: 38,
-                  height: 38,
-                  decoration: BoxDecoration(
-                    color: color.withValues(alpha: .13),
-                    borderRadius: BorderRadius.circular(11),
-                  ),
-                  child: Icon(icon, color: color, size: 19),
-                ),
-                const SizedBox(width: 11),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        title,
-                        style: const TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        subtitle,
-                        style: const TextStyle(color: _muted, fontSize: 9.5),
-                      ),
-                    ],
-                  ),
-                ),
-                const Icon(Icons.chevron_right, color: _muted, size: 18),
+                Expanded(child: source),
+                const SizedBox(width: 6),
+                Expanded(child: prompts),
               ],
             ),
-          ),
-        ),
-      );
-    }
-
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: _panel,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: _line),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            'QUICK ACCESS',
-            style: TextStyle(
-              color: _muted,
-              fontSize: 9,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 1.3,
-            ),
-          ),
-          const SizedBox(height: 10),
-          action(
-            icon: Icons.auto_awesome,
-            title: 'Grounded assistant',
-            subtitle: 'Ask with citations from memory',
-            color: _mint,
-            onTap: () => _openWorkspace(1, AssistantScreen(apiBase: _apiBase)),
-          ),
-          const SizedBox(height: 7),
-          action(
-            icon: Icons.forum_outlined,
-            title: 'Rooms',
-            subtitle: 'Continue a project or topic',
-            color: _violet,
-            onTap: () => _openWorkspace(2, RoomsListScreen(apiBase: _apiBase)),
-          ),
-          const SizedBox(height: 7),
-          action(
-            icon: Icons.manage_search,
-            title: 'Explore memory',
-            subtitle: 'Search timeline and entities',
-            color: const Color(0xFF62B5FF),
-            onTap:
-                () =>
-                    _openWorkspace(3, MemoryTimelineScreen(apiBase: _apiBase)),
-          ),
-          const SizedBox(height: 7),
-          action(
-            icon: _reflecting ? Icons.hourglass_top : Icons.psychology_outlined,
-            title: 'Reflect now',
-            subtitle:
-                _reflecting
-                    ? 'Reading the last ${_reflectFrames}s…'
-                    : '${_reflectShortcut?.label ?? 'Shortcut disabled'} • '
-                        'last ${_reflectFrames}s of frames',
-            color: const Color(0xFFFFC857),
-            onTap: _reflecting ? () {} : _reflectOnScreen,
-          ),
-          const SizedBox(height: 7),
-          action(
-            icon: Icons.add_to_photos_outlined,
-            title: 'Reflect from source…',
-            subtitle:
-                '${_sourceReflectShortcut?.label ?? 'Shortcut disabled'} • '
-                'screen, mobile or camera',
-            color: const Color(0xFF62B5FF),
-            onTap: _reflecting ? () {} : _showReflectionSourcePicker,
-          ),
-          const SizedBox(height: 7),
-          action(
-            icon: Icons.auto_awesome_outlined,
-            title: 'Guided reflection…',
-            subtitle: '9 reading, code and guidance prompts',
-            color: _mint,
-            onTap: _reflecting ? () {} : _showPromptActionPicker,
-          ),
-        ],
-      ),
+          ],
+        );
+      },
     );
   }
 
@@ -3621,75 +3775,39 @@ class _MyAppState extends State<MyApp> {
         children: [
           _buildContextSelector(),
           const SizedBox(height: 10),
-          Row(
+          // Wrapped rather than four equal columns: at three chips to a 360dp
+          // row each label had to shrink or clip, and the labels are the only
+          // thing saying what the toggle does.
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
             children: [
-              Expanded(
-                child: _buildToggleSwitch(
-                  'Talk',
-                  _isTalking,
-                  (v) => setState(() => _isTalking = v),
-                ),
+              _buildToggleSwitch(
+                'Talk',
+                _isTalking,
+                (v) => setState(() => _isTalking = v),
               ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: _buildToggleSwitch('Live', _isLive, (v) {
-                  if (v && _currentContext == 'talker') {
-                    _showSnack('Choose Screen or Camera first');
-                    return;
-                  }
-                  setState(() => _isLive = v);
-                }),
+              _buildToggleSwitch('Live', _isLive, (v) {
+                if (v && _currentContext == 'talker') {
+                  _showSnack('Choose Screen or Camera first');
+                  return;
+                }
+                setState(() => _isLive = v);
+              }),
+              _buildToggleSwitch(
+                'Memory',
+                _useMemory,
+                (v) => setState(() => _useMemory = v),
               ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: _buildToggleSwitch(
-                  'Memory',
-                  _useMemory,
-                  (v) => setState(() => _useMemory = v),
-                ),
+              _buildToggleSwitch(
+                'Thinking',
+                _conversationThinking,
+                (v) => setState(() => _conversationThinking = v),
               ),
             ],
-          ),
-          const SizedBox(height: 6),
-          _buildToggleSwitch(
-            'Thinking',
-            _conversationThinking,
-            (v) => setState(() => _conversationThinking = v),
           ),
           const SizedBox(height: 8),
-          Row(
-            children: [
-              Expanded(
-                child: FilledButton.tonalIcon(
-                  onPressed: _reflecting ? null : _reflectOnScreen,
-                  icon: Icon(
-                    _reflecting
-                        ? Icons.hourglass_top
-                        : Icons.psychology_outlined,
-                    size: 17,
-                  ),
-                  label: Text(_reflecting ? 'Working…' : 'Reflect'),
-                ),
-              ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: _reflecting ? null : _showReflectionSourcePicker,
-                  icon: const Icon(Icons.add_to_photos_outlined, size: 17),
-                  label: const Text('Source'),
-                ),
-              ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: OutlinedButton.icon(
-                  key: const Key('mobile-guided-reflection-button'),
-                  onPressed: _reflecting ? null : _showPromptActionPicker,
-                  icon: const Icon(Icons.auto_awesome_outlined, size: 17),
-                  label: const Text('Prompts'),
-                ),
-              ),
-            ],
-          ),
+          _buildMobileReflectionActions(),
           ListTile(
             dense: true,
             contentPadding: const EdgeInsets.fromLTRB(4, 4, 4, 0),
@@ -3811,7 +3929,16 @@ class _MyAppState extends State<MyApp> {
                                         child: SingleChildScrollView(
                                           child: Column(
                                             children: [
-                                              _buildQuickAccessPanel(),
+                                              // First in the column on purpose:
+                                              // "what is the machine doing?" is
+                                              // the question asked most often,
+                                              // and it changes the fastest.
+                                              JobsPanel(apiBase: _apiBase),
+                                              const SizedBox(height: 12),
+                                              // Directly under it: what the
+                                              // machine decided was worth
+                                              // saying while nobody asked.
+                                              _buildInsightsPanel(),
                                               const SizedBox(height: 12),
                                               _buildControlPanel(),
                                             ],
@@ -3823,16 +3950,46 @@ class _MyAppState extends State<MyApp> {
                                 ),
                               ],
                             )
-                            : Column(
-                              children: [
-                                _buildMobileHeader(),
-                                const SizedBox(height: 10),
-                                _buildMobileStatus(),
-                                const SizedBox(height: 10),
-                                Expanded(child: _buildConversationCard()),
-                                const SizedBox(height: 10),
-                                _buildMobileControls(),
-                              ],
+                            : LayoutBuilder(
+                              builder: (context, viewport) {
+                                // The phone layout scrolls instead of
+                                // compressing. Header, status, conversation and
+                                // controls together are taller than a phone
+                                // viewport, and fitting them all on screen left
+                                // the transcript a couple of bubbles tall — and
+                                // less than that once the keyboard opened.
+                                // Everything keeps its natural height. The
+                                // conversation still takes whatever the header,
+                                // status and controls leave over, so a roomy
+                                // phone needs no scrolling at all; it just
+                                // stops shrinking at a floor, and the page
+                                // scrolls from there.
+                                final conversationHeight = math.max(
+                                  _mobileConversationMinHeight,
+                                  viewport.maxHeight - _mobileChromeHeight,
+                                );
+                                return SingleChildScrollView(
+                                  child: Column(
+                                    children: [
+                                      _buildMobileHeader(),
+                                      const SizedBox(height: 10),
+                                      _buildMobileStatus(),
+                                      if (_proactiveEnabled &&
+                                          _insightFeed.isNotEmpty) ...[
+                                        const SizedBox(height: 10),
+                                        _buildInsightsPanel(compact: true),
+                                      ],
+                                      const SizedBox(height: 10),
+                                      SizedBox(
+                                        height: conversationHeight,
+                                        child: _buildConversationCard(),
+                                      ),
+                                      const SizedBox(height: 10),
+                                      _buildMobileControls(),
+                                    ],
+                                  ),
+                                );
+                              },
                             ),
                   ),
                 ),

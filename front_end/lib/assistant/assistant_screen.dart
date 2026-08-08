@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import '../memory/timeline_screen.dart';
 import '../network/http_json.dart';
 import '../reports/reports_screen.dart';
@@ -291,10 +292,44 @@ class ConversationPanel extends StatefulWidget {
   State<ConversationPanel> createState() => _ConversationPanelState();
 }
 
+/// How a grounded turn is answered. `direct` and `thinking` both run the local
+/// model — only the reasoning template differs; `agent` hands the turn to the
+/// Claude Agent SDK, which is the only mode where effort applies.
+const _assistantModes = <String, ({String label, IconData icon, String hint})>{
+  'direct': (
+    label: 'No thinking',
+    icon: Icons.bolt_outlined,
+    hint: 'Local model answers straight from the evidence — fastest.',
+  ),
+  'thinking': (
+    label: 'Thinking',
+    icon: Icons.psychology_outlined,
+    hint: 'Local model reasons before answering — slower, better on hard asks.',
+  ),
+  'agent': (
+    label: 'Claude agent',
+    icon: Icons.smart_toy_outlined,
+    hint: 'Claude runs with graph and MCP tools — slowest, can look things up.',
+  ),
+};
+
+const _agentEfforts = <String>['low', 'medium', 'high', 'xhigh', 'max'];
+
 class _ConversationPanelState extends State<ConversationPanel> {
+  static const _modeKey = 'assistant_conversation_mode';
+  static const _effortKey = 'assistant_conversation_effort';
+
   final TextEditingController _input = TextEditingController();
   final ScrollController _scroll = ScrollController();
   bool _sending = false;
+  String _mode = 'direct';
+  String _effort = 'high';
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadPreferences());
+  }
 
   @override
   void dispose() {
@@ -302,6 +337,31 @@ class _ConversationPanelState extends State<ConversationPanel> {
     _scroll.dispose();
     super.dispose();
   }
+
+  Future<void> _loadPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    final mode = prefs.getString(_modeKey);
+    final effort = prefs.getString(_effortKey);
+    if (!mounted) return;
+    setState(() {
+      if (_assistantModes.containsKey(mode)) _mode = mode!;
+      if (_agentEfforts.contains(effort)) _effort = effort!;
+    });
+  }
+
+  Future<void> _savePreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_modeKey, _mode);
+    await prefs.setString(_effortKey, _effort);
+  }
+
+  /// The agent may make several tool round trips, and local thinking runs on a
+  /// single shared sequence — both need far more headroom than a plain answer.
+  Duration get _timeout => switch (_mode) {
+        'agent' => const Duration(minutes: 15),
+        'thinking' => const Duration(minutes: 5),
+        _ => const Duration(seconds: 90),
+      };
 
   Future<void> _send() async {
     final text = _input.text.trim();
@@ -312,8 +372,12 @@ class _ConversationPanelState extends State<ConversationPanel> {
       final resp = await http.post(
         Uri.parse('${widget.apiBase}/assistant/conversations/$id/messages'),
         headers: {'Content-Type': 'application/json'},
-        body: json.encode({'message': text}),
-      ).timeout(const Duration(seconds: 90));
+        body: json.encode({
+          'message': text,
+          'mode': _mode,
+          if (_mode == 'agent') 'effort': _effort,
+        }),
+      ).timeout(_timeout);
       if (resp.statusCode == 200) {
         _input.clear();
         widget.onChanged();
@@ -321,9 +385,69 @@ class _ConversationPanelState extends State<ConversationPanel> {
         ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('Assistant failed: HTTP ${resp.statusCode}')));
       }
+    } on TimeoutException {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('Assistant timed out — try a lower effort or mode.')));
+      }
     } finally {
       if (mounted) setState(() => _sending = false);
     }
+  }
+
+  Widget _modeBar() {
+    return Container(
+      width: double.infinity,
+      color: _panel,
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 0),
+      child: Wrap(
+        spacing: 7,
+        runSpacing: 7,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          for (final entry in _assistantModes.entries)
+            ChoiceChip(
+              key: Key('assistant-mode-${entry.key}'),
+              selected: _mode == entry.key,
+              avatar: Icon(entry.value.icon, size: 16),
+              label: Text(entry.value.label),
+              tooltip: entry.value.hint,
+              selectedColor: _mint.withValues(alpha: .22),
+              backgroundColor: _panelRaised,
+              side: BorderSide(color: _mode == entry.key ? _mint : _line),
+              labelStyle: TextStyle(
+                  color: _mode == entry.key ? _mint : _muted, fontSize: 12),
+              onSelected: (selected) {
+                if (!selected || _sending) return;
+                setState(() => _mode = entry.key);
+                unawaited(_savePreferences());
+              },
+            ),
+          if (_mode == 'agent')
+            DropdownButton<String>(
+              key: const Key('assistant-effort'),
+              value: _effort,
+              dropdownColor: _panelRaised,
+              underline: const SizedBox.shrink(),
+              style: const TextStyle(color: _violet, fontSize: 12),
+              items: [
+                for (final effort in _agentEfforts)
+                  DropdownMenuItem(
+                    value: effort,
+                    child: Text('Effort: $effort'),
+                  ),
+              ],
+              onChanged: _sending
+                  ? null
+                  : (value) {
+                      if (value == null) return;
+                      setState(() => _effort = value);
+                      unawaited(_savePreferences());
+                    },
+            ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -338,7 +462,9 @@ class _ConversationPanelState extends State<ConversationPanel> {
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
           child: Text(
             'Grounding: $scope'
-            '${widget.conversation['room_id'] != null ? ' · ${widget.conversation['room_id']}' : ''}',
+            '${widget.conversation['room_id'] != null ? ' · ${widget.conversation['room_id']}' : ''}'
+            ' · ${_assistantModes[_mode]!.label.toLowerCase()}'
+            '${_mode == 'agent' ? ' ($_effort effort)' : ''}',
             style: const TextStyle(color: _muted, fontSize: 11),
           ),
         ),
@@ -361,6 +487,7 @@ class _ConversationPanelState extends State<ConversationPanel> {
         ),
         if (_sending)
           const LinearProgressIndicator(minHeight: 2, color: _mint),
+        _modeBar(),
         Container(
           color: _panel,
           padding: const EdgeInsets.all(10),

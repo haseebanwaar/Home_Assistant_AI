@@ -22,11 +22,14 @@ only when a worthwhile draft repeats itself. The parked event-bus/autogen agents
 live in agents/_parked/.
 """
 import logging
+import re
 import time
 from collections import deque
 from threading import Lock
 
 from memory.retrieval.terms import tokenize
+from agents.schemas import ProactiveInsightDecision
+from providers.local_openAI import thinking_request_kwargs
 
 logger = logging.getLogger("home_assistant")
 
@@ -36,17 +39,35 @@ RECENT_EXCLUSION_SECONDS = 900
 MAX_DIRECT_MEMORIES = 4
 MAX_LINKED_MEMORIES = 4
 MAX_LINK_ENTITIES = 3
+QUALITY_MIN_TOTAL = 16
+# Per-run safety budget for this module's two Claude calls. The narrator is
+# given graph tools and told to go and check memory before it speaks, and at
+# 4 requests / 6 tool calls it kept ending on the budget rather than on an
+# answer — which shows up as "Proactive consider failed" and no nudge at all.
+# Still well under the room default's ceiling, because an unprompted remark
+# that costs a long tool loop has already failed at being timely.
+INSIGHT_REQUEST_LIMIT = 8
+INSIGHT_TOOL_CALLS_LIMIT = 12
+_OPERATIONAL_NOISE = re.compile(
+    r"\b(?:logs?|bugs?|errors?|graphs?|msi|installer|installation|stack trace|"
+    r"exception|compiler|build failure|runtime failure|telemetry|process monitor)\b",
+    re.IGNORECASE,
+)
 
 _SYSTEM_PROMPT = """You are the initiative layer of a personal assistant. You receive \
 live observations plus relevant memory and decide for yourself whether to speak without \
 waiting for a request.
 
-Use your full judgment and creativity. Surface whatever you believe would be valuable in \
-this moment: an observation, connection, question, reminder, warning, idea, challenge, \
-encouragement, next step, or something the user may not have considered. Those are examples, \
-not a list of allowed reasons. Do not force the situation through a fixed rubric of what is \
-right, wrong, useful, or permissible; reason from the whole context and the user's likely \
-needs. Prefer taking initiative when you have a meaningful contribution.
+Use your full judgment, imagination, and creativity. Privately brainstorm several possible \
+angles, including ideas, hypotheses, surprising connections, future possibilities, useful \
+questions, reframes, and things the user may not have considered. Prefer an insight that helps \
+the user think or create over a literal description of what is on screen.
+
+Operational activity is context, not content. Do not proactively discuss logs, code bugs, \
+exceptions, compiler/build errors, installers or MSI activity, processes, telemetry, dashboards, \
+graphs, or routine technical noise. Do not narrate that something is running. A visible error is \
+not itself an insight. Stay silent unless the wider memory reveals a genuinely important \
+non-operational idea; even then, speak about the idea rather than the error or log.
 
 Look for a non-obvious but grounded connection between the live work and linked memory. When \
 memory supplies a useful prior attempt, decision, unresolved thread, preference, or pattern, \
@@ -63,9 +84,11 @@ or assistant preamble. Vary the opening words, sentence shape, and conversationa
 recent initiatives. Avoid repeatedly beginning with phrases such as "It looks like", "I \
 noticed", "You seem to be", "Hey", or "Just a thought". Never invent novelty by changing facts.
 
-If speaking would add no value right now, reply with exactly: NO ACTION
-Otherwise reply naturally for speech. Be direct and reasonably brief (usually 1-3 sentences, \
-no formatting)."""
+Before answering, critically score the strongest candidate for relevance, novelty, usefulness, \
+and insightfulness. Mark operational_noise true if it is driven by any excluded technical noise. \
+Set publish=true only when the candidate is unusually worthwhile, specific, and would justify \
+interrupting the user. If the bar is not met, discard it. The final insight must be direct and \
+reasonably brief (usually 1-3 sentences, no formatting)."""
 
 
 def _similar(a, b, threshold=0.6):
@@ -102,7 +125,8 @@ def _repeats_opening(text, prior_texts):
 class ProactiveNarrator:
     def __init__(self, vlm_model, client, cooldown_seconds=300,
                  retriever=None, store_getter=None, focus_cooldown_seconds=120,
-                 personal_memory=None, delivery_budget=None):
+                 personal_memory=None, delivery_budget=None, agent_runtime=None,
+                 evaluation_interval_seconds=300, reflections=None):
         self.vlm_model = vlm_model
         self.client = client
         self.cooldown_seconds = cooldown_seconds
@@ -110,13 +134,19 @@ class ProactiveNarrator:
         # narrator's own cooldown is the only pacing, and a nudge could land in
         # the same minute as a check-in because neither knew about the other.
         self.delivery_budget = delivery_budget
+        self.agent_runtime = agent_runtime
+        self.evaluation_interval_seconds = max(1, int(evaluation_interval_seconds))
         # Drift from a stated goal is worth catching sooner than a general remark.
         self.focus_cooldown_seconds = focus_cooldown_seconds
         self.retriever = retriever
         self.personal_memory = personal_memory
+        #: Daily Reflection answers. The single best defence against a nudge
+        #: that tells the user something he already worked out in writing.
+        self.reflections = reflections
         # Lazy: the graph is connected after the narrator is constructed.
         self._store_getter = store_getter or (lambda: None)
         self._last_spoken_at = 0.0
+        self._last_considered_at = 0.0
         self._recent_texts = deque(maxlen=12)
         # Screen, mobile and camera workers run on different threads/event loops.
         # Only one initiative decision should be in flight at a time.
@@ -141,6 +171,9 @@ class ProactiveNarrator:
         try:
             focus = self._active_focus()
             now = time.time()
+            if now - self._last_considered_at < self.evaluation_interval_seconds:
+                logger.debug("Proactive: waiting for the next insight evaluation.")
+                return None
             cooldown = self.focus_cooldown_seconds if focus else self.cooldown_seconds
             if now - self._last_spoken_at < cooldown:
                 logger.debug("Proactive: within delivery cooldown.")
@@ -152,34 +185,38 @@ class ProactiveNarrator:
                 logger.debug("Proactive: shared delivery budget is spent.")
                 return None
 
+            # Advance the evaluation cadence whether Claude publishes or discards.
+            # Otherwise low-quality observations would cause a tight retry loop.
+            self._last_considered_at = now
+
             recent_texts = self._recent_nudges()
             evidence = self._recall(description, now, focus=focus, context=context)
             personal_context = self._personal_context(description)
             prompt = self._build_prompt(
                 description, focus, evidence, source=source, context=context,
-                personal_context=personal_context, recent_texts=recent_texts)
+                personal_context=personal_context, recent_texts=recent_texts,
+                reflection_context=self._reflection_context(description))
 
-            response = await self.client.chat.completions.create(
-                model=self.vlm_model,
-                messages=[{"role": "system", "content": _SYSTEM_PROMPT},
-                          {"role": "user", "content": prompt}],
-                max_tokens=180,
-                temperature=0.8,
-                top_p=0.95,
-                **thinking_request_kwargs(False),
-            )
-            text = (response.choices[0].message.content or "").strip()
-
-            if not text or text.upper() == "NO ACTION":
+            decision = await self._create_decision(prompt)
+            if not self._passes_quality(decision):
+                logger.debug(
+                    "Proactive: candidate discarded (scores=%s/%s/%s/%s, noise=%s): %s",
+                    decision.relevance, decision.novelty, decision.usefulness,
+                    decision.insightfulness, decision.operational_noise,
+                    decision.rationale)
                 return None
+            text = decision.insight.strip()
 
             repeated_content = any(_similar(text, prior) for prior in recent_texts)
             repeated_opening = _repeats_opening(text, recent_texts)
-            if repeated_content or repeated_opening:
+            if (repeated_content or repeated_opening) and self.agent_runtime is None:
                 text = await self._revise_repetition(
                     prompt, text, recent_texts, repeated_content, repeated_opening)
                 if not text or text.upper() == "NO ACTION":
                     return None
+            elif repeated_content or repeated_opening:
+                logger.debug("Proactive: Claude candidate repeated a recent initiative.")
+                return None
 
             if any(_similar(text, prior) for prior in recent_texts):
                 logger.debug("Proactive: near-duplicate blocked at delivery.")
@@ -214,6 +251,67 @@ class ProactiveNarrator:
         finally:
             self._decision_lock.release()
 
+    async def _create_decision(self, prompt):
+        """Use Claude Agent SDK in production; retain direct compatibility for tests."""
+        if self.agent_runtime is not None:
+            result = await self.agent_runtime.run(
+                model_name=self.vlm_model or "",
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=300,
+                output_type=ProactiveInsightDecision,
+                selected_tools=None,
+                room_id="agent:proactive-insight",
+                room={
+                    "kind": "advisor",
+                    "agent_tools": ["graph"],
+                    "execution_profile": "investigate",
+                },
+                execution_profile="investigate",
+                configured_request_limit=INSIGHT_REQUEST_LIMIT,
+                configured_tool_calls_limit=INSIGHT_TOOL_CALLS_LIMIT,
+                thinking=True,
+                thinking_budget=None,
+                effort="high",
+            )
+            return result.output
+
+        response = await self.client.chat.completions.create(
+            job_label="Proactive narrator (compatibility)",
+            model=self.vlm_model,
+            messages=[{"role": "system", "content": _SYSTEM_PROMPT},
+                      {"role": "user", "content": prompt}],
+            max_tokens=180,
+            temperature=0.8,
+            top_p=0.95,
+            **thinking_request_kwargs(False),
+        )
+        text = (response.choices[0].message.content or "").strip()
+        return ProactiveInsightDecision(
+            publish=bool(text and text.upper() != "NO ACTION"), insight=text,
+            relevance=5, novelty=5, usefulness=5, insightfulness=5)
+
+    @staticmethod
+    def _passes_quality(decision):
+        text = (decision.insight or "").strip()
+        scores = (
+            decision.relevance, decision.novelty,
+            decision.usefulness, decision.insightfulness,
+        )
+        return (
+            decision.publish
+            and bool(text)
+            and not decision.operational_noise
+            and not _OPERATIONAL_NOISE.search(text)
+            and decision.relevance >= 4
+            and decision.usefulness >= 4
+            and decision.insightfulness >= 4
+            and decision.novelty >= 3
+            and sum(scores) >= QUALITY_MIN_TOTAL
+        )
+
     async def _revise_repetition(self, prompt, draft, recent_texts,
                                  repeated_content, repeated_opening):
         """Give a worthwhile draft one chance to become fresh instead of dropping it."""
@@ -237,7 +335,28 @@ class ProactiveNarrator:
         )
         if recent:
             revision_prompt += "\nRecent openings to avoid:\n" + recent
+        if self.agent_runtime is not None:
+            result = await self.agent_runtime.run(
+                model_name=self.vlm_model or "",
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": revision_prompt},
+                ],
+                max_tokens=180,
+                output_type=str,
+                selected_tools=None,
+                room_id="agent:proactive-insight",
+                room={"kind": "advisor", "execution_profile": "investigate"},
+                execution_profile="investigate",
+                configured_request_limit=INSIGHT_REQUEST_LIMIT,
+                configured_tool_calls_limit=INSIGHT_TOOL_CALLS_LIMIT,
+                thinking=True,
+                thinking_budget=None,
+                effort="high",
+            )
+            return str(result.output or "").strip()
         response = await self.client.chat.completions.create(
+            job_label="Proactive narrator (rewrite)",
             model=self.vlm_model,
             messages=[{"role": "system", "content": _SYSTEM_PROMPT},
                       {"role": "user", "content": revision_prompt}],
@@ -398,6 +517,18 @@ class ProactiveNarrator:
             logger.debug("Proactive: personal context failed: %s", exc)
             return ""
 
+    def _reflection_context(self, description):
+        """What the user has already said about this, in his own words."""
+        if self.reflections is None:
+            return ""
+        try:
+            return self.reflections.prompt_context(
+                query=description, limit=3, days=180, max_chars=1500,
+                answer_chars=700, strict=True)
+        except Exception as exc:
+            logger.debug("Proactive: reflection context failed: %s", exc)
+            return ""
+
     def _recent_nudges(self, limit=10):
         """Recent text survives restarts when the graph store is available."""
         texts = list(reversed(self._recent_texts))
@@ -429,7 +560,8 @@ class ProactiveNarrator:
             return []
 
     def _build_prompt(self, description, focus, evidence, source="screen", context=None,
-                      personal_context="", recent_texts=None):
+                      personal_context="", recent_texts=None,
+                      reflection_context=""):
         parts = [f"Live observation source: {source}\nObservation:\n{description}"]
         if context:
             lines = "\n".join(f"- {key}: {value}" for key, value in context.items()
@@ -475,6 +607,14 @@ class ProactiveNarrator:
                 "\nRelevant personal preferences and tendencies. Apply only when they "
                 "actually help with this moment:\n" + personal_context)
 
+        if reflection_context:
+            parts.append(
+                "\n" + reflection_context
+                + "\nSaying back to him something he already wrote here is the "
+                  "least valuable thing you can do. Either build on it — hold "
+                  "him to it, notice it has changed, point at what he has not "
+                  "acted on — or stay silent.")
+
         dismissed = self._dismissed()
         if dismissed:
             lines = "\n".join(
@@ -495,8 +635,11 @@ class ProactiveNarrator:
                 + "\n".join(f"- {opening}" for opening in openings[:8]))
 
         parts.append(
-            "\nSilently choose the most useful angle and a tone that fits the live "
-            "moment. If you speak, lead with specific substance and use linked memory "
-            "to advance the thought rather than narrating what is visible.")
+            "\nUse the graph-memory tools if they can reveal a deeper connection beyond "
+            "the supplied evidence. Silently generate multiple possible insights, reject "
+            "anything driven by logs, bugs, errors, installers/MSI activity, running "
+            "processes, graphs, dashboards, or other operational noise, then self-score "
+            "only the strongest remaining candidate. Use a tone that fits the live moment, "
+            "and lead with the idea rather than narrating what is visible. It is correct "
+            "to publish nothing.")
         return "\n".join(parts)
-from providers.local_openAI import thinking_request_kwargs

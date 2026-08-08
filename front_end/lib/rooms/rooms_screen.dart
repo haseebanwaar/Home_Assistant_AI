@@ -2,12 +2,20 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
+import '../calendar/calendar_screen.dart';
 import '../voice/dictation_controller.dart';
 import '../network/http_json.dart';
+import 'horizons_screen.dart';
 import 'quran_room_screen.dart';
 import 'research_room_screen.dart';
+import 'room_arc_screen.dart';
+import 'room_hygiene_sheet.dart';
+import 'room_shell.dart';
+import 'theme.dart';
 import 'tomorrow_plan_screen.dart';
 import 'personal_agent_room_screens.dart';
+import 'daily_reflection_screen.dart';
+import '../widgets/rich_content.dart';
 
 const _ink = Color(0xFF070B14);
 const _panel = Color(0xFF111827);
@@ -178,6 +186,15 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     // daily rhythm/food tracking, and a room-specific history. Keep the
     // generic room screen for every other agent or user-created room.
     switch (room['room_id']) {
+      case 'agent:daily-reflection':
+        Navigator.of(context)
+            .push(
+              MaterialPageRoute(
+                builder: (_) => DailyReflectionScreen(apiBase: widget.apiBase),
+              ),
+            )
+            .then((_) => _load());
+        return;
       case 'agent:motivational':
         Navigator.of(context)
             .push(
@@ -211,6 +228,15 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
             .push(
               MaterialPageRoute(
                 builder: (_) => WisdomRoomScreen(apiBase: widget.apiBase),
+              ),
+            )
+            .then((_) => _load());
+        return;
+      case 'agent:horizons':
+        Navigator.of(context)
+            .push(
+              MaterialPageRoute(
+                builder: (_) => HorizonsScreen(apiBase: widget.apiBase),
               ),
             )
             .then((_) => _load());
@@ -256,7 +282,7 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
                   roomId: room['room_id'].toString(),
                   roomName: (room['name'] ?? room['room_id']).toString(),
                   kind: (room['kind'] ?? 'activity').toString(),
-                  assistantMode: (room['assistant_mode'] ?? 'chat').toString(),
+                  assistantMode: 'agent',
                 ),
           ),
         )
@@ -351,11 +377,10 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     final entities = TextEditingController(
       text: ((matcher['entity_types'] as List?) ?? []).join(', '),
     );
-    var assistantMode =
-        (room?['assistant_mode'] ??
-                (room?['kind'] == 'agent' ? 'agent' : 'chat'))
-            .toString();
+    var executionProfile =
+        (room?['execution_profile'] ?? 'investigate').toString();
     final selectedTools = <String>{
+      'graph',
       ...((room?['agent_tools'] as List?) ?? []).map((item) => item.toString()),
     };
     final isNew = room == null;
@@ -386,7 +411,7 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
                           const Padding(
                             padding: EdgeInsets.only(top: 6, bottom: 7),
                             child: Text(
-                              'Conversation mode',
+                              'Execution depth',
                               style: TextStyle(
                                 color: _mint,
                                 fontWeight: FontWeight.w700,
@@ -396,23 +421,27 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
                           SegmentedButton<String>(
                             segments: const [
                               ButtonSegment(
-                                value: 'chat',
-                                label: Text('Chat'),
-                                icon: Icon(Icons.chat_bubble_outline),
+                                value: 'quick',
+                                label: Text('Quick'),
+                                icon: Icon(Icons.bolt_outlined),
                               ),
                               ButtonSegment(
-                                value: 'agent',
-                                label: Text('Agent'),
-                                icon: Icon(Icons.smart_toy_outlined),
+                                value: 'investigate',
+                                label: Text('Investigate'),
+                                icon: Icon(Icons.manage_search),
+                              ),
+                              ButtonSegment(
+                                value: 'act',
+                                label: Text('Act'),
+                                icon: Icon(Icons.build_outlined),
                               ),
                             ],
-                            selected: {assistantMode},
+                            selected: {executionProfile},
                             showSelectedIcon: false,
                             onSelectionChanged:
                                 (selection) => setDialogState(() {
-                                  assistantMode = selection.first;
-                                  if (assistantMode == 'agent' &&
-                                      selectedTools.isEmpty &&
+                                  executionProfile = selection.first;
+                                  if (selectedTools.isEmpty &&
                                       availableTools.any(
                                         (tool) => tool['id'] == 'graph',
                                       )) {
@@ -420,7 +449,14 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
                                   }
                                 }),
                           ),
-                          if (assistantMode == 'agent') ...[
+                          const Padding(
+                            padding: EdgeInsets.only(top: 6),
+                            child: Text(
+                              'Quick caps the reasoning loop. Investigate uses the normal budget. Act is for rooms with explicitly granted workspace tools.',
+                              style: TextStyle(color: _muted, fontSize: 11.5),
+                            ),
+                          ),
+                          ...[
                             const SizedBox(height: 12),
                             _dialogField(
                               agentWorkspace,
@@ -500,12 +536,18 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
                                           (tool['description'] ?? '')
                                               .toString(),
                                       onSelected:
-                                          (selected) => setDialogState(() {
-                                            final id = tool['id'].toString();
-                                            selected
-                                                ? selectedTools.add(id)
-                                                : selectedTools.remove(id);
-                                          }),
+                                          tool['id'] == 'graph'
+                                              ? null
+                                              : (selected) =>
+                                                  setDialogState(() {
+                                                    final id =
+                                                        tool['id'].toString();
+                                                    selected
+                                                        ? selectedTools.add(id)
+                                                        : selectedTools.remove(
+                                                          id,
+                                                        );
+                                                  }),
                                     ),
                                 ],
                               ),
@@ -549,7 +591,8 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
       'name': name.text.trim(),
       'description': description.text.trim(),
       'instructions': instructions.text.trim(),
-      'assistant_mode': assistantMode,
+      'assistant_mode': 'agent',
+      'execution_profile': executionProfile,
       'agent_tools': selectedTools.toList()..sort(),
       'agent_workspace': agentWorkspace.text.trim(),
       'agent_request_limit': int.tryParse(agentRequestLimit.text.trim()) ?? 0,
@@ -630,6 +673,14 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     final id = room['room_id'].toString();
     try {
       if (action == 'edit') return _editRoom(room);
+      if (action == 'arc') {
+        return openRoomArc(
+          context,
+          apiBase: widget.apiBase,
+          roomId: id,
+          roomName: (room['name'] ?? id).toString(),
+        );
+      }
       if (action == 'archive') {
         await http.patch(
           Uri.parse('${widget.apiBase}/rooms/$id'),
@@ -701,6 +752,23 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
         title: const Text('Rooms'),
         actions: [
           IconButton(
+            tooltip: 'Calendar — your weekly routine, and days that are not ordinary',
+            icon: const Icon(Icons.calendar_month_outlined, color: _muted),
+            onPressed:
+                () => Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => CalendarScreen(apiBase: widget.apiBase),
+                  ),
+                ),
+          ),
+          IconButton(
+            tooltip: 'Tidy rooms — stale and duplicate suggestions',
+            icon: const Icon(Icons.cleaning_services_outlined, color: _muted),
+            onPressed: () async {
+              if (await showRoomHygiene(context, widget.apiBase)) await _load();
+            },
+          ),
+          IconButton(
             tooltip: _showArchived ? 'Hide archived' : 'Show archived',
             icon: Icon(
               _showArchived ? Icons.inventory_2 : Icons.inventory_2_outlined,
@@ -754,7 +822,8 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
   Widget _roomTile(Map<String, dynamic> room) {
     final name = (room['name'] ?? room['room_id']).toString();
     final kind = (room['kind'] ?? 'activity').toString();
-    final assistantMode = (room['assistant_mode'] ?? 'chat').toString();
+    final executionProfile =
+        (room['execution_profile'] ?? 'investigate').toString();
     final events = (room['events'] ?? 0);
     final accent = _roomColor(room['color'], kind == 'daily' ? _mint : _violet);
     return Container(
@@ -779,7 +848,7 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
           ),
         ),
         subtitle: Text(
-          '$kind · $assistantMode · $events events',
+          '$kind · $executionProfile · $events events',
           style: const TextStyle(color: _muted, fontSize: 12),
         ),
         trailing: Row(
@@ -792,6 +861,10 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
               onSelected: (value) => _roomAction(value, room),
               itemBuilder:
                   (_) => [
+                    const PopupMenuItem(
+                      value: 'arc',
+                      child: Text('Arc — week by week'),
+                    ),
                     const PopupMenuItem(value: 'edit', child: Text('Edit')),
                     PopupMenuItem(
                       value: 'pin',
@@ -1322,45 +1395,41 @@ class _RoomScreenState extends State<RoomScreen> {
   @override
   Widget build(BuildContext context) {
     final visibleFeed = _visibleFeed;
-    return Scaffold(
-      backgroundColor: _ink,
-      appBar: AppBar(
-        backgroundColor: _panel,
-        title: Text(widget.roomName, overflow: TextOverflow.ellipsis),
-        actions: [
-          if (_isCreativeCoach)
-            IconButton(
-              tooltip: 'Generate daily Coach report',
-              icon: const Icon(Icons.insights, color: _mint),
-              onPressed: _sending ? null : _generateReport,
-            ),
-          if (_isAgent)
-            IconButton(
-              tooltip: 'Run agent check-in',
-              icon: const Icon(Icons.auto_awesome, color: _violet),
-              onPressed: _sending ? null : _generateAgentCheckIn,
-            ),
+    return RoomShell(
+      apiBase: widget.apiBase,
+      roomId: widget.roomId,
+      title: widget.roomName,
+      kind: widget.kind,
+      loading: _loading || _sending,
+      // A banner rather than a takeover: a failed refresh should not throw away
+      // the feed that is already on screen.
+      error: _error == null ? null : 'Could not load feed. $_error',
+      onRefresh: _load,
+      bottom: _composer(),
+      actions: [
+        if (_isCreativeCoach)
           IconButton(
-            icon: const Icon(Icons.refresh, color: _mint),
-            onPressed: _loading ? null : _load,
+            tooltip: 'Generate daily Coach report',
+            icon: const Icon(Icons.insights, color: _mint),
+            onPressed: _sending ? null : _generateReport,
           ),
-        ],
-      ),
-      body: Column(
+        if (_isAgent)
+          IconButton(
+            tooltip: 'Run agent check-in',
+            icon: const Icon(Icons.auto_awesome, color: _violet),
+            onPressed: _sending ? null : _generateAgentCheckIn,
+          ),
+      ],
+      child: Column(
         children: [
-          if (_loading || _sending)
-            const LinearProgressIndicator(minHeight: 2, color: _mint),
           _feedFilters(),
           if (_kinds.contains('event')) _activityOverview(),
           Expanded(
             child:
-                _error != null
-                    ? Center(
-                      child: Text(
-                        'Could not load feed.\n$_error',
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(color: _muted),
-                      ),
+                (_error != null && visibleFeed.isEmpty)
+                    ? const RoomPlaceholder(
+                      icon: Icons.forum_outlined,
+                      message: 'Nothing loaded for this room yet.',
                     )
                     : ListView.builder(
                       controller: _scroll,
@@ -1369,7 +1438,6 @@ class _RoomScreenState extends State<RoomScreen> {
                       itemBuilder: (context, i) => _feedItem(visibleFeed[i]),
                     ),
           ),
-          _composer(),
         ],
       ),
     );
@@ -2285,14 +2353,7 @@ class _RoomScreenState extends State<RoomScreen> {
           borderRadius: BorderRadius.circular(14),
           border: Border.all(color: isUser ? _mint.withOpacity(.4) : _line),
         ),
-        child: Text(
-          text,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 13,
-            height: 1.3,
-          ),
-        ),
+        child: RichContent.chat(data: text, accent: _mint),
       ),
     );
   }
@@ -2320,14 +2381,10 @@ class _RoomScreenState extends State<RoomScreen> {
             ],
           ),
           const SizedBox(height: 8),
-          Text(
-            text,
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 12.5,
-              height: 1.4,
-              fontFamily: 'monospace',
-            ),
+          RichContent.report(
+            data: text,
+            textColor: Colors.white70,
+            accent: _mint,
           ),
         ],
       ),

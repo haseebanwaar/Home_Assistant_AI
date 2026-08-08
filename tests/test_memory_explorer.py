@@ -26,6 +26,13 @@ class FakeSearchStore(Neo4jStore):
                 "title": "Memory Explorer", "text": "project", "ts": None,
                 "rooms": [], "score": 150,
             }]
+        if query == store_module._SEARCH_NUDGES_CYPHER:
+            return [{
+                "kind": "insight", "id": "nudge-1",
+                "title": "Proactive insight", "text": "Take a short break",
+                "ts": 30, "span_start": 30, "span_end": 30,
+                "rooms": [], "score": 160,
+            }]
         return []
 
 
@@ -151,6 +158,15 @@ class MemoryExplorerTests(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["kind"], "event")
+
+    def test_search_can_retrieve_proactive_insights(self):
+        store = FakeSearchStore()
+
+        results = store.memory_search(
+            "proactive insight notification", kinds=["insight"], limit=10)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], "nudge-1")
 
     def test_event_vector_delete_uses_log_event_deterministic_id(self):
         client = FakeQdrant()

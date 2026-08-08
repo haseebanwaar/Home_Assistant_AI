@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.speech.tts.TextToSpeech
 import androidx.core.app.NotificationCompat
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -19,9 +20,14 @@ class AlertPollingService : Service() {
     @Volatile private var eventNotifications = true
     @Volatile private var proactiveNotifications = false
     private var worker: Thread? = null
+    private var textToSpeech: TextToSpeech? = null
+    @Volatile private var ttsReady = false
 
     override fun onCreate() {
         super.onCreate()
+        textToSpeech = TextToSpeech(this) { status ->
+            ttsReady = status == TextToSpeech.SUCCESS
+        }
         createMonitorChannel()
         startForeground(MONITOR_NOTIFICATION_ID, monitorNotification())
     }
@@ -81,6 +87,10 @@ class AlertPollingService : Service() {
         running = false
         worker?.interrupt()
         worker = null
+        textToSpeech?.stop()
+        textToSpeech?.shutdown()
+        textToSpeech = null
+        ttsReady = false
         super.onDestroy()
     }
 
@@ -126,6 +136,15 @@ class AlertPollingService : Service() {
                     item.optString("body", ""),
                     item.optString("severity", "important"),
                 )
+                if (item.optBoolean("speak", false) && ttsReady) {
+                    val speech = item.optString("body", item.optString("title", ""))
+                    textToSpeech?.speak(
+                        speech,
+                        TextToSpeech.QUEUE_ADD,
+                        null,
+                        "task-reminder-$sequence",
+                    )
+                }
             }
             prefs.edit().putInt(sequenceKey, latest).apply()
         } finally {

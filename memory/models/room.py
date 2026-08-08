@@ -39,10 +39,13 @@ class Room(BaseModel):
     matcher: RoomMatcher = Field(default_factory=RoomMatcher)
     description: str = ""
     instructions: str = ""
-    # Direct chat makes one model call with the room context. Agent mode enables
-    # the iterative PydanticAI runtime and only the explicitly selected toolsets.
-    assistant_mode: Literal["chat", "agent"] = "chat"
-    agent_tools: List[str] = Field(default_factory=list)
+    # Legacy compatibility field.  All rooms use Claude Code while the runtime
+    # is enabled; disabling it globally is the direct-chat emergency fallback.
+    assistant_mode: Literal["chat", "agent"] = "agent"
+    # quick caps the loop at 3/3; investigate uses normal room budgets; act is
+    # intended for rooms with explicitly granted writable workspace tools.
+    execution_profile: Literal["quick", "investigate", "act"] = "investigate"
+    agent_tools: List[str] = Field(default_factory=lambda: ["graph"])
     # Blank means a stable directory derived from room_id under
     # AGENT_WORKSPACE_ROOT. Relative paths stay under that root; absolute paths
     # deliberately grant this room access to a different directory.

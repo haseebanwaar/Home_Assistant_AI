@@ -28,7 +28,7 @@ from memory.retrieval.terms import tokenize
 
 logger = logging.getLogger("home_assistant")
 
-DEFAULT_KINDS = ("event", "note", "message", "entity", "claim", "room")
+DEFAULT_KINDS = ("event", "note", "message", "entity", "claim", "room", "insight")
 
 
 class EvidenceRetriever:
@@ -131,7 +131,9 @@ class EvidenceRetriever:
                 "kind": "event", "id": event_id,
                 "title": meta.get("profile") or "Activity",
                 "text": meta.get("document") or "",
-                "ts": meta.get("span_start"), "rooms": [],
+                "ts": meta.get("span_start"),
+                "span_start": meta.get("span_start"),
+                "span_end": meta.get("span_end"), "rooms": [],
                 "score": 70, "match": "semantic",
             })
         if not items:

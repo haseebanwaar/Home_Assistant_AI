@@ -14,6 +14,7 @@ from lmdeploy.vl.constants import IMAGE_TOKEN
 from lmdeploy.vl.utils import encode_image_base64
 from providers.local_openAI import client, get_model_name_vlm, thinking_request_kwargs
 from utils.qwen_preprocess import encode_video
+from utils.maintenance import maintenance_window_active
 import cv2
 import tempfile
 import pygetwindow as gw
@@ -37,6 +38,37 @@ except Exception:  # pragma: no cover - non-Windows / missing deps
     win32process = None
 
 logger = logging.getLogger("home_assistant")
+
+
+def _compact_screen_observation(record):
+    """Keep task continuity while bounding prior VLM output placed in a prompt."""
+    record = record or {}
+    return {
+        "timestamp": record.get("timestamp"),
+        "activity_type": record.get("activity_type"),
+        "event_type": record.get("event_type"),
+        "project": record.get("project"),
+        "profile": record.get("selected_profile"),
+        "summary": str(record.get("summary") or "")[:1200],
+        "entities": [
+            {"name": entity.get("name"), "type": entity.get("type")}
+            for entity in (record.get("entities") or [])[:16]
+            if isinstance(entity, dict) and entity.get("name")
+        ],
+        "claims": [
+            claim.get("text")
+            for claim in (record.get("claims") or [])[:8]
+            if isinstance(claim, dict) and claim.get("text")
+        ],
+        "tasks": [
+            {"text": task.get("text"), "status": task.get("status")}
+            for task in (record.get("tasks") or [])[:8]
+            if isinstance(task, dict) and task.get("text")
+        ],
+        "boundary_signal": record.get("boundary_signal"),
+        "process_names": list(record.get("process_names") or [])[-4:],
+        "window_titles": list(record.get("window_titles") or [])[-4:],
+    }
 
 
 def _process_for_hwnd(hwnd):
@@ -111,6 +143,12 @@ class RealtimeScreenCapture:
         # log result.summary to Qdrant (app unchanged) + the full object to
         # data/debug/extractions.jsonl.
         self.structured_extraction = os.getenv("STRUCTURED_EXTRACTION", "0").lower() in ("1", "true", "yes")
+        # A few compact prior JSON results turn isolated minute descriptions into
+        # a continuous account of the feature/task and its implementation stage.
+        history_windows = max(
+            1, min(8, int(os.getenv("SCREEN_CONTEXT_WINDOWS", "4")))
+        )
+        self._visual_history = deque(maxlen=history_windows)
         # Step 4: gap-spanning frame sampling before the VLM call.
         self.gap_sampling = os.getenv("GAP_SAMPLING", "0").lower() in ("1", "true", "yes")
         self.gap_sample_count = int(os.getenv("GAP_SAMPLE_COUNT", "10"))
@@ -118,9 +156,9 @@ class RealtimeScreenCapture:
         # static reading/watching is still remembered. 0 disables. Default 3.
         self.heartbeat_minutes = int(os.getenv("HEARTBEAT_MINUTES", "3"))
         self._idle_minutes = 0
-        # Is the user there? Keyboard/mouse says yes for anything interactive; a
-        # large share of the screen repainting says yes for watching, which has no
-        # input at all (sources.idle.PresenceGate). Minutes with neither are
+        # Is the user there? Keyboard/mouse within the cut-off is required; a
+        # repainting screen can stand in for it only if watching-as-presence is
+        # switched on (sources.idle.PresenceGate). Minutes without presence are
         # dropped entirely: nothing captured, nothing timed, nothing to attribute
         # to whichever window happened to be in front.
         self.presence_gate = (presence_gate if presence_gate is not None
@@ -187,15 +225,18 @@ class RealtimeScreenCapture:
         #     question += f'Relevant past context:\n'
         #     for i, description in enumerate(self.description_history):
         #         question += f'{description}\n'
-        question = "describe what you see on user PC so that if i read your description later i will get full meaning ?\n"
-        question = """Describe exactly what is happening on the screen right now.
-Include:
-– what the user is doing or experiencing
-– important visible text, subtitles, or dialogue
-– actions or story events
-– what is visually changing and why it matters
+        from memory.extraction.prompts import observation_history_context
 
-Focus on information useful to remember later.
+        question = observation_history_context(self._visual_history) + """Describe the high-level activity happening on the screen right now.
+Include:
+– the task or feature the user is pursuing and the current workflow step
+– meaningful progress, actions, outcomes, story events, or dialogue
+– important visible text only when it explains the activity
+– what changed from the prior observations and why it matters
+
+Treat routine logs, warnings, and incidental errors as background evidence. Mention \
+them only when the user is actively investigating them or they materially affect the \
+result. Focus on information useful to remember later.
 Someone reading your description should be able to continue watching the experience without missing anything."""
         sys_prompt =  """
             You are a visual narrator describing exactly what appears on the user's PC screen.
@@ -236,13 +277,14 @@ Create a retrievable memory record that preserves what matters most for future r
         ]
         tim = time.perf_counter()
         response = await client.chat.completions.create(
+            job_label="Screen description",
             model=self.model_name_vlm, messages=messages,
             max_tokens=self.max_tokens if self.thinking else 2500,
             **thinking_request_kwargs(self.thinking),
         )
 
         answer = response.choices[0].dict()['message']['content']
-        logger.debug("Screen description: %s", answer)
+        logger.info("Screen VLM output (prose):\n%s", answer)
         logger.info("Screen processing of %d frames took %.3f seconds", len(imgs), time.perf_counter()-tim)
 
 
@@ -258,7 +300,7 @@ Create a retrievable memory record that preserves what matters most for future r
         """
         from memory.models.extraction import ExtractionResult
         from memory.extraction.prompts import (
-            build_system_prompt, EXTRACTION_USER_PROMPT,
+            build_system_prompt, build_user_prompt,
         )
         from memory.extraction.validator import run_extraction
         from memory.profiles.registry import select_profile
@@ -267,9 +309,12 @@ Create a retrievable memory record that preserves what matters most for future r
         titles = window_titles if window_titles is not None else self.current_minute_apps
         # Step 3: route to a domain profile (process_name preferred, title fallback).
         profile = select_profile(procs, titles)
-        # Past user merges/renames steer the naming, so corrections stick.
+        # Past user merges/renames steer the naming, so corrections stick, and
+        # what he has confirmed about himself keeps the watcher from re-guessing it.
         naming_hints = self.pipeline.naming_hints() if self.pipeline is not None else None
-        system_prompt = build_system_prompt(profile, naming_hints=naming_hints)
+        confirmed = self.pipeline.confirmed_facts() if self.pipeline is not None else None
+        system_prompt = build_system_prompt(
+            profile, naming_hints=naming_hints, confirmed_facts=confirmed)
 
         if len(imgs) == 0:
             return ExtractionResult(summary="", confidence=0.0), "empty", profile.name
@@ -289,7 +334,7 @@ Create a retrievable memory record that preserves what matters most for future r
             return ExtractionResult(summary="Error preparing screen frames", confidence=0.0), "empty", profile.name
 
         base_content = [
-            {"type": "text", "text": EXTRACTION_USER_PROMPT},
+            {"type": "text", "text": build_user_prompt(self._visual_history)},
             *image_parts,
         ]
 
@@ -302,11 +347,18 @@ Create a retrievable memory record that preserves what matters most for future r
                 {"role": "user", "content": user_content},
             ]
             resp = await client.chat.completions.create(
+                job_label="Screen extraction",
                 model=self.model_name_vlm, messages=messages,
                 max_tokens=self.max_tokens if self.thinking else 2500,
                 **thinking_request_kwargs(self.thinking),
             )
-            return resp.choices[0].dict()["message"]["content"]
+            output = resp.choices[0].dict()["message"]["content"]
+            logger.info(
+                "Screen VLM output (structured%s):\n%s",
+                " retry" if feedback else "",
+                output,
+            )
+            return output
 
         tim = time.perf_counter()
         result, status = await run_extraction(generate)
@@ -385,6 +437,9 @@ Create a retrievable memory record that preserves what matters most for future r
                 self._mailbox_wake.clear()
             if payload is None:
                 continue
+            if maintenance_window_active():
+                logger.debug("Maintenance window: dropping queued screen inference batch.")
+                continue
             try:
                 self._process_batch(*payload)
             except Exception as exc:
@@ -413,8 +468,17 @@ Create a retrievable memory record that preserves what matters most for future r
                 write_jsonl("extractions", record)
             except Exception as exc:
                 logger.debug("failed writing extraction: %s", exc)
+            if description and description.strip():
+                self._visual_history.append(_compact_screen_observation(record))
         else:
             description = asyncio.run(self._describe_frames(imgs))
+            if description and description.strip():
+                self._visual_history.append(_compact_screen_observation({
+                    "timestamp": timestamp,
+                    "summary": description,
+                    "process_names": list(process_names),
+                    "window_titles": list(window_titles),
+                }))
 
         # Recorded before ingest so the notification raised inside ingest can
         # already point at the footage it was raised from.
@@ -626,11 +690,12 @@ Create a retrievable memory record that preserves what matters most for future r
                         self._away_minutes += 1
                         if self._away_minutes == 1:
                             logger.info(
-                                "No keyboard/mouse input for %.0fs (> %.0fs) and "
-                                "the screen is not playing anything — capture "
-                                "paused until the user is back.",
+                                "No keyboard/mouse input for %.0fs (> %.0fs)%s — "
+                                "capture paused until the user is back.",
                                 presence.idle_seconds or 0.0,
-                                self.presence_gate.input.timeout_seconds)
+                                self.presence_gate.input.timeout_seconds,
+                                " and the screen is not playing anything"
+                                if self.presence_gate.playback_enabled else "")
                         self.current_minute_apps = list()
                         self.current_minute_processes = list()
                         self._idle_minutes = 0

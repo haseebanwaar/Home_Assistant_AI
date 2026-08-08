@@ -17,6 +17,12 @@ from sources.camera_worker import CameraCaptureWorker
 logger = logging.getLogger("home_assistant")
 
 
+def _paused_camera_names():
+    """Display names whose inference workers should start paused."""
+    configured = os.getenv("CAMERA_PAUSED_BY_DEFAULT", "IPC-A22E-G")
+    return {name.strip().lower() for name in configured.split(",") if name.strip()}
+
+
 def _slug(text):
     return re.sub(r"[^a-z0-9]+", "-", str(text or "").strip().lower()).strip("-") or "camera"
 
@@ -77,7 +83,8 @@ def _host_of(url):
 class CameraManager:
     def __init__(self, model_name_vlm, neo4j_store=None, activity_logger=None,
                  window_seconds=120, fps=0.5, notification_sink=None,
-                 insight_callback=None, clip_store=None, profile_store=None):
+                 insight_callback=None, clip_store=None, profile_store=None,
+                 state_store=None):
         self.model_name_vlm = model_name_vlm
         self.neo4j = neo4j_store
         self.activity_logger = activity_logger
@@ -87,6 +94,9 @@ class CameraManager:
         self.insight_callback = insight_callback
         self.clip_store = clip_store
         self.profile_store = profile_store
+        # Shared across cameras but keyed by camera_id inside: each camera's
+        # scene is its own, and a slot must never leak between two views.
+        self.state_store = state_store
         self.workers = {}  # camera_id -> CameraCaptureWorker
 
     def discover_and_start(self):
@@ -125,7 +135,10 @@ class CameraManager:
                 window_seconds=interval, fps=fps,
                 notification_sink=self.notification_sink,
                 insight_callback=self.insight_callback,
-                clip_store=self.clip_store)
+                clip_store=self.clip_store,
+                state_store=self.state_store)
+            if str(name or "").strip().lower() in _paused_camera_names():
+                self.workers[camera_id].pause()
             logger.info("Started camera worker %s (%s).", camera_id, name)
         except Exception as exc:
             logger.warning("failed to start camera %s: %s", camera_id, exc)
@@ -149,6 +162,10 @@ class CameraManager:
 
     def health_all(self):
         return [w.health() for w in self.workers.values()]
+
+    def state_all(self):
+        """The standing scene each camera is tracking, with its rhythms."""
+        return [w.state() for w in self.workers.values()]
 
     def update_capture_profile(
         self, camera_id, sample_fps, inference_interval_seconds

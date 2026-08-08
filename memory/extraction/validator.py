@@ -10,7 +10,7 @@ import logging
 from pydantic import ValidationError
 
 from memory.models.extraction import (
-    Claim, Entity, ExtractionResult, PersonalMemoryCandidate,
+    Claim, Entity, ExtractionResult, PersonalMemoryCandidate, SceneState,
 )
 from memory.extraction.prompts import RETRY_PREFIX, RETRY_SUFFIX
 
@@ -71,13 +71,23 @@ def _salvage_fields(data):
             personal.append(PersonalMemoryCandidate.model_validate(raw))
         except (ValidationError, TypeError):
             continue
+    # Salvaged states matter as much as salvaged claims: dropping them makes the
+    # camera look at an unchanged scene and conclude the tracked things all left.
+    states = []
+    for raw in data.get("states") or []:
+        try:
+            states.append(SceneState.model_validate(raw))
+        except (ValidationError, TypeError):
+            continue
+    gone = [str(key).strip() for key in (data.get("gone") or [])
+            if isinstance(key, str) and str(key).strip()]
 
     # Add the optional fields one at a time, re-validating the whole model each
     # time, so a single bad value falls back to its default instead of being
     # written straight through (plain setattr skips pydantic validation).
     base = {"summary": summary, "confidence": 0.3,
             "entities": entities, "claims": claims,
-            "personal_memory": personal}
+            "personal_memory": personal, "states": states, "gone": gone}
     result = ExtractionResult(**base)
     for field in ("activity_type", "event_type", "project", "importance"):
         if field not in data:
