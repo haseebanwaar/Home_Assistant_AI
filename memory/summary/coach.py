@@ -53,6 +53,10 @@ def format_report(metrics, claims=None, entities=None, heading=None,
     lines.append(
         f"**{active:.0f} min active** · {metrics.get('sessions', 0)} sessions · "
         f"{metrics.get('events', 0)} events · focus score **{metrics.get('focus_score', 0)}/100**")
+    if not metrics.get("events"):
+        lines.append(
+            "_No screen activity was captured. This is missing productivity "
+            "evidence, not evidence that the user was inactive._")
     lines.append(
         f"_avg block {metrics.get('avg_event_seconds', 0) / 60:.1f} min · "
         f"longest {metrics.get('longest_block_seconds', 0) / 60:.1f} min · "
@@ -154,14 +158,24 @@ def coach_prompt(metrics, claims=None, comparison=None, period="day",
     was fragmented; only he can say he was up with a sick relative, and a coach
     that ignores what he already wrote is worse than no coach.
     """
-    parts = [
+    instruction = (
         "You are a supportive but honest productivity coach. Based on the user's "
         f"screen-activity metrics for the {period}, write 3-5 concise sentences of "
         "feedback: what went well, where focus was fragmented, and one concrete "
         "suggestion for next time. Be specific to the data; do not invent "
         "activities. These metrics cover screen activity only — home camera "
         "observations are deliberately excluded, so do not treat their absence as "
-        "idle time.\n",
+        "idle time."
+        if metrics.get("events") else
+        "No screen activity was captured for this period. That is missing "
+        "productivity evidence, not evidence of inactivity, failure, or avoidance. "
+        "Write 2-4 concise sentences using any supplied calendar, reflection, Quran, "
+        "food, sleep, research, or camera context. Offer one grounded observation "
+        "or useful question; if little else is known, simply acknowledge the gap "
+        "without auditing the user. Never invent an activity."
+    )
+    parts = [
+        instruction + "\n",
         f"Active minutes: {metrics.get('active_minutes')}",
         f"Focus score: {metrics.get('focus_score')}/100 "
         f"(avg block {metrics.get('avg_event_seconds', 0) / 60:.1f} min, "
@@ -239,8 +253,7 @@ def _history_block(history):
 
 def report_prompt(metrics, claims=None, entities=None, comparison=None,
                   series=None, period="day", claim_summary=None,
-                  reflection_context="", history=None, hours=None,
-                  raw_report=""):
+                  reflection_context="", history=None, hours=None):
     """The brief for a written report, as opposed to a rendered one.
 
     `format_report` restates metrics; this hands the whole picture over and asks
@@ -298,19 +311,21 @@ def report_prompt(metrics, claims=None, entities=None, comparison=None,
         "plotted against each other. Scoring the day is not the same as "
         "judging the person: score the shape of the time and what came of it, "
         "with the rationale attached, and never diagnose him.",
-        "- Disagreement. If the deterministic report below reads the period "
-        "wrongly, say so and explain what you think actually happened.",
+        "- Score authorship. You choose and assign every score yourself from "
+        "the raw evidence in this brief. The app supplies no deterministic "
+        "overall or dimension score. Do not infer one from a rendered report "
+        "or copy a mechanical focus score. Previous scores below are also "
+        "yours, supplied only to keep your scale consistent over time.",
         "",
         "## The period",
         f"{period} ({metrics.get('start_date')} to {metrics.get('end_date')})",
         f"Active: {metrics.get('active_minutes', 0):.0f} min across "
         f"{metrics.get('active_days') or 1} active day(s), "
         f"{metrics.get('sessions', 0)} sessions, {metrics.get('events', 0)} events",
-        f"Focus score {metrics.get('focus_score', 0)}/100 "
-        f"(avg block {metrics.get('avg_event_seconds', 0) / 60:.1f} min, "
+        f"Average block {metrics.get('avg_event_seconds', 0) / 60:.1f} min, "
         f"longest {metrics.get('longest_block_seconds', 0) / 60:.0f} min, "
         f"{metrics.get('switches', 0)} switches at "
-        f"{metrics.get('switches_per_hour', 0)}/hr)",
+        f"{metrics.get('switches_per_hour', 0)}/hr",
         "Time is only counted while he was actually at the machine — five "
         "minutes without keyboard or mouse and the clock stops — so these "
         "minutes are attended minutes, not minutes an app was open.",
@@ -371,6 +386,8 @@ def report_prompt(metrics, claims=None, entities=None, comparison=None,
                      + (" (both sides per active day)"
                         if comparison.get("averaged") else "") + ":")
         for key, entry in (comparison.get("metrics") or {}).items():
+            if key == "focus_score":
+                continue
             lines.append(
                 f"  - {key}: {entry.get('current')} vs {entry.get('previous')} "
                 f"({entry.get('delta'):+})")
@@ -408,15 +425,6 @@ def report_prompt(metrics, claims=None, entities=None, comparison=None,
         lines.append(
             f"({claim_summary['dropped']} of {claim_summary['considered']} "
             "extracted claims were dropped as uninformative.)")
-
-    if raw_report:
-        lines.append("")
-        lines.append("## The deterministic report")
-        lines.append(
-            "This is what the app renders from the same numbers, shown to him "
-            "beside yours. Yours is not a rewrite of it — do not restate it, "
-            "and contradict it where you think it is wrong:")
-        lines.append(raw_report)
 
     lines.extend(_history_block(history))
 

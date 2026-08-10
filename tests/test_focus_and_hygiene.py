@@ -150,6 +150,13 @@ def test_distinct_nudges_are_not_suppressed():
                         "Your Neo4j password is missing from the env file.")
 
 
+def test_short_insight_is_not_suppressed_by_partial_containment():
+    assert not _similar(
+        "A smaller experiment could reveal the real constraint.",
+        "The smaller experiment from Tuesday revealed a budget constraint, so "
+        "reuse its measurements before redesigning the whole pipeline.")
+
+
 def test_reused_opening_is_detected_independently_of_the_rest_of_the_message():
     assert _repeats_opening(
         "It looks like the build passed.",
@@ -157,6 +164,9 @@ def test_reused_opening_is_detected_independently_of_the_rest_of_the_message():
     assert not _repeats_opening(
         "That retry recovered.",
         ["It looks as though that retry recovered."])
+    assert not _repeats_opening(
+        "The smaller trial would answer this quickly.",
+        ["The launch schedule leaves no margin."])
 
 
 def test_proactive_prompt_uses_open_ended_model_judgment():
@@ -195,16 +205,22 @@ def test_proactive_prompt_includes_personal_context_and_openings_to_avoid():
     assert "installers/MSI activity" in prompt
 
 
-def test_quality_gate_rejects_weak_and_operational_candidates():
+def test_quality_gate_accepts_strong_useful_candidate_without_near_ceiling_scores():
     weak = ProactiveInsightDecision(
         publish=True, insight="Maybe consider a different approach.",
         relevance=4, novelty=2, usefulness=3, insightfulness=3)
     noisy = ProactiveInsightDecision(
         publish=True, insight="The MSI installer log shows another runtime error.",
-        relevance=5, novelty=5, usefulness=5, insightfulness=5)
+        relevance=5, novelty=5, usefulness=5, insightfulness=5,
+        operational_noise=True)
+    useful = ProactiveInsightDecision(
+        publish=True,
+        insight="Those errors may expose an assumption worth testing separately.",
+        relevance=4, novelty=3, usefulness=4, insightfulness=3)
 
     assert not ProactiveNarrator._passes_quality(weak)
     assert not ProactiveNarrator._passes_quality(noisy)
+    assert ProactiveNarrator._passes_quality(useful)
 
 
 def test_claude_agent_uses_graph_memory_and_only_passes_high_quality():
@@ -327,6 +343,43 @@ def test_proactive_rewrites_a_repeated_opening_instead_of_silently_dropping_it()
 
     assert result["text"].startswith("That decoder fault")
     assert completions.calls == 2
+
+
+def test_production_runtime_revises_repetition_instead_of_dropping_it():
+    class Runtime:
+        def __init__(self):
+            self.calls = []
+
+        async def run(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return SimpleNamespace(output=ProactiveInsightDecision(
+                    publish=True,
+                    insight="It looks like the launch plan needs a smaller trial.",
+                    relevance=4, novelty=3, usefulness=4, insightfulness=3))
+            return SimpleNamespace(
+                output="A one-day trial would test the launch assumption cheaply.")
+
+    class Store:
+        def active_focus_session(self):
+            return None
+
+        def list_nudges(self, limit=10):
+            return [{"text": "It looks like the launch is ready."}]
+
+        def recent_nudge_feedback(self, limit=8):
+            return []
+
+    runtime = Runtime()
+    narrator = ProactiveNarrator(
+        "claude-model", client=None, agent_runtime=runtime,
+        cooldown_seconds=0, store_getter=Store)
+
+    result = asyncio.run(narrator.consider("Reviewing the launch plan."))
+
+    assert result["text"].startswith("A one-day trial")
+    assert len(runtime.calls) == 2
+    assert runtime.calls[1]["output_type"] is str
 
 
 def test_recall_follows_event_entity_links_and_excludes_the_recent_window():

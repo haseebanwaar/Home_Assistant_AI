@@ -42,6 +42,41 @@
   `AGENT_CHECKIN_SCHEDULE`; blank means manual only, which is what Research
   (expensive, tool-driven) and Tomorrow (the planner already runs it) use.
 
+- **`forums.py`** — the three rooms that hold an argument in front of the user,
+  and the one machinery all three run on. A `Forum` is a panel, a slot in the
+  night, and the exact sections its closing synthesis must return; `council.py`
+  is now a thin compatibility layer over it.
+  - **The rooms.** *Hard Questions* (02:00) argues meaning, death,
+    responsibility and what he owes the people closest to him, seating Islam
+    (revelation and named scholarship) against Wisdom (Western moral philosophy
+    and the sciences), with The Skeptic pressure-testing both and The Life
+    saying what the abstraction costs him on a Tuesday. *Risk Assessment*
+    (02:25) is a one-person risk desk — Scout gathers dated, sourced signals,
+    Analyst traces the mechanism that reaches *him*, Red Team argues the tail
+    and the ignored assumption, Steward converts it into positioning and names
+    the opportunity being treated as a threat. *Council* (03:00) is unchanged in
+    substance: the nine personal agents, under their own identities.
+  - **Two rounds, not one.** A single pass is not a discussion — the first
+    speaker has nothing to answer and the last has everything. Every speaker
+    opens, then every speaker answers the *complete* first round, and only then
+    does the moderator synthesize.
+  - **Repetition is the failure mode.** Each speaker sees what the room
+    concluded on earlier nights and what the other two rooms concluded recently,
+    and is told plainly that restating a point is worse than saying less. Every
+    synthesis ends with `## Threads to continue`, which is both what the next
+    session picks up and the record that stops the room looping.
+  - **Teaching is a by-product.** `## Worth learning` carries the concepts,
+    thinkers and sources the argument actually used, with something specific to
+    read. It is explicitly forbidden from growing longer than the argument.
+  - **The user intervenes.** A *follow-up* replaces the routine with his
+    question at a moment he picks. An *agenda topic* — "we will talk about
+    existential crisis tomorrow" — is carried *into* the next routine session
+    instead, and is handed back to the queue if that session fails. Both are
+    per-room: `POST /forums/{id}/agenda`, `/followups`, `/run`.
+  - **Tools are not optional.** Graph memory, a browser and a filesystem
+    workspace are granted to every voice in a discussion room, including a
+    Council participant whose own room was configured with less.
+
 - **`horizons.py`** — the only module that reasons above the altitude of a day.
   Every other agent here answers about today, this week at the most, which means
   a year of captured life ends up used a day at a time forever. This one holds
@@ -67,6 +102,14 @@
   a window that has not finished. The user's verdict on any forecast or thread
   overrides the model's through `PUT /horizons/predictions/{id}` and
   `PUT /horizons/threads/{id}`, and survives a regenerate.
+
+  The structured record also feeds daily reasoning. `shared_horizon_context()`
+  selects a small relevance-ranked set of open threads and unresolved forecasts,
+  labels them as interpretations rather than facts, and includes calibration
+  before personal-agent turns and daily reports. Ordinary assistant turns use a
+  strict topic match. Advisor agents can call `horizon_intelligence` through the
+  local graph MCP bundle when they need full thread trajectories instead of the
+  compact prompt block.
 
 - **`quran_study.py`** — the Quran room's store. The room used to ask the chat
   endpoint for a JSON study guide and keep the result in the client's

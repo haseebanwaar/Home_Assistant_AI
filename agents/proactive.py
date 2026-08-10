@@ -22,6 +22,7 @@ only when a worthwhile draft repeats itself. The parked event-bus/autogen agents
 live in agents/_parked/.
 """
 import logging
+import math
 import re
 import time
 from collections import deque
@@ -39,7 +40,7 @@ RECENT_EXCLUSION_SECONDS = 900
 MAX_DIRECT_MEMORIES = 4
 MAX_LINKED_MEMORIES = 4
 MAX_LINK_ENTITIES = 3
-QUALITY_MIN_TOTAL = 16
+QUALITY_MIN_TOTAL = 14
 # Per-run safety budget for this module's two Claude calls. The narrator is
 # given graph tools and told to go and check memory before it speaks, and at
 # 4 requests / 6 tool calls it kept ending on the budget rather than on an
@@ -48,9 +49,9 @@ QUALITY_MIN_TOTAL = 16
 # that costs a long tool loop has already failed at being timely.
 INSIGHT_REQUEST_LIMIT = 8
 INSIGHT_TOOL_CALLS_LIMIT = 12
-_OPERATIONAL_NOISE = re.compile(
-    r"\b(?:logs?|bugs?|errors?|graphs?|msi|installer|installation|stack trace|"
-    r"exception|compiler|build failure|runtime failure|telemetry|process monitor)\b",
+_CANNED_OPENING = re.compile(
+    r"^\s*(?:it\s+(?:looks|seems)|you\s+(?:look|seem)|i\s+noticed|"
+    r"hey\b|just\s+a\s+thought\b)",
     re.IGNORECASE,
 )
 
@@ -91,12 +92,12 @@ interrupting the user. If the bar is not met, discard it. The final insight must
 reasonably brief (usually 1-3 sentences, no formatting)."""
 
 
-def _similar(a, b, threshold=0.6):
-    """Token-overlap similarity — catches rephrased repeats, not just identical ones."""
+def _similar(a, b, threshold=0.7):
+    """Cosine token overlap catches repeats without punishing the shorter text."""
     ta, tb = set(tokenize(a)), set(tokenize(b))
     if not ta or not tb:
         return a.strip().lower() == b.strip().lower()
-    return len(ta & tb) / min(len(ta), len(tb)) >= threshold
+    return len(ta & tb) / math.sqrt(len(ta) * len(tb)) >= threshold
 
 
 def _opening(text, words=4):
@@ -105,19 +106,24 @@ def _opening(text, words=4):
 
 
 def _repeats_opening(text, prior_texts):
-    """Catch reused lead-ins while allowing ordinary vocabulary later on."""
-    current = tokenize(text, keep_stopwords=True)
+    """Catch canned or repeated content-word lead-ins, ignoring stopwords."""
+    current = tokenize(text)
     if not current:
         return False
     for prior in prior_texts:
-        previous = tokenize(prior, keep_stopwords=True)
+        previous = tokenize(prior)
         if not previous:
             continue
-        # Two repeated lead words catches canned constructions ("it looks",
-        # "you are") without rejecting every sentence that happens to start
-        # with a common article.
-        width = 2 if min(len(current), len(previous)) >= 2 else 1
-        if current[:width] == previous[:width]:
+        current_canned = _CANNED_OPENING.match(text)
+        prior_canned = _CANNED_OPENING.match(prior)
+        if (current_canned and prior_canned
+                and current_canned.group(0).lower().split()[:2]
+                == prior_canned.group(0).lower().split()[:2]):
+            return True
+        # Articles and pronouns no longer make two otherwise different short
+        # insights look like the same opening.
+        if (len(current) >= 2 and len(previous) >= 2
+                and current[:2] == previous[:2]):
             return True
     return False
 
@@ -209,14 +215,11 @@ class ProactiveNarrator:
 
             repeated_content = any(_similar(text, prior) for prior in recent_texts)
             repeated_opening = _repeats_opening(text, recent_texts)
-            if (repeated_content or repeated_opening) and self.agent_runtime is None:
+            if repeated_content or repeated_opening:
                 text = await self._revise_repetition(
                     prompt, text, recent_texts, repeated_content, repeated_opening)
                 if not text or text.upper() == "NO ACTION":
                     return None
-            elif repeated_content or repeated_opening:
-                logger.debug("Proactive: Claude candidate repeated a recent initiative.")
-                return None
 
             if any(_similar(text, prior) for prior in recent_texts):
                 logger.debug("Proactive: near-duplicate blocked at delivery.")
@@ -304,10 +307,9 @@ class ProactiveNarrator:
             decision.publish
             and bool(text)
             and not decision.operational_noise
-            and not _OPERATIONAL_NOISE.search(text)
             and decision.relevance >= 4
             and decision.usefulness >= 4
-            and decision.insightfulness >= 4
+            and decision.insightfulness >= 3
             and decision.novelty >= 3
             and sum(scores) >= QUALITY_MIN_TOTAL
         )

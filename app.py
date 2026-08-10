@@ -56,15 +56,28 @@ from agents.proactive import ProactiveNarrator
 from agents.personal_agents import (
     AGENTS as PERSONAL_AGENTS,
     CREATIVE_COACH_ROOM_ID,
+    FORUM_AGENTS,
     get_agent,
+    personal_agent_prompt,
+)
+from agents.forums import (
+    COUNCIL,
+    FORUMS,
+    ForumStore,
+    get_forum,
+    opening_prompt as forum_opening_prompt,
+    rebuttal_prompt as forum_rebuttal_prompt,
+    synthesis_prompt as forum_synthesis_prompt,
 )
 from agents.agent_runtime import AgentRuntime, AgentRuntimeUnavailable
 from agents.daily_reflection import (
     DailyReflectionStore,
+    MAX_DAILY_QUESTIONS,
+    MIN_DAILY_QUESTIONS,
     REFLECTION_SYSTEM_PROMPT,
     reflection_context,
 )
-from agents.conversation_manager import ConversationManager
+from agents.conversation_manager import ConversationManager, validate_json_response
 from agents.calorie_estimator import (
     CalorieEstimateStore,
     estimate_missing as estimate_missing_calories,
@@ -86,6 +99,7 @@ from agents.horizons import (
     horizon_context,
     period_bounds as horizon_bounds,
     period_key as horizon_period_key,
+    shared_horizon_context,
 )
 from agents.orchestrator import (
     DailyAt,
@@ -117,6 +131,7 @@ from agents.calendar import (
     REPEATS as CALENDAR_REPEATS,
     CalendarStore,
 )
+from agents.accountability import from_canvas_store as accountability_from_canvas
 from agents.room_canvas_store import RoomCanvasStore
 from agents.room_pacing import AgentPacingError, RoomAgentPacer
 from agents.satisfaction import (
@@ -235,7 +250,8 @@ vlm_model = None
 agent_runtime = AgentRuntime(
     client=client,
     # Resolved lazily: the graph connects during startup, after this point.
-    local_toolsets=graph_toolset_factory(lambda: neo4j_store),
+    local_toolsets=graph_toolset_factory(
+        lambda: neo4j_store, lambda: horizon_reviews),
 )
 conversation_manager = ConversationManager(
     client=client, model_name=lambda: vlm_model, agent_runtime=agent_runtime)
@@ -285,21 +301,59 @@ async def _creative_coach_report_complete(prompt, *, max_tokens,
         room.get("instructions")
         or (built_in.instructions if built_in else "Write an evidence-grounded report.")
     )
-    return await _intelligent_complete(
-        effort=effort,
-        room_id=CREATIVE_COACH_ROOM_ID,
-        room=room,
-        messages=[
-            {"role": "system", "content": (
-                f"You are {name}, the user's persistent personal agent. "
-                "Write this report in that same role and keep its evidence and "
-                "safety boundaries.\n\nYour role:\n" + instructions
-            )},
-            {"role": "user", "content": prompt},
-        ],
-        max_tokens=max_tokens,
-        output_type=output_type,
-    )
+    if built_in is not None:
+        instructions = personal_agent_prompt(built_in, instructions)
+    structured = output_type is not str and hasattr(output_type, "model_validate")
+    if structured:
+        # Claude SDK's native structured output becomes a sampler grammar at
+        # the local Anthropic-compatible gateway.  The ActivityReport schema is
+        # large enough that the gateway rejects that grammar before generation
+        # starts. Keep Claude as the writer, ask it for JSON in ordinary text,
+        # then enforce the exact same Pydantic contract locally.
+        schema = json.dumps(
+            output_type.model_json_schema(), ensure_ascii=False, separators=(",", ":"))
+        prompt += (
+            "\n\n## Required response format\nReturn only one JSON object that "
+            "matches this JSON Schema. Do not wrap it in a Markdown fence.\n"
+            + schema
+        )
+    system_message = {
+        "role": "system", "content": (
+            f"You are {name}, the user's persistent personal agent. "
+            "Write this report in that same role and keep its evidence and "
+            "safety boundaries.\n\nYour role:\n" + instructions
+        )}
+
+    async def write(user_prompt):
+        return await _intelligent_complete(
+            effort=effort,
+            room_id=CREATIVE_COACH_ROOM_ID,
+            room=room,
+            messages=[system_message, {"role": "user", "content": user_prompt}],
+            max_tokens=max_tokens,
+            output_type=str,
+        )
+
+    result = await write(prompt)
+    if structured:
+        try:
+            result.output = validate_json_response(result.reply, output_type)
+        except (ValidationError, ValueError) as exc:
+            # Text JSON is the compatibility path for gateways that cannot
+            # compile the native schema grammar. Give the same Claude agent one
+            # focused correction pass; do not fall back to the direct model or
+            # silently store a report that violates the contract.
+            repair_prompt = (
+                "Correct the JSON report below so it satisfies the schema and "
+                "validation errors. Preserve its supported findings and scores. "
+                "Return only the corrected JSON object, without a Markdown fence.\n\n"
+                "VALIDATION ERROR:\n" + str(exc) + "\n\nJSON TO CORRECT:\n"
+                + result.reply
+            )
+            result = await write(repair_prompt)
+            result.output = validate_json_response(result.reply, output_type)
+        result.reply = result.output.model_dump_json()
+    return result
 
 
 screen_stream = None
@@ -341,6 +395,19 @@ product_reviews = ProductReviewStore(
 # forecasts each one makes, and the threads they track across periods.
 horizon_reviews = HorizonStore(
     os.getenv("HORIZONS_PATH", "data/horizons.sqlite3"))
+# The three nightly discussion rooms: their sessions, the follow-ups the user
+# schedules, and the topics he sets for a coming night. One file each, so a room
+# can be added or reset without touching another's transcripts.
+forum_stores = {
+    forum.forum_id: ForumStore(
+        os.getenv(forum.env("PATH"), forum.store_path))
+    for forum in FORUMS
+}
+council_store = forum_stores[COUNCIL.forum_id]
+# One lock for all three. They meet back to back between 02:00 and 04:00 and
+# every turn is a full high-effort Claude run, so two of them talking at once
+# would only slow both down.
+_forum_lock = asyncio.Lock()
 # Quran Room: every passage report it writes, and the one vocabulary deck those
 # reports feed. The recall marks on that deck are the user's, not the model's.
 quran_study = QuranStudyStore(
@@ -485,11 +552,14 @@ tool_registry = ToolRegistry()
 register_default_tools(tool_registry, past_memory)
 
 
-INITIATIVE_PROMPT = """Act as an initiative-taking partner, not a passive question-answering \
-system. Use your own judgment and creativity to notice implications, make connections, \
-anticipate needs, and offer useful next steps or ideas the user did not explicitly request. \
-Do not reduce your judgment to a fixed rubric of what is right or wrong. Stay grounded in \
-the available context and clearly distinguish remembered facts from inference."""
+INITIATIVE_PROMPT = """Act as an initiative-taking partner, not a passive question-answering
+system. Challenge the framing when it hides a better question, disagree when your reasoning
+points elsewhere, connect domains the user may have separated, and propose the bold or
+non-obvious option he may not generate alone. You may advance surprising hypotheses when
+you label them as hypotheses, give the evidence for and against them, and say what would
+change your mind. Prefer one specific, testable insight over several safe observations.
+Stay honest about what is remembered fact, inference, or imaginative possibility; uncertainty
+should make the thinking explicit, not make the response generic or silent."""
 
 
 CONCISE_SYSTEM_PROMPT = f"""You are a conversational AI designed for a real-time Speech-to-Speech (S2S) system. Your primary function is to engage in natural, fluid conversation.
@@ -636,6 +706,10 @@ async def startup_event():
             logger.warning("ensure_source_room(screen) failed : %s", exc)
         try:
             neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
+            # The discussion rooms sit apart from the nine: they host an
+            # argument rather than taking part in one, and they take their own
+            # block of list positions so they group together.
+            neo4j_store.ensure_agent_rooms(FORUM_AGENTS, start=30)
             # Research supersedes the older PhD Helper room. Preserve its notes,
             # messages, and linked activity, then keep it out of the active list.
             neo4j_store.merge_rooms("agent:phd-helper", "agent:research")
@@ -808,7 +882,7 @@ def register_agent_jobs():
             "daily-report", "Daily report", _job_daily_report,
             DailyAt(env_int("DAILY_REPORT_HOUR", 23, minimum=0),
                     env_int("DAILY_REPORT_MINUTE", 30, minimum=0)),
-            priority=20, speaks=True, needs_activity=True,
+            priority=20, speaks=True,
             # The report always covers *today*, so a slot missed overnight must
             # not be caught up the next afternoon: it would review the wrong
             # day. A short bound still recovers a boot minutes after 23:30.
@@ -816,6 +890,43 @@ def register_agent_jobs():
                 "DAILY_REPORT_CATCH_UP_SECONDS", 3600, minimum=0),
             description="Coach's review of the day, stored on the day rollup, "
                         "then the day's written report and its scores.")
+
+    # The three discussion rooms own 02:00-04:00, meeting one after another:
+    # Hard Questions at 02:00, Risk Assessment at 02:25, the Council at 03:00.
+    # They are intentionally silent while they work — a session is dozens of
+    # internal turns, and those must not claim dozens of delivery slots or wake
+    # the user. Each publishes one durable notification after its synthesis.
+    # Every slot, budget and timeout below is overridable per room through
+    # <PREFIX>_AT, <PREFIX>_TIMEOUT_SECONDS and friends.
+    for forum in FORUMS:
+        if not env_bool(forum.env("ENABLED"), True):
+            continue
+        hour, minute = (int(part) for part in forum.at.split(":"))
+        timeout = env_int(forum.env("TIMEOUT_SECONDS"),
+                          forum.job_timeout_seconds, minimum=600)
+        orchestrator.add(
+            forum.nightly_job_id, f"Nightly {forum.name}",
+            _forum_nightly_job(forum),
+            parse_daily(os.getenv(forum.env("AT")), DailyAt(hour, minute)),
+            priority=10, speaks=False,
+            timeout_seconds=timeout,
+            # Starting far outside the slot cannot honestly guarantee every
+            # speaker a turn before the next room sits, or before maintenance
+            # begins at 04:00.
+            catch_up_seconds=env_int(
+                forum.env("CATCH_UP_SECONDS"), 300, minimum=0),
+            max_retries=0,
+            description=(f"{forum.description} Runs at {forum.at}, carrying any "
+                         "topic the user set for the night."))
+        orchestrator.add(
+            forum.followup_job_id, f"Scheduled {forum.name} follow-ups",
+            _forum_followup_job(forum),
+            Interval(env_int(
+                forum.env("FOLLOWUP_CHECK_SECONDS"), 30, minimum=15),
+                run_at_start=True),
+            priority=11, speaks=False,
+            timeout_seconds=timeout,
+            description=f"Run user-scheduled sessions in the {forum.name} room.")
 
     if env_bool("TOMORROW_PLANNER_ENABLED", True):
         # The planner both proposes and tracks, so it runs on a short interval
@@ -862,7 +973,7 @@ def register_agent_jobs():
         orchestrator.add(
             f"check-in:{agent.room_id}", f"{agent.name} check-in",
             _agent_check_in_job(agent), schedule,
-            priority=50, speaks=True, needs_activity=True,
+            priority=50, speaks=True,
             timeout_seconds=env_int("AGENT_CHECKIN_TIMEOUT_SECONDS", 240),
             # A morning check-in reports the day that just ended, so it stays
             # correct if the PC boots late and it runs hours after its slot —
@@ -1089,14 +1200,19 @@ async def generate_daily_reflections(date_str=None, replace=False):
     target = date_str or datetime.date.today().isoformat()
     datetime.date.fromisoformat(target)
     existing = daily_reflections.get(target)
-    if existing is not None and existing.get("total") == 20 and not replace:
+    total = int((existing or {}).get("total") or 0)
+    if (existing is not None
+            and MIN_DAILY_QUESTIONS <= total <= MAX_DAILY_QUESTIONS
+            and not replace):
         return existing
     context = await asyncio.to_thread(
         reflection_context, personal_memory, room_canvas_store,
         neo4j_store, target, daily_reflections)
-    messages = [{"role": "system", "content": REFLECTION_SYSTEM_PROMPT}, {
+    messages = [{"role": "system", "content": personal_agent_prompt(
+        get_agent("agent:daily-reflection"), REFLECTION_SYSTEM_PROMPT)}, {
         "role": "user",
-        "content": "Create today's 20-question set from this evidence:\n\n" + context,
+        "content": "Create today's strongest reflection set from this evidence. "
+                   "Use only as many questions as remain sharp:\n\n" + context,
     }]
     result = await _intelligent_complete(
         room_id="agent:daily-reflection",
@@ -1113,7 +1229,7 @@ async def generate_daily_reflections(date_str=None, replace=False):
     if neo4j_store is not None:
         neo4j_store.add_message(
             "agent:daily-reflection", "reflection",
-            f"Prepared 20 deep-reflection questions for {target}.")
+            f"Prepared {len(questions)} deep-reflection questions for {target}.")
     return saved
 
 
@@ -1122,6 +1238,464 @@ async def _job_daily_reflection(ctx):
     return JobResult(
         detail=f"{result['date']}: {result['total']} questions",
         data={"date": result["date"], "total": result["total"]})
+
+
+def _forum_shared_context(forum, reference_date):
+    """A bounded whole-life dossier shared identically with every speaker.
+
+    All three discussion rooms read the same life. What differs is the argument
+    they have about it, so the dossier is built once per session and handed
+    unchanged to every participant — an identical brief is what makes their
+    disagreements about judgement rather than about who saw which page.
+    """
+    day = datetime.date.fromisoformat(str(reference_date))
+    start = datetime.datetime.combine(day, datetime.time.min).timestamp()
+    end = start + 86400
+    sections = [
+        f"{forum.name} evidence date: {day.isoformat()}.",
+        "This dossier deliberately combines the day with compressed long-term "
+        "history. Missing capture is missing data, not a quiet or failed life.",
+    ]
+
+    def add(title, value, maximum=30000):
+        if value is None:
+            return
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False, default=str, indent=2)
+        value = value.strip()
+        if value:
+            sections.append(f"## {title}\n{value[:maximum]}")
+
+    try:
+        add("Personal memory and personality",
+            personal_memory.context(
+                fact_limit=80,
+                query="personality values fears decisions marriage wife family "
+                      "children Islam health money work research creativity regrets"),
+            24000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} personal-memory context failed: %s", exc)
+    try:
+        add("The user's own recent reflection answers",
+            daily_reflections.prompt_context(
+                query="personality values fear marriage wife family children "
+                      "religion money health work decisions future",
+                limit=60, days=730, max_chars=30000, answer_chars=1800),
+            30000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} reflection context failed: %s", exc)
+    try:
+        add("Open commitments and their age",
+            tomorrow_plan_store.accountability_context(), 16000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} task context failed: %s", exc)
+    try:
+        add("Calendar, routines, exceptions and dated life facts",
+            calendar_store.prompt_context(now=day), 18000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} calendar context failed: %s", exc)
+    try:
+        add("Structured life, research, Quran and agent canvases",
+            room_canvas_store.prompt_context(
+                [agent.room_id for agent in PERSONAL_AGENTS], max_chars=30000),
+            30000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} canvas context failed: %s", exc)
+    try:
+        add("Open long-horizon threads and forecasts",
+            {
+                "threads": horizon_reviews.threads(
+                    status="open", limit=20, with_history=True),
+                "predictions": horizon_reviews.open_predictions(limit=30),
+                "calibration": horizon_reviews.calibration(),
+            }, 30000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} Horizons context failed: %s", exc)
+    try:
+        add("Compressed full history",
+            neo4j_store.long_term_context(
+                end_date=day.isoformat(), months=24, weeks=52, limit=30),
+            30000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} long-term graph context failed: %s", exc)
+    try:
+        add("The evidence day",
+            {
+                "metrics": neo4j_store.daily_metrics(day.isoformat()),
+                "claims": neo4j_store.day_claims(day.isoformat(), limit=40),
+                "activity": neo4j_store.room_context(
+                    "daily", event_limit=40, note_limit=10, entity_limit=30,
+                    start=start, end=end),
+            }, 24000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} day context failed: %s", exc)
+    try:
+        camera_days = []
+        for room in neo4j_store.list_rooms():
+            if room.get("kind") != "camera":
+                continue
+            context = neo4j_store.room_context(
+                room["room_id"], event_limit=12, note_limit=3,
+                entity_limit=12, start=start, end=end)
+            if context.get("events") or context.get("notes"):
+                camera_days.append({"camera": room.get("name"), **context})
+        add("Home and camera observations for the evidence day", camera_days, 16000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} camera context failed: %s", exc)
+    try:
+        recent_reports = []
+        for agent in PERSONAL_AGENTS:
+            messages = neo4j_store.room_messages(agent.room_id, limit=8)
+            reports = [item for item in messages
+                       if item.get("role") != "user" and item.get("text")]
+            if reports:
+                recent_reports.append({
+                    "agent": agent.name,
+                    "reports": [str(item["text"])[:1800] for item in reports[-3:]],
+                })
+        add("What the nine agents have recently said", recent_reports, 30000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} agent-report context failed: %s", exc)
+    try:
+        feedback = [
+            {"role": item.get("role"), "text": str(item.get("text") or "")[:2400]}
+            for item in neo4j_store.room_messages(forum.room_id, limit=30)
+            if item.get("role") in {"user", "coach"}
+        ][-12:]
+        add(f"What the user has said back to the {forum.name} room", feedback, 18000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} feedback context failed: %s", exc)
+    # What the *other* discussion rooms have concluded. Three rooms reading one
+    # life will otherwise arrive at the same observation on the same night and
+    # each present it as its own discovery.
+    try:
+        neighbours = []
+        for other in FORUMS:
+            if other.forum_id == forum.forum_id:
+                continue
+            store = forum_stores.get(other.forum_id)
+            if store is None:
+                continue
+            recent = store.recent_conclusions(limit=2, max_chars=1400)
+            if recent:
+                neighbours.append({"room": other.name, "sessions": recent})
+        add("What the other discussion rooms concluded recently", neighbours, 12000)
+    except Exception as exc:
+        logger.warning(f"{forum.name} neighbouring-forum context failed: %s", exc)
+    return "\n\n".join(sections)
+
+
+async def _forum_complete(*, room_id, room, messages, max_tokens,
+                          effort="high"):
+    """Prefer the full agent, but retain the speaker's voice on SDK failure."""
+    try:
+        return await _intelligent_complete(
+            room_id=room_id, room=room, messages=messages,
+            max_tokens=max_tokens, effort=effort)
+    except AgentRuntimeUnavailable:
+        return await conversation_manager.complete(
+            room_id=room_id, room=room, messages=messages,
+            max_tokens=max_tokens, allow_agent=False, require_agent=False,
+            thinking=True, thinking_budget=None, effort=effort)
+
+
+def _forum_speakers(forum):
+    """Who sits at this table, as (name, lens, room_id, system prompt).
+
+    A forum with its own panel seats those personas in its own room, so they
+    share its browser, filesystem and workspace. The Council instead seats the
+    user's existing personal agents under their own identities and workspaces —
+    that is the whole point of it — and only borrows the Council room's tool
+    grant so that a participant whose own room has no browser can still check a
+    claim about the world before making it.
+    """
+    forum_agent = get_agent(forum.room_id)
+    if forum.panel:
+        return [
+            (panelist.name, panelist.lens, forum.room_id,
+             personal_agent_prompt(forum_agent, panelist.instructions))
+            for panelist in forum.panel
+        ]
+    return [
+        (agent.name, "Your own discipline, brought to a whole life",
+         agent.room_id, personal_agent_prompt(agent))
+        for agent in PERSONAL_AGENTS
+    ]
+
+
+def _forum_room(forum, room_id):
+    """The room a turn runs in, with the forum's tool grant applied.
+
+    Speakers keep their own workspace and execution profile; what the forum adds
+    is the guarantee the user asked for — graph, browser and filesystem are
+    available to every voice in a discussion room, whatever its home room was
+    configured with.
+    """
+    if neo4j_store is None:
+        agent = get_agent(room_id) or get_agent(forum.room_id)
+        room = {
+            "room_id": room_id,
+            "assistant_mode": getattr(agent, "assistant_mode", "agent"),
+            "execution_profile": getattr(agent, "execution_profile", "investigate"),
+            "agent_tools": list(getattr(agent, "agent_tools", ("graph",))),
+            "agent_workspace": getattr(agent, "workspace", ""),
+        }
+    else:
+        room = dict(neo4j_store.get_room(room_id) or {"room_id": room_id})
+    room["agent_tools"] = list(dict.fromkeys(
+        [*(room.get("agent_tools") or []), *forum.agent_tools]))
+    return room
+
+
+def _forum_focus_line(agenda, question):
+    """One human-readable line describing what a session was asked to discuss."""
+    topics = [str(item.get("topic") or "").strip() for item in agenda]
+    parts = [topic for topic in topics if topic]
+    if str(question or "").strip():
+        parts.append(str(question).strip())
+    return " · ".join(parts)
+
+
+async def run_forum(forum, *, source, scheduled_for, reference_date,
+                    question="", dedupe_key=None, followup_id=None,
+                    on_date=None):
+    """Hold one session: an opening round, a response round, then a synthesis.
+
+    Two rounds rather than one because a single pass is not a discussion — the
+    first speaker has nothing to answer and the last has everything, so only the
+    second round lets every voice reply to every other. The user's agenda for
+    the night is claimed here and released again if the session dies, so a topic
+    he set is never silently swallowed by a failed run.
+    """
+    store = forum_stores[forum.forum_id]
+    dedupe_key = dedupe_key or f"{source}:{scheduled_for:.3f}"
+    on_date = on_date or datetime.date.today().isoformat()
+    async with _forum_lock:
+        neo4j_store.ensure_agent_rooms([get_agent(forum.room_id)])
+        session, created = await asyncio.to_thread(
+            store.begin_session,
+            dedupe_key=dedupe_key, source=source,
+            scheduled_for=scheduled_for, reference_date=reference_date,
+            question=question)
+        if not created:
+            return session
+
+        session_id = session["session_id"]
+        # A follow-up is already the user's question; only a routine session
+        # picks up the topics he queued for the night. Matched against the night
+        # the room is sitting, not the day it is reviewing: a session at 02:00
+        # discusses yesterday's evidence, and a topic he set "for tomorrow"
+        # means tomorrow's meeting, not the meeting after it.
+        agenda = ([] if source == "followup" else
+                  await asyncio.to_thread(
+                      store.claim_agenda, on_date, session_id))
+        focus = _forum_focus_line(agenda, question)
+        if focus:
+            await asyncio.to_thread(store.set_session_question, session_id, focus)
+        speakers = _forum_speakers(forum)
+        recent = await asyncio.to_thread(store.recent_conclusions, 5)
+
+        header = (
+            f"# {'Follow-up' if source == 'followup' else 'Nightly'} "
+            f"{forum.name} · {reference_date}\n\n"
+            f"{len(speakers)} voices are being given a turn, then a second turn "
+            "to answer each other. They can challenge one another and speculate "
+            "openly; hypotheses must remain visibly distinct from observed facts."
+            + ("".join(f"\n\n**Topic you set:** {item['topic']}"
+                       for item in agenda))
+            + (f"\n\n**Focus requested by the user:** {question}"
+               if question else "")
+        )
+        neo4j_store.add_message(forum.room_id, "council", header)
+        shared = await asyncio.to_thread(
+            _forum_shared_context, forum, reference_date)
+        transcript_parts = []
+        spoken = set()
+        try:
+            for index, (name, lens, room_id, system) in enumerate(speakers, 1):
+                transcript = "\n\n".join(transcript_parts)
+                prompt = forum_opening_prompt(
+                    forum, name, lens, reference_date, shared, transcript,
+                    agenda=agenda, question=question, recent_conclusions=recent,
+                    position=index, total=len(speakers))
+                messages = [{
+                    "role": "system",
+                    "content": system
+                    + f"\n\nYou are speaker {index} of {len(speakers)} in the "
+                      f"{forum.name} room. Your reply is shown verbatim to the "
+                      "user and to every speaker after you."
+                }, {"role": "user", "content": prompt}]
+                try:
+                    result = await asyncio.wait_for(
+                        _forum_complete(
+                            room_id=room_id,
+                            room=_forum_room(forum, room_id),
+                            messages=messages,
+                            max_tokens=forum.opening_tokens,
+                            effort="high"),
+                        timeout=env_int(forum.env("SPEAKER_SECONDS"),
+                                        forum.opening_seconds, minimum=30))
+                    reply = result.reply.strip()
+                    if not reply:
+                        raise RuntimeError("empty contribution")
+                    spoken.add(name)
+                except Exception as exc:
+                    logger.warning("%s speaker %s failed: %s",
+                                   forum.name, name, exc)
+                    reply = ("I could not complete this turn because the agent "
+                             f"run failed: {exc}")
+                contribution = f"## {name}\n\n{reply}"
+                transcript_parts.append(contribution)
+                neo4j_store.add_message(forum.room_id, "assistant", contribution)
+
+            # A real discussion needs every mind to see every opening position,
+            # not merely the speakers that happened to go before it. Repetition
+            # is explicitly forbidden here, both to keep the room worth reading
+            # and to keep the session inside its slot in the night.
+            first_round = "\n\n".join(transcript_parts)
+            rebuttal_timeout = env_int(forum.env("REBUTTAL_SECONDS"),
+                                       forum.rebuttal_seconds, minimum=20)
+            amendments = []
+            for name, lens, room_id, system in speakers:
+                messages = [{
+                    "role": "system",
+                    "content": system
+                    + f"\n\nThis is your response turn in the {forum.name} room."
+                }, {
+                    "role": "user",
+                    "content": forum_rebuttal_prompt(
+                        forum, name, first_round, "\n".join(amendments),
+                        agenda=agenda, question=question),
+                }]
+                try:
+                    result = await asyncio.wait_for(
+                        _forum_complete(
+                            room_id=room_id,
+                            room=_forum_room(forum, room_id),
+                            messages=messages,
+                            max_tokens=forum.rebuttal_tokens,
+                            effort="high"),
+                        timeout=rebuttal_timeout)
+                    reply = result.reply.strip()
+                    if not reply:
+                        raise RuntimeError("empty response")
+                    spoken.add(name)
+                except Exception as exc:
+                    logger.warning("%s response %s failed: %s",
+                                   forum.name, name, exc)
+                    reply = f"Response unavailable: {exc}"
+                amendment = f"### {name} — response\n\n{reply}"
+                amendments.append(amendment)
+                neo4j_store.add_message(forum.room_id, "assistant", amendment)
+
+            transcript = (first_round + f"\n\n# {forum.name} responses\n\n"
+                          + "\n\n".join(amendments))
+            moderator = get_agent(forum.room_id)
+            synthesis_messages = [{
+                "role": "system", "content": personal_agent_prompt(moderator)
+            }, {
+                "role": "user",
+                "content": forum_synthesis_prompt(
+                    forum, reference_date, shared, transcript, agenda=agenda,
+                    question=question, recent_conclusions=recent),
+            }]
+            synthesis = await asyncio.wait_for(
+                _forum_complete(
+                    room_id=forum.room_id,
+                    room=_forum_room(forum, forum.room_id),
+                    messages=synthesis_messages, max_tokens=2600,
+                    effort="max"),
+                timeout=env_int(forum.env("SYNTHESIS_SECONDS"),
+                                forum.synthesis_seconds, minimum=60))
+            summary = synthesis.reply.strip()
+            neo4j_store.add_message(
+                forum.room_id, "coach", f"# {forum.name} synthesis\n\n{summary}")
+            finished = await asyncio.to_thread(
+                store.finish_session, session_id,
+                participants=len(spoken), summary=summary)
+            if agenda:
+                await asyncio.to_thread(store.close_agenda, session_id)
+            if followup_id:
+                await asyncio.to_thread(
+                    store.finish_followup, followup_id, session_id=session_id)
+            notification_center.publish(
+                f"{forum.name} discussion ready",
+                (summary[:300]
+                 or f"The {forum.name} room finished its discussion."),
+                severity="important", category="forum", source=forum.forum_id,
+                room_id=forum.room_id, speak=False,
+                metadata={"session_id": session_id,
+                          "forum": forum.forum_id,
+                          "participants": len(spoken),
+                          "expected_participants": len(speakers),
+                          "agenda": [item["topic"] for item in agenda]})
+            return finished
+        except Exception as exc:
+            await asyncio.to_thread(
+                store.finish_session, session_id, participants=len(spoken),
+                summary="", status="failed", error=str(exc))
+            # The topics he set go back on the list rather than being consumed
+            # by a session that never reached a conclusion.
+            if agenda:
+                await asyncio.to_thread(
+                    store.close_agenda, session_id, discussed=False)
+            if followup_id:
+                await asyncio.to_thread(
+                    store.finish_followup, followup_id, error=str(exc))
+            neo4j_store.add_message(
+                forum.room_id, "coach",
+                f"# {forum.name} synthesis failed\n\n{len(spoken)} of "
+                f"{len(speakers)} speakers completed a turn. {exc}")
+            raise
+
+
+async def run_council(*, source, scheduled_for, reference_date, question="",
+                      dedupe_key=None, followup_id=None):
+    """The Council, for callers that only ever meant the Council."""
+    return await run_forum(
+        COUNCIL, source=source, scheduled_for=scheduled_for,
+        reference_date=reference_date, question=question,
+        dedupe_key=dedupe_key, followup_id=followup_id)
+
+
+def _forum_nightly_job(forum):
+    """The unprompted session: last night's evidence plus any topic he set."""
+    async def job(ctx):
+        tonight = datetime.date.fromtimestamp(ctx.now)
+        reference = (tonight - datetime.timedelta(days=1)).isoformat()
+        session = await run_forum(
+            forum, source="nightly", scheduled_for=ctx.now,
+            reference_date=reference, dedupe_key=f"nightly:{reference}",
+            on_date=tonight.isoformat())
+        expected = len(_forum_speakers(forum))
+        return JobResult(
+            detail=(f"{reference}: {session.get('participants', 0)}/{expected} "
+                    "speakers"),
+            delivered=False, data={"session_id": session.get("session_id"),
+                                   "forum": forum.forum_id})
+    return job
+
+
+def _forum_followup_job(forum):
+    """Run whatever the user scheduled for this room, one session per tick."""
+    async def job(ctx):
+        if _forum_lock.locked():
+            return JobResult(detail="a discussion room is already sitting")
+        store = forum_stores[forum.forum_id]
+        followup = await asyncio.to_thread(store.claim_due_followup, ctx.now)
+        if not followup:
+            return JobResult(detail="no follow-up due")
+        reference = datetime.date.fromtimestamp(ctx.now).isoformat()
+        session = await run_forum(
+            forum, source="followup", scheduled_for=followup["run_at"],
+            reference_date=reference, question=followup["question"],
+            dedupe_key=f"followup:{followup['followup_id']}",
+            followup_id=followup["followup_id"])
+        return JobResult(
+            detail=f"follow-up {followup['followup_id']} completed",
+            delivered=False, data={"session_id": session.get("session_id"),
+                                   "forum": forum.forum_id})
+    return job
 
 
 async def generate_weekly_product_review(week_start=None, replace=False):
@@ -1152,7 +1726,8 @@ async def generate_weekly_product_review(week_start=None, replace=False):
         room=(neo4j_store.get_room("agent:daily-reflection")
               if neo4j_store is not None else None),
         messages=[
-            {"role": "system", "content": PRODUCT_REVIEW_SYSTEM_PROMPT},
+            {"role": "system", "content": personal_agent_prompt(
+                get_agent("agent:daily-reflection"), PRODUCT_REVIEW_SYSTEM_PROMPT)},
             {"role": "user",
              "content": "Review this week and report what it asks of the "
                         "application:\n\n" + context},
@@ -1245,7 +1820,8 @@ async def generate_horizon_review(horizon, key=None, replace=False):
         room=(neo4j_store.get_room(HORIZON_ROOM)
               if neo4j_store is not None else None),
         messages=[
-            {"role": "system", "content": HORIZON_SYSTEM_PROMPT},
+            {"role": "system", "content": personal_agent_prompt(
+                get_agent(HORIZON_ROOM), HORIZON_SYSTEM_PROMPT)},
             {"role": "user",
              "content": (f"Reflect on this {horizon} and forecast the next "
                          f"one.\n\n{context}")},
@@ -1376,7 +1952,8 @@ async def generate_quran_study_guide(surah, from_ayah, to_ayah, date=None,
         daily_reflections)
     room = neo4j_store.get_room(QURAN_ROOM) if neo4j_store is not None else None
     messages = [
-        {"role": "system", "content": QURAN_STUDY_SYSTEM_PROMPT},
+        {"role": "system", "content": personal_agent_prompt(
+            get_agent(QURAN_ROOM), QURAN_STUDY_SYSTEM_PROMPT)},
         {"role": "user", "content": context},
     ]
     # One repair attempt. A report that omits the tafsir or the words is the
@@ -1486,6 +2063,7 @@ def _agent_check_in_job(agent):
                 "partial activity as part of the report.\n\n"
                 f"{agent.check_in}"
             ),
+            directive_date=report_date,
         )
         return JobResult(detail=f"{len(result['reply'])} chars", delivered=True)
     return run
@@ -2394,7 +2972,7 @@ async def horizons_index():
             "horizons": horizons,
             "due": [{"horizon": h, "period_key": k} for h, k in due],
             "calibration": horizon_reviews.calibration(),
-            "open_predictions": len(horizon_reviews.due_predictions(limit=200)),
+            "open_predictions": len(horizon_reviews.open_predictions(limit=200)),
             "threads": horizon_reviews.threads(limit=60),
         }
     return await asyncio.to_thread(load)
@@ -2427,6 +3005,191 @@ async def horizon_thread_update(thread_id: str, request: Request):
     if updated is None:
         return JSONResponse(status_code=404, content={"error": "thread not found"})
     return updated
+
+
+def _resolve_forum(key):
+    """A forum by short id or room id, or None for an unknown one."""
+    return get_forum(key)
+
+
+async def _forum_payload(forum, limit=30):
+    limit = max(1, min(int(limit), 100))
+    store = forum_stores[forum.forum_id]
+
+    def load():
+        return {
+            "sessions": store.sessions(limit),
+            "followups": store.followups(None, limit),
+            "agenda": store.agenda(None, limit),
+        }
+    return {
+        "forum": forum.forum_id,
+        "name": forum.name,
+        "room_id": forum.room_id,
+        "description": forum.description,
+        "color": forum.color,
+        "icon": forum.icon,
+        "schedule": os.getenv(forum.env("AT")) or forum.at,
+        "window": "02:00-04:00 local time",
+        # The lock is shared, so this says "a discussion is in progress", which
+        # is the honest answer: the rooms deliberately never sit at once.
+        "running": _forum_lock.locked(),
+        "participants": [name for name, *_ in _forum_speakers(forum)],
+        **await asyncio.to_thread(load),
+    }
+
+
+@app.get("/forums")
+async def forums_status(limit: int = 30):
+    """Every discussion room: when it meets, what it decided, what is queued."""
+    return {
+        "running": _forum_lock.locked(),
+        "forums": [await _forum_payload(forum, limit) for forum in FORUMS],
+    }
+
+
+@app.get("/forums/{forum_id}")
+async def forum_status(forum_id: str, limit: int = 30):
+    forum = _resolve_forum(forum_id)
+    if forum is None:
+        return JSONResponse(status_code=404,
+                            content={"error": f"unknown forum: {forum_id}"})
+    return await _forum_payload(forum, limit)
+
+
+@app.post("/forums/{forum_id}/agenda")
+async def forum_agenda_create(forum_id: str, request: Request):
+    """Set what a room will discuss on a coming night.
+
+    This is an addition to the routine session, not a replacement for it: the
+    room still reviews the evidence it always reviews, and gives the user's
+    topic the better half of its attention. Omit `for_date` to have it taken up
+    whenever the room next meets.
+    """
+    forum = _resolve_forum(forum_id)
+    if forum is None:
+        return JSONResponse(status_code=404,
+                            content={"error": f"unknown forum: {forum_id}"})
+    try:
+        data = await request.json()
+    except Exception as exc:
+        return JSONResponse(status_code=400,
+                            content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "expected an object"})
+    try:
+        item = await asyncio.to_thread(
+            forum_stores[forum.forum_id].set_agenda,
+            data.get("topic"), data.get("for_date"), data.get("note") or "")
+    except (TypeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return JSONResponse(status_code=201,
+                        content={"agenda": item, "forum": forum.forum_id})
+
+
+@app.delete("/forums/{forum_id}/agenda/{agenda_id}")
+async def forum_agenda_delete(forum_id: str, agenda_id: str):
+    forum = _resolve_forum(forum_id)
+    if forum is None:
+        return JSONResponse(status_code=404,
+                            content={"error": f"unknown forum: {forum_id}"})
+    if not await asyncio.to_thread(
+            forum_stores[forum.forum_id].cancel_agenda, agenda_id):
+        return JSONResponse(status_code=404,
+                            content={"error": "pending agenda topic not found"})
+    return {"cancelled": True, "agenda_id": agenda_id, "forum": forum.forum_id}
+
+
+@app.post("/forums/{forum_id}/followups")
+async def forum_followup_create(forum_id: str, request: Request):
+    """Schedule an extra session of this room around a question from the user."""
+    forum = _resolve_forum(forum_id)
+    if forum is None:
+        return JSONResponse(status_code=404,
+                            content={"error": f"unknown forum: {forum_id}"})
+    try:
+        data = await request.json()
+    except Exception as exc:
+        return JSONResponse(status_code=400,
+                            content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "expected an object"})
+    try:
+        followup = await asyncio.to_thread(
+            forum_stores[forum.forum_id].schedule_followup,
+            data.get("when"), data.get("question"))
+    except (TypeError, ValueError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return JSONResponse(status_code=201,
+                        content={"followup": followup, "forum": forum.forum_id})
+
+
+@app.post("/forums/{forum_id}/run")
+async def forum_run_now(forum_id: str, request: Request):
+    """Queue a session of this room for the next orchestrator tick."""
+    forum = _resolve_forum(forum_id)
+    if forum is None:
+        return JSONResponse(status_code=404,
+                            content={"error": f"unknown forum: {forum_id}"})
+    try:
+        data = await request.json()
+    except Exception as exc:
+        return JSONResponse(status_code=400,
+                            content={"error": f"invalid JSON: {exc}"})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "expected an object"})
+    question = str(data.get("question") or "").strip()
+    if not question:
+        question = (f"Revisit the latest {forum.name} session in light of my "
+                    "feedback in the room.")
+    followup = await asyncio.to_thread(
+        forum_stores[forum.forum_id].schedule_followup, time.time() + 1,
+        question)
+    return JSONResponse(status_code=202,
+                        content={"followup": followup, "forum": forum.forum_id})
+
+
+@app.delete("/forums/{forum_id}/followups/{followup_id}")
+async def forum_followup_delete(forum_id: str, followup_id: str):
+    forum = _resolve_forum(forum_id)
+    if forum is None:
+        return JSONResponse(status_code=404,
+                            content={"error": f"unknown forum: {forum_id}"})
+    if not await asyncio.to_thread(
+            forum_stores[forum.forum_id].cancel_followup, followup_id):
+        return JSONResponse(status_code=404,
+                            content={"error": "scheduled follow-up not found"})
+    return {"cancelled": True, "followup_id": followup_id,
+            "forum": forum.forum_id}
+
+
+# The Council's own routes, from before there were three discussion rooms.
+# They are thin delegations now, kept because they are what shipped clients ask.
+
+@app.get("/council")
+async def council_status(limit: int = 30):
+    """Nightly sessions, follow-ups and agenda for the visible Council room."""
+    return await _forum_payload(COUNCIL, limit)
+
+
+@app.post("/council/followups")
+async def council_followup_create(request: Request):
+    """Schedule a whole-Council follow-up around a question from the user."""
+    return await forum_followup_create(COUNCIL.forum_id, request)
+
+
+@app.post("/council/run")
+async def council_run_now(request: Request):
+    """Queue a user-requested Council for the next orchestrator tick."""
+    return await forum_run_now(COUNCIL.forum_id, request)
+
+
+@app.delete("/council/followups/{followup_id}")
+async def council_followup_delete(followup_id: str):
+    return await forum_followup_delete(COUNCIL.forum_id, followup_id)
 
 
 @app.get("/horizons/calibration")
@@ -3019,6 +3782,60 @@ async def room_feed(room_id: str, date: str = None, limit: int = 200,
                 start=start, end=end, applications=selected_apps)}
 
 
+def _daily_life_context(date_str):
+    """Non-screen evidence that can make a quiet-day report worth delivering."""
+    day = datetime.date.fromisoformat(date_str)
+    sections = []
+    try:
+        calendar_context = calendar_store.accountability_context(now=day, days=1)
+        if calendar_context:
+            sections.append(calendar_context)
+    except Exception as exc:
+        logger.warning("Loading calendar context for daily report failed: %s", exc)
+    try:
+        answers = daily_reflections.answers_between(date_str, date_str, limit=20)
+        if answers:
+            sections.append(
+                "The user's own reflection answers for this date (ground truth):\n"
+                + "\n".join(
+                    f"- {item.get('question')}: {str(item.get('answer') or '')[:900]}"
+                    for item in answers))
+    except Exception as exc:
+        logger.warning("Loading dated reflections for daily report failed: %s", exc)
+    try:
+        sections.append(accountability_from_canvas(
+            room_canvas_store, now=day,
+            calorie_lookup=calorie_estimate_store.lookup()).prompt_context())
+    except Exception as exc:
+        logger.warning("Loading life-room context for daily report failed: %s", exc)
+    try:
+        horizon_context_block = shared_horizon_context(
+            horizon_reviews,
+            query="daily review work family health worship research priorities",
+            today=day)
+        if horizon_context_block:
+            sections.append(horizon_context_block)
+    except Exception as exc:
+        logger.warning("Loading Horizons context for daily report failed: %s", exc)
+    try:
+        start = datetime.datetime.combine(day, datetime.time.min).timestamp()
+        end = datetime.datetime.combine(day, datetime.time.max).timestamp()
+        camera_events = neo4j_store.recent_events(
+            start=start, end=end, domain="home", limit=8)
+        camera_lines = [
+            str(item.get("summary") or item.get("text") or "").strip()
+            for item in camera_events]
+        camera_lines = [line for line in camera_lines if line]
+        if camera_lines:
+            sections.append(
+                "Home-camera observations for this date. These describe the home, "
+                "not necessarily what the user personally did:\n"
+                + "\n".join(f"- {line}" for line in camera_lines))
+    except Exception as exc:
+        logger.warning("Loading camera context for daily report failed: %s", exc)
+    return "\n\n".join(section for section in sections if section)
+
+
 @app.post("/rooms/daily/report")
 async def daily_report(date: str = None, post: bool = True):
     """Generate the Coach's daily review and post it to Creative Coach."""
@@ -3034,29 +3851,29 @@ async def daily_report(date: str = None, post: bool = True):
     entities = neo4j_store.day_entities(ds, limit=12, domain=PRODUCTIVITY_DOMAIN)
     comparison = compare_periods(
         metrics, neo4j_store.range_metrics(*previous_window("daily", ds)))
+    life_context = _daily_life_context(ds)
 
     feedback = ""
-    if metrics.get("events"):
-        try:
-            result = await _creative_coach_report_complete(
-                coach_prompt(
-                    metrics, claims, comparison=comparison,
-                    reflection_context=_reflection_block(
-                        query="today focus energy sleep mood work plans",
-                        limit=8, days=7, max_chars=4000, answer_chars=900)),
-                max_tokens=350)
-            feedback = result.reply.strip()
-        except AgentRuntimeUnavailable as exc:
-            return JSONResponse(status_code=503, content={"error": str(exc)})
-        except Exception as exc:
-            logger.warning("coach feedback LLM failed: %s", exc)
+    try:
+        result = await _creative_coach_report_complete(
+            coach_prompt(
+                metrics, claims, comparison=comparison,
+                reflection_context=life_context or _reflection_block(
+                    query="today focus energy sleep mood work plans",
+                    limit=8, days=7, max_chars=4000, answer_chars=900)),
+            max_tokens=350)
+        feedback = result.reply.strip()
+    except AgentRuntimeUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    except Exception as exc:
+        logger.warning("coach feedback LLM failed: %s", exc)
 
     report = format_report(metrics, claims=claims, entities=entities,
                            comparison=comparison)
     if feedback:
         report += f"\n\n## Coach\n{feedback}"
 
-    posted = bool(post and metrics.get("events"))
+    posted = bool(post)
     if posted:
         neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
         eod = datetime.datetime.fromisoformat(ds).timestamp() + 86399
@@ -3926,12 +4743,19 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
     # the same reason they all get the open-task ages: whichever room speaks
     # first should already know, rather than being corrected by him afterwards.
     calendar_block = ""
+    horizon_block = ""
     if agent is not None:
         task_accountability = tomorrow_plan_store.accountability_context()
         try:
             calendar_block = calendar_store.prompt_context()
         except Exception as exc:
             logger.warning("Loading the calendar for %s failed: %s", room_id, exc)
+        try:
+            horizon_block = shared_horizon_context(
+                horizon_reviews, query=f"{agent.description} {message}")
+        except Exception as exc:
+            logger.warning("Loading Horizons grounding for %s failed: %s",
+                           room_id, exc)
 
     if agent is not None:
         grounding = (
@@ -3939,7 +4763,7 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
             "This is your own room and conversation; do not impersonate the other "
             "agents. Use the shared personal and activity context when relevant, "
             "but do not force every detail into every answer.\n\n"
-            f"Your role:\n{agent.instructions}\n\n{INITIATIVE_PROMPT}\n\n"
+            f"{personal_agent_prompt(agent)}\n\n"
             f"{personal_memory.context(query=message) or 'No personal profile facts learned yet.'}\n\n"
             + (reflection_block + "\n\n" if reflection_block else "")
             + ("Open task accountability (his own uncompleted commitments; "
@@ -3951,6 +4775,7 @@ def _room_chat_turn(room_id, message, applications=None, start=None, end=None,
                "than app categories, so read them as you would read anything "
                "else he told you:\n" + calendar_block + "\n\n"
                if calendar_block else "")
+            + (horizon_block + "\n\n" if horizon_block else "")
             + "Today's observed PC activity:\n- "
             + "\n- ".join((daily_ctx or {}).get("events", []) or ["(none yet)"])
             + "\n\nMost relevant long-term activity or memory:\n- "
@@ -4109,17 +4934,19 @@ async def room_chat(room_id: str, request: Request):
     return response
 
 
-def _check_in_prompt(prompt):
-    """Bend an unprompted check-in to the day the user says he is having."""
+def _check_in_prompt(prompt, directive_date=None):
+    """Bend an unprompted check-in to the same day it is reviewing."""
     try:
-        directive = calendar_store.check_in_directive()
+        day = (datetime.date.fromisoformat(directive_date)
+               if directive_date else None)
+        directive = calendar_store.check_in_directive(day)
     except Exception as exc:
-        logger.warning("Reading today's calendar for a check-in failed: %s", exc)
+        logger.warning("Reading calendar context for a check-in failed: %s", exc)
         return prompt
     return f"{directive}\n\n{prompt}" if directive else prompt
 
 
-async def _run_agent_check_in(room_id, prompt=None):
+async def _run_agent_check_in(room_id, prompt=None, directive_date=None):
     """Run one agent's default check-in and post the reply into its room.
 
     Shared by the manual endpoint and the orchestrator's scheduled job, so an
@@ -4135,7 +4962,8 @@ async def _run_agent_check_in(room_id, prompt=None):
         neo4j_store.ensure_agent_rooms(PERSONAL_AGENTS)
     messages, citations, meta = _room_chat_turn(
         room_id, _check_in_prompt(
-            prompt if prompt is not None else agent.check_in))
+            prompt if prompt is not None else agent.check_in,
+            directive_date=directive_date))
     result = await _intelligent_complete(
         room_id=room_id, room=neo4j_store.get_room(room_id),
         messages=messages, max_tokens=750)
@@ -4676,6 +5504,13 @@ def _assistant_turn(conversation, message):
         + INITIATIVE_PROMPT
         + "\n\nMemory evidence:\n" + evidence_text
     )
+    try:
+        horizon_block = shared_horizon_context(
+            horizon_reviews, query=message, strict=True, max_chars=4000)
+        if horizon_block:
+            system += "\n\n" + horizon_block
+    except Exception as exc:
+        logger.warning("Loading Horizons context for assistant failed: %s", exc)
     if room_id:
         room = neo4j_store.get_room(room_id)
         if room and room.get("instructions"):
@@ -5120,6 +5955,7 @@ async def report_activity(period: str = "daily", date: str = None,
             "model": already.get("model"),
             "effort": already.get("effort"),
             "written_at": already.get("written_at"),
+            "scored_by": "claude_agent",
             "stored": True,
         }
 
@@ -5138,7 +5974,6 @@ async def report_activity(period: str = "daily", date: str = None,
                     claim_summary=claim_summary,
                     history=list(reversed(history)),
                     hours=hours,
-                    raw_report=raw_report,
                     # Why the period looked the way it did is something only he
                     # can supply; the metrics only show that it did.
                     reflection_context=_reflection_block(
@@ -5158,6 +5993,7 @@ async def report_activity(period: str = "daily", date: str = None,
             payload["narrative_meta"] = {
                 "model": getattr(result, "model", None),
                 "effort": getattr(result, "effort", None),
+                "scored_by": "claude_agent",
                 "stored": False,
             }
             # The score chart was built before this run; put the score that was
@@ -6320,7 +7156,8 @@ async def gather_tool_context(transcription):
 
 
 def build_messages(concise, memory_text, chat_history, user_content,
-                   personal_context=None, reflection_context=None):
+                   personal_context=None, reflection_context=None,
+                   horizon_context=None):
     system_prompt = (
         CONCISE_SYSTEM_PROMPT if concise
         else "You are the user's personal assistant.\n\n" + INITIATIVE_PROMPT
@@ -6333,6 +7170,8 @@ def build_messages(concise, memory_text, chat_history, user_content,
         })
     if reflection_context:
         messages.append({"role": "system", "content": reflection_context})
+    if horizon_context:
+        messages.append({"role": "system", "content": horizon_context})
     if memory_text:
         messages.append({
             "role": "user",
@@ -6421,9 +7260,15 @@ async def generate_response(wav_bytes_audio, wav_bytes_image, chat_history,
     reflection_context = _reflection_block(
         query=transcription, limit=4, days=400, max_chars=2400,
         answer_chars=800, strict=True)
+    try:
+        horizon_context_block = shared_horizon_context(
+            horizon_reviews, query=transcription, strict=True, max_chars=3000)
+    except Exception as exc:
+        logger.warning("Loading Horizons context for live assistant failed: %s", exc)
+        horizon_context_block = ""
     messages = build_messages(
         concise, memory_text, chat_history, user_content, personal_context,
-        reflection_context)
+        reflection_context, horizon_context_block)
     try:
         chat_response = await client.chat.completions.create(
             job_label="Chat reply (streaming)",

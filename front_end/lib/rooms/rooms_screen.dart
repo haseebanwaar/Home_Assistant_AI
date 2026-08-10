@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -752,7 +753,8 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
         title: const Text('Rooms'),
         actions: [
           IconButton(
-            tooltip: 'Calendar — your weekly routine, and days that are not ordinary',
+            tooltip:
+                'Calendar — your weekly routine, and days that are not ordinary',
             icon: const Icon(Icons.calendar_month_outlined, color: _muted),
             onPressed:
                 () => Navigator.of(context).push(
@@ -897,6 +899,98 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
   }
 }
 
+/// ---- Discussion rooms ----------------------------------------------------
+
+/// The wording for one discussion room's three actions.
+///
+/// The rooms behave identically — sit now, set a topic for a coming night,
+/// schedule an extra session — so only their language differs. Keeping that
+/// language here is what stops three near-identical dialogs from being written
+/// three times.
+class _ForumActions {
+  final String id;
+  final String name;
+  final String runTooltip;
+  final String runQuestion;
+  final String topicTooltip;
+  final String topicTitle;
+  final String topicLabel;
+  final String topicHint;
+  final String followupTooltip;
+  final String followupTitle;
+  final String followupLabel;
+  final String followupHint;
+
+  const _ForumActions({
+    required this.id,
+    required this.name,
+    required this.runTooltip,
+    required this.runQuestion,
+    required this.topicTooltip,
+    required this.topicTitle,
+    required this.topicLabel,
+    required this.topicHint,
+    required this.followupTooltip,
+    required this.followupTitle,
+    required this.followupLabel,
+    required this.followupHint,
+  });
+}
+
+const _forumActions = <String, _ForumActions>{
+  'agent:council': _ForumActions(
+    id: 'council',
+    name: 'Council',
+    runTooltip: 'Run the nine-agent Council now',
+    runQuestion:
+        'Revisit the latest Council in light of my feedback in this room.',
+    topicTooltip: 'Set what the Council discusses on a coming night',
+    topicTitle: 'Set a Council topic',
+    topicLabel: 'What should the Council discuss that night?',
+    topicHint:
+        'For example: whether I am building the life I actually want, or the one I drifted into.',
+    followupTooltip: 'Schedule a Council follow-up',
+    followupTitle: 'Schedule Council follow-up',
+    followupLabel: 'What should all nine agents revisit?',
+    followupHint:
+        'For example: challenge the assumptions behind our plan for work and family.',
+  ),
+  'agent:hard-questions': _ForumActions(
+    id: 'hard-questions',
+    name: 'Hard Questions',
+    runTooltip: 'Hold a Hard Questions session now',
+    runQuestion:
+        'Take up the last Hard Questions session again in light of my feedback in this room.',
+    topicTooltip: 'Set what Hard Questions discusses on a coming night',
+    topicTitle: 'Set a Hard Questions topic',
+    topicLabel: 'What should the room argue that night?',
+    topicHint:
+        'For example: existential crisis — whether meaning is found or made, and what that asks of me.',
+    followupTooltip: 'Schedule a Hard Questions follow-up',
+    followupTitle: 'Schedule Hard Questions follow-up',
+    followupLabel: 'What should the room take up?',
+    followupHint:
+        'For example: press harder on where the Islamic and Western answers actually part ways.',
+  ),
+  'agent:risk-assessment': _ForumActions(
+    id: 'risk-assessment',
+    name: 'Risk Assessment',
+    runTooltip: 'Run a Risk Assessment now',
+    runQuestion:
+        'Update the risk picture in light of my feedback in this room.',
+    topicTooltip: 'Set what Risk Assessment examines on a coming night',
+    topicTitle: 'Set a Risk Assessment topic',
+    topicLabel: 'What should the room assess that night?',
+    topicHint:
+        'For example: what AI coding tools do to the job market I am actually aiming at.',
+    followupTooltip: 'Schedule a Risk Assessment follow-up',
+    followupTitle: 'Schedule Risk Assessment follow-up',
+    followupLabel: 'What should the room assess?',
+    followupHint:
+        'For example: how exposed my savings and my field are if the funding climate turns.',
+  ),
+};
+
 /// ---- Room screen (feed + compose) ---------------------------------------
 class RoomScreen extends StatefulWidget {
   final String apiBase;
@@ -950,6 +1044,11 @@ class _RoomScreenState extends State<RoomScreen> {
   bool get _isDaily => widget.kind == 'daily';
   bool get _isAgent => widget.kind == 'agent';
   bool get _isCreativeCoach => widget.roomId == 'agent:creative-coach';
+
+  /// The discussion room this is, if it is one. A forum room replaces the
+  /// ordinary check-in button with its own three actions: sit now, schedule an
+  /// extra session, or set what it will discuss on a coming night.
+  _ForumActions? get _forum => _forumActions[widget.roomId];
   bool get _isCameraRoom => widget.kind == 'camera';
   bool get _isSourceRoom => widget.kind == 'camera' || widget.kind == 'screen';
 
@@ -1386,6 +1485,298 @@ class _RoomScreenState extends State<RoomScreen> {
     }
   }
 
+  Future<void> _runForumNow(_ForumActions forum) async {
+    setState(() => _sending = true);
+    try {
+      final resp = await http
+          .post(
+            Uri.parse('${widget.apiBase}/forums/${forum.id}/run'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode({'question': forum.runQuestion}),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (resp.statusCode == 202) {
+        _snack('${forum.name} queued for the next scheduler tick.');
+      } else {
+        _snack('Could not queue ${forum.name}: HTTP ${resp.statusCode}');
+      }
+    } catch (e) {
+      _snack('Could not queue ${forum.name}: $e');
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  /// Set what a room will discuss on a coming night.
+  ///
+  /// Deliberately not a follow-up: this topic is carried *into* the routine
+  /// session rather than replacing it, so the room still does its nightly work
+  /// and spends the better half of its attention on what he asked for.
+  Future<void> _setForumTopic(_ForumActions forum) async {
+    final topic = TextEditingController();
+    void disposeTopicAfterDialogAnimation() {
+      unawaited(
+        Future<void>.delayed(const Duration(milliseconds: 350), topic.dispose),
+      );
+    }
+
+    final today = DateTime.now();
+    var night = DateTime(today.year, today.month, today.day + 1);
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder:
+          (dialogContext) => StatefulBuilder(
+            builder:
+                (context, setDialogState) => AlertDialog(
+                  title: Text(forum.topicTitle),
+                  content: SizedBox(
+                    width: 480,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        TextField(
+                          controller: topic,
+                          onChanged: (_) => setDialogState(() {}),
+                          autofocus: true,
+                          minLines: 3,
+                          maxLines: 7,
+                          decoration: InputDecoration(
+                            labelText: forum.topicLabel,
+                            hintText: forum.topicHint,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(Icons.event_outlined),
+                          title: Text(
+                            '${night.year.toString().padLeft(4, '0')}-'
+                            '${night.month.toString().padLeft(2, '0')}-'
+                            '${night.day.toString().padLeft(2, '0')}',
+                          ),
+                          subtitle: const Text(
+                            'Discussed alongside the room’s normal routine, '
+                            'the first time it meets on or after this day.',
+                          ),
+                          onTap: () async {
+                            final date = await showDatePicker(
+                              context: context,
+                              initialDate: night,
+                              firstDate: DateTime(today.year, today.month, today.day),
+                              lastDate: DateTime.now().add(
+                                const Duration(days: 730),
+                              ),
+                            );
+                            if (date != null) {
+                              setDialogState(() => night = date);
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(dialogContext, false),
+                      child: const Text('Cancel'),
+                    ),
+                    FilledButton(
+                      onPressed:
+                          topic.text.trim().isEmpty
+                              ? null
+                              : () => Navigator.pop(dialogContext, true),
+                      child: const Text('Set topic'),
+                    ),
+                  ],
+                ),
+          ),
+    );
+    if (accepted != true) {
+      disposeTopicAfterDialogAnimation();
+      return;
+    }
+    final forDate =
+        '${night.year.toString().padLeft(4, '0')}-'
+        '${night.month.toString().padLeft(2, '0')}-'
+        '${night.day.toString().padLeft(2, '0')}';
+    try {
+      final resp = await http
+          .post(
+            Uri.parse('${widget.apiBase}/forums/${forum.id}/agenda'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode({
+              'topic': topic.text.trim(),
+              'for_date': forDate,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (resp.statusCode == 201) {
+        _snack('${forum.name} will discuss this on $forDate.');
+      } else {
+        String reason = 'HTTP ${resp.statusCode}';
+        try {
+          reason =
+              (decodeJsonResponse(resp) as Map<String, dynamic>)['error']
+                  ?.toString() ??
+              reason;
+        } catch (_) {}
+        _snack('Could not set the topic: $reason');
+      }
+    } catch (e) {
+      _snack('Could not set the topic: $e');
+    } finally {
+      disposeTopicAfterDialogAnimation();
+    }
+  }
+
+  Future<void> _scheduleForumFollowup(_ForumActions forum) async {
+    final question = TextEditingController();
+    void disposeQuestionAfterDialogAnimation() {
+      unawaited(
+        Future<void>.delayed(
+          const Duration(milliseconds: 350),
+          question.dispose,
+        ),
+      );
+    }
+
+    var scheduled = DateTime.now().add(const Duration(days: 1));
+    scheduled = DateTime(scheduled.year, scheduled.month, scheduled.day, 9);
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder:
+          (dialogContext) => StatefulBuilder(
+            builder:
+                (context, setDialogState) => AlertDialog(
+                  title: Text(forum.followupTitle),
+                  content: SizedBox(
+                    width: 480,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        TextField(
+                          controller: question,
+                          onChanged: (_) => setDialogState(() {}),
+                          autofocus: true,
+                          minLines: 3,
+                          maxLines: 7,
+                          decoration: InputDecoration(
+                            labelText: forum.followupLabel,
+                            hintText: forum.followupHint,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(Icons.event_outlined),
+                          title: Text(
+                            '${scheduled.year.toString().padLeft(4, '0')}-'
+                            '${scheduled.month.toString().padLeft(2, '0')}-'
+                            '${scheduled.day.toString().padLeft(2, '0')}',
+                          ),
+                          onTap: () async {
+                            final date = await showDatePicker(
+                              context: context,
+                              initialDate: scheduled,
+                              firstDate: DateTime.now(),
+                              lastDate: DateTime.now().add(
+                                const Duration(days: 730),
+                              ),
+                            );
+                            if (date != null) {
+                              setDialogState(
+                                () =>
+                                    scheduled = DateTime(
+                                      date.year,
+                                      date.month,
+                                      date.day,
+                                      scheduled.hour,
+                                      scheduled.minute,
+                                    ),
+                              );
+                            }
+                          },
+                        ),
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(Icons.schedule_outlined),
+                          title: Text(
+                            '${scheduled.hour.toString().padLeft(2, '0')}:'
+                            '${scheduled.minute.toString().padLeft(2, '0')}',
+                          ),
+                          onTap: () async {
+                            final chosen = await showTimePicker(
+                              context: context,
+                              initialTime: TimeOfDay.fromDateTime(scheduled),
+                            );
+                            if (chosen != null) {
+                              setDialogState(
+                                () =>
+                                    scheduled = DateTime(
+                                      scheduled.year,
+                                      scheduled.month,
+                                      scheduled.day,
+                                      chosen.hour,
+                                      chosen.minute,
+                                    ),
+                              );
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(dialogContext, false),
+                      child: const Text('Cancel'),
+                    ),
+                    FilledButton(
+                      onPressed:
+                          question.text.trim().isEmpty
+                              ? null
+                              : () => Navigator.pop(dialogContext, true),
+                      child: const Text('Schedule'),
+                    ),
+                  ],
+                ),
+          ),
+    );
+    if (accepted != true) {
+      disposeQuestionAfterDialogAnimation();
+      return;
+    }
+    final questionText = question.text.trim();
+    try {
+      final resp = await http
+          .post(
+            Uri.parse('${widget.apiBase}/forums/${forum.id}/followups'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode({
+              'when': scheduled.toIso8601String(),
+              'question': questionText,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (resp.statusCode == 201) {
+        _snack('${forum.name} follow-up scheduled.');
+      } else {
+        String reason = 'HTTP ${resp.statusCode}';
+        try {
+          reason =
+              (decodeJsonResponse(resp) as Map<String, dynamic>)['error']
+                  ?.toString() ??
+              reason;
+        } catch (_) {}
+        _snack('Could not schedule follow-up: $reason');
+      }
+    } catch (e) {
+      _snack('Could not schedule follow-up: $e');
+    } finally {
+      disposeQuestionAfterDialogAnimation();
+    }
+  }
+
   void _snack(String m) {
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
@@ -1407,13 +1798,30 @@ class _RoomScreenState extends State<RoomScreen> {
       onRefresh: _load,
       bottom: _composer(),
       actions: [
+        if (_forum != null) ...[
+          IconButton(
+            tooltip: _forum!.runTooltip,
+            icon: const Icon(Icons.play_circle_outline, color: _mint),
+            onPressed: _sending ? null : () => _runForumNow(_forum!),
+          ),
+          IconButton(
+            tooltip: _forum!.topicTooltip,
+            icon: const Icon(Icons.edit_calendar_outlined, color: _mint),
+            onPressed: _sending ? null : () => _setForumTopic(_forum!),
+          ),
+          IconButton(
+            tooltip: _forum!.followupTooltip,
+            icon: const Icon(Icons.event_repeat, color: _violet),
+            onPressed: _sending ? null : () => _scheduleForumFollowup(_forum!),
+          ),
+        ],
         if (_isCreativeCoach)
           IconButton(
             tooltip: 'Generate daily Coach report',
             icon: const Icon(Icons.insights, color: _mint),
             onPressed: _sending ? null : _generateReport,
           ),
-        if (_isAgent)
+        if (_isAgent && _forum == null)
           IconButton(
             tooltip: 'Run agent check-in',
             icon: const Icon(Icons.auto_awesome, color: _violet),

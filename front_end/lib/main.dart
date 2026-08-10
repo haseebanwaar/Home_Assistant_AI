@@ -1488,6 +1488,8 @@ class _MyAppState extends State<MyApp> {
             nudgeId: item.nudgeId,
             audio: item.audio,
             clipId: item.clipId,
+            clipCoversSeconds: item.clipCoversSeconds,
+            clipPlaysSeconds: item.clipPlaysSeconds,
             feedback: previous,
           ),
         );
@@ -1506,6 +1508,16 @@ class _MyAppState extends State<MyApp> {
       compact: compact,
       onReplay: _replayInsight,
       onFeedback: _sendInsightFeedback,
+      onOpenClip:
+          (insight) => showClipSheet(
+            context,
+            apiBase: _apiBase,
+            clipId: insight.clipId!,
+            caption: insight.text,
+            coversSeconds: insight.clipCoversSeconds,
+            playsSeconds: insight.clipPlaysSeconds,
+          ),
+      onBrowseClips: () => showClipsLibrarySheet(context, apiBase: _apiBase),
     );
   }
 

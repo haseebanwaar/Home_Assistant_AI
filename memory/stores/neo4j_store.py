@@ -806,13 +806,18 @@ class Neo4jStore:
         self.run(_MERGE_ROOM_CYPHER, **_room_params(room, _json))
         return self.get_room(room.room_id)
 
-    def ensure_agent_rooms(self, agents):
-        """Idempotently create/update the built-in personal-agent rooms."""
+    def ensure_agent_rooms(self, agents, start=10):
+        """Idempotently create/update the built-in personal-agent rooms.
+
+        `start` reserves a block of list positions for a group of rooms, so the
+        discussion rooms sit together after the nine instead of interleaving
+        with them.
+        """
         import json as _json
         from memory.models.room import Room
 
         rooms = []
-        for position, agent in enumerate(agents, start=10):
+        for position, agent in enumerate(agents, start=int(start)):
             room = Room(
                 room_id=agent.room_id, name=agent.name, kind="agent",
                 auto=True, description=agent.description,

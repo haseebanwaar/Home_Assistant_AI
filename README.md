@@ -90,7 +90,7 @@ Quran stays at 06:30. New automatic screen, camera, and mobile inference is also
 suppressed for the hour so it cannot compete for the model; manual user requests
 remain available. The reserved sequence is personal-memory deduplication at
 04:00, long-term graph consolidation at 04:05, verification of personal memory
-against the user's own reflection answers at 04:10, generation of twenty deep
+against the user's own reflection answers at 04:10, generation of an adaptive deep
 reflection questions at 04:25, and clip-retention cleanup at 04:45.
 
 #### When the PC was off at 04:00
@@ -171,9 +171,10 @@ PROJECT_DORMANT_DAYS=21
 `memory/refinement.py` conservatively merges near-identical personal facts while
 preserving evidence and never merging same-topic facts whose values differ.
 `agents/daily_reflection.py` stores the daily exercise and answers in SQLite.
-Generation uses adaptive thinking and validated structured output: exactly 20
-questions spanning projects, research, memory, personality, Quran, relationships
-and wider life. The dedicated Daily Reflection room lets the user answer
+Generation uses adaptive thinking and validated structured output: 8–20
+questions selected from whatever is genuinely alive in the evidence, with
+open-vocabulary category labels rather than a mandatory daily checklist. The
+dedicated Daily Reflection room lets the user answer
 throughout the day or generate manually if the overnight run was missed.
 
 ### Answers as ground truth
@@ -214,7 +215,7 @@ purpose, having spent real time on the question. They are treated accordingly.
 * **The loop closes.** The audit runs at 04:10, before the 04:25 generation, so
   the new set is built from memory the answers have already corrected and is
   told which beliefs are still unconfirmed — those get at least three of the
-  twenty questions. Prompts mark each fact `CONFIRMED`/`UNCONFIRMED`, the screen
+  daily question set. Prompts mark each fact `CONFIRMED`/`UNCONFIRMED`, the screen
   extractor is shown the confirmed set so it stops re-guessing it, and
   `GET /reflections/insights` reports what the answering has bought.
 
