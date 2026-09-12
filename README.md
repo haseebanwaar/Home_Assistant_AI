@@ -272,14 +272,20 @@ budget, and **Act** is intended for explicitly granted writable workspace tools.
 ```dotenv
 AGENT_RUNTIME_ENABLED=true
 ANTHROPIC_BASE_URL=http://localhost:8888
-ANTHROPIC_API_KEY=
+ANTHROPIC_API_KEY=local-gateway
 ANTHROPIC_MODEL=Qwen/Qwen3.6-35B-A3B
 MCP_CONFIG_PATH=./mcp.config.json
 AGENT_WORKSPACE_ROOT=C:/d/agent_workspaces
-RESEARCH_WORKSPACE=D:/research
+RESEARCH_WORKSPACE=D:/research_claude
 RESEARCH_AGENT_REQUEST_LIMIT=32
 RESEARCH_AGENT_TOOL_CALLS_LIMIT=64
 ```
+
+For a local/custom `ANTHROPIC_BASE_URL`, keep `ANTHROPIC_API_KEY` non-empty
+(the non-secret `local-gateway` placeholder is sufficient when the gateway does
+not enforce a key). Otherwise Claude Code falls back to its interactive OAuth
+session, which can expire even though the local gateway is healthy. The app also
+supplies this placeholder automatically when a custom base URL has no key.
 
 #### Tools
 
@@ -297,7 +303,10 @@ Rooms see two kinds of tool:
   Room settings, leave **Agent workspace folder** blank for an automatic private
   folder, enter a relative name under `AGENT_WORKSPACE_ROOT`, or enter an
   absolute path. `RESEARCH_WORKSPACE` gives the built-in Research agent a
-  dedicated durable location (the recommended Windows value is `D:/research`).
+  dedicated durable location (this installation uses `D:/research_claude`).
+  The Research room reads its manifest, living plan, paper library, and recent
+  artifact changes from that directory whenever the room opens or is refreshed,
+  so progress made by an external Claude Code session appears in the room.
   It bootstraps a numbered topic-to-submission timeline, literature folders for
   inbox/unread/reading/read/included/excluded/duplicate papers, canonical CSV
   search and screening logs, a living research plan, a proposal outline, and
@@ -410,6 +419,15 @@ $env:MCP_LIVE_TEST=1; python -m pytest tests/test_mcp_config.py
   in Settings and registered globally on desktop while the app is running;
   equivalent touch controls are shown in the Android UI.
 
+* **Bounded Android live sharing**
+  Phone camera and screen sharing can reduce each outgoing frame by 1x, 2x,
+  3x, or 5x in both dimensions. The choice is persisted on the phone. The Home
+  Hub holds compressed frames under simultaneous age, count, and byte limits;
+  spoken turns attach only a small recent sample and never retain image payloads
+  in conversation history. Configure the caps with `MOBILE_FRAME_BUFFER_MAX`,
+  `MOBILE_FRAME_BUFFER_MB`, `MOBILE_FRAME_BUFFER_SECONDS`, and
+  `MOBILE_LIVE_PROMPT_FRAMES`.
+
   Guided reflection adds nine configurable prompt shortcuts:
 
   * `Alt+Shift+1` — Do you agree?
@@ -436,3 +454,13 @@ $env:MCP_LIVE_TEST=1; python -m pytest tests/test_mcp_config.py
 | **VLM Engine** | Qwen3.6 35B-A3B (llama.cpp) | 2 min temporal image sequence per inference |
 | **ASR** | Parakeet / Whisper | Ultra-low latency / Multilingual |
 | **Memory** | Vector Store + Reranker | Full-day context retention |
+
+
+Daily learning rooms: Wisdom generates at 06:00 and Relation at 08:00 server local
+time (existing AGENT_CHECKIN_SCHEDULE overrides still apply). Keep the backend
+running with agent check-ins enabled. Each report is saved once per date in
+data/daily_lessons.sqlite3. High-effort writing is followed by full-archive
+novelty review across both rooms, with retries; rejected content is not published.
+The archive is retained indefinitely. Semantic novelty is model-reviewed, not a
+mathematical guarantee. Existing accessible messages and canvases are checked too.
+Risk Assessment is retired; startup removes its old room and private messages.

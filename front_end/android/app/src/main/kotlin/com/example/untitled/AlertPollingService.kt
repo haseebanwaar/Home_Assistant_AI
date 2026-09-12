@@ -19,6 +19,7 @@ class AlertPollingService : Service() {
     @Volatile private var apiBase = ""
     @Volatile private var eventNotifications = true
     @Volatile private var proactiveNotifications = false
+    @Volatile private var speechEnabled = true
     private var worker: Thread? = null
     private var textToSpeech: TextToSpeech? = null
     @Volatile private var ttsReady = false
@@ -58,6 +59,12 @@ class AlertPollingService : Service() {
         } else {
             proactiveNotifications =
                 prefs.getBoolean(KEY_PROACTIVE_NOTIFICATIONS, false)
+        }
+        if (intent?.hasExtra(EXTRA_SPEECH_ENABLED) == true) {
+            speechEnabled = intent.getBooleanExtra(EXTRA_SPEECH_ENABLED, true)
+            prefs.edit().putBoolean(KEY_SPEECH_ENABLED, speechEnabled).apply()
+        } else {
+            speechEnabled = prefs.getBoolean(KEY_SPEECH_ENABLED, true)
         }
         if (!eventNotifications && !proactiveNotifications) {
             stopSelf()
@@ -136,7 +143,7 @@ class AlertPollingService : Service() {
                     item.optString("body", ""),
                     item.optString("severity", "important"),
                 )
-                if (item.optBoolean("speak", false) && ttsReady) {
+                if (speechEnabled && item.optBoolean("speak", false) && ttsReady) {
                     val speech = item.optString("body", item.optString("title", ""))
                     textToSpeech?.speak(
                         speech,
@@ -193,6 +200,14 @@ class AlertPollingService : Service() {
                     item.optString("text", ""),
                     "proactive",
                 )
+                if (speechEnabled && ttsReady) {
+                    textToSpeech?.speak(
+                        item.optString("text", ""),
+                        TextToSpeech.QUEUE_ADD,
+                        null,
+                        "proactive-insight-$id",
+                    )
+                }
             }
             prefs.edit().putInt(sequenceKey, latest).apply()
         } finally {
@@ -237,12 +252,14 @@ class AlertPollingService : Service() {
         const val EXTRA_API_BASE = "api_base"
         const val EXTRA_EVENT_NOTIFICATIONS = "event_notifications"
         const val EXTRA_PROACTIVE_NOTIFICATIONS = "proactive_notifications"
+        const val EXTRA_SPEECH_ENABLED = "speech_enabled"
         private const val PREFS = "homemind_alerts"
         private const val KEY_API_BASE = "api_base"
         private const val KEY_SEQUENCE = "last_sequence"
         private const val KEY_PROACTIVE_SEQUENCE = "last_proactive_sequence"
         private const val KEY_EVENT_NOTIFICATIONS = "event_notifications"
         private const val KEY_PROACTIVE_NOTIFICATIONS = "proactive_notifications"
+        private const val KEY_SPEECH_ENABLED = "speech_enabled"
         private const val MONITOR_CHANNEL = "homemind_monitor"
         private const val MONITOR_NOTIFICATION_ID = 8200
         private const val POLL_INTERVAL_MS = 15_000L

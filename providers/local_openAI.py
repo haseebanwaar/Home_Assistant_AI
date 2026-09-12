@@ -1,3 +1,4 @@
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -10,6 +11,9 @@ from utils.jobs import VLM, describe_frames, jobs
 # model_name_vlm = client.models.list().data[0].id
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
 
 class _TrackedStream:
     """A streaming completion that keeps its job open until the tokens stop.
@@ -127,6 +131,43 @@ def thinking_request_kwargs(enabled=False, budget=None):
     if enabled and budget is not None and int(budget) >= 0:
         kwargs["extra_body"]["thinking_budget_tokens"] = int(budget)
     return kwargs
+
+
+async def complete_chat_text(client, *, model, messages, max_tokens,
+                             thinking=False, thinking_max_tokens=None,
+                             job_label=None):
+    """Return visible chat text, recovering from an empty thinking response.
+
+    A reasoning model can consume a small completion allowance entirely in its
+    hidden reasoning field and finish with empty ``content``.  Give thinking
+    requests their configured larger ceiling and, if the server still returns
+    no visible answer, retry once without thinking so an interactive action
+    does not fail intermittently.
+    """
+    normal_max = max(1, int(max_tokens))
+    thinking_max = max(normal_max, int(thinking_max_tokens or normal_max))
+
+    async def create(enable_thinking, token_limit, label):
+        response = await client.chat.completions.create(
+            job_label=label,
+            model=model,
+            messages=messages,
+            max_tokens=token_limit,
+            **thinking_request_kwargs(enable_thinking),
+        )
+        if not response.choices:
+            return ""
+        return (response.choices[0].message.content or "").strip()
+
+    text = await create(
+        thinking, thinking_max if thinking else normal_max, job_label)
+    if text or not thinking:
+        return text
+
+    logger.warning("%s returned no visible text; retrying without thinking",
+                   job_label or "Chat completion")
+    return await create(False, normal_max,
+                        f"{job_label} retry" if job_label else None)
 
 
 # Shared client for the main app loop and the (single) screen worker thread.

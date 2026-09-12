@@ -33,7 +33,16 @@ object CaptureBridge {
     }
 
     /** Emit a status snapshot to Flutter on the main thread. */
-    fun emitStatus(running: Boolean, source: String?, fps: Int, frames: Long, error: String?) {
+    fun emitStatus(
+        running: Boolean,
+        source: String?,
+        fps: Int,
+        frames: Long,
+        resizeFactor: Int,
+        width: Int,
+        height: Int,
+        error: String?,
+    ) {
         val sink = eventSink ?: return
         val payload = HashMap<String, Any?>()
         payload["type"] = "status"
@@ -41,6 +50,9 @@ object CaptureBridge {
         payload["source"] = source
         payload["fps"] = fps
         payload["frames"] = frames
+        payload["resizeFactor"] = resizeFactor
+        payload["width"] = width
+        payload["height"] = height
         payload["error"] = error
         main.post { eventSink?.success(payload) }
     }

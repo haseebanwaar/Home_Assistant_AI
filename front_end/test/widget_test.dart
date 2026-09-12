@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:untitled/main.dart';
 
@@ -51,6 +53,29 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
     expect(challengeAction, findsOneWidget);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Android capture restores the selected image reduction', (
+    WidgetTester tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    SharedPreferences.setMockInitialValues({'capture_resize_factor': 3});
+
+    await pumpAt(tester, const Size(390, 844));
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.tap(find.byIcon(Icons.menu_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Capture & privacy').last);
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('capture-resize-options')), findsOneWidget);
+    final selected = tester.widget<ChoiceChip>(
+      find.byKey(const ValueKey('capture-resize-3x')),
+    );
+    expect(selected.selected, isTrue);
+    expect(find.textContaining('9x fewer pixels'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    debugDefaultTargetPlatformOverride = null;
   });
 
   // The phone home screen used to fit everything on screen by squeezing it,

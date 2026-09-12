@@ -32,6 +32,10 @@ class Event(BaseModel):
     # separately in Neo4j so later observations cannot overwrite it.
     importance: float = Field(0.5, ge=0.0, le=1.0)
     confidence: float = Field(0.5, ge=0.0, le=1.0)
+    # Capture evidence for the newest window contributing to this event.  This
+    # is persisted on the graph event as well as in the clip sidecar so room
+    # feeds do not have to guess which footage belongs to an observation.
+    clip_id: Optional[str] = None
 
 
 class Session(BaseModel):

@@ -34,6 +34,7 @@ Future<void> main() async {
   // Must run before any Player is constructed, so clip playback works on the
   // desktop build.
   MediaKit.ensureInitialized();
+  await initializeJsonCache();
   await setupDesktopAlerts();
   runApp(const HomeMindApp());
 }
@@ -146,6 +147,7 @@ class _MyAppState extends State<MyApp> {
   static const _clipboardAnswerShortcutPreferenceKey =
       'clipboard_answer_shortcut';
   static const _clipboardAnswerPromptPreferenceKey = 'clipboard_answer_prompt';
+  static const _captureResizePreferenceKey = 'capture_resize_factor';
   static const _promptShortcutPreferencePrefix = 'reflection_prompt_shortcut_';
   static const _promptTextPreferencePrefix = 'reflection_prompt_text_';
   static const _shortcutThinkingPreferencePrefix = 'shortcut_thinking_';
@@ -276,6 +278,7 @@ class _MyAppState extends State<MyApp> {
   CaptureStatus _captureStatus = CaptureStatus.idle;
   CaptureSource _captureSource = CaptureSource.camera;
   bool _frontCamera = false;
+  int _captureResizeFactor = 1;
   final TextEditingController _fpsController = TextEditingController(text: '5');
 
   @override
@@ -288,6 +291,7 @@ class _MyAppState extends State<MyApp> {
     _loadShortcutPreferences();
     _loadPromptTexts();
     _loadClipboardAnswerPrompt();
+    _loadCaptureResizePreference();
     _captureSub = _capture.status.listen((s) {
       if (mounted) setState(() => _captureStatus = s);
     });
@@ -343,8 +347,9 @@ class _MyAppState extends State<MyApp> {
     if (apiBase.isEmpty || _kokoroVoiceLoading) return;
     _kokoroVoiceLoading = true;
     try {
-      final response = await http
-          .get(Uri.parse('$apiBase/settings/tts'))
+      final response = await cachedJsonGet(
+            Uri.parse('$apiBase/settings/tts'),
+          )
           .timeout(const Duration(seconds: 5));
       if (response.statusCode != 200) {
         throw Exception('TTS settings request returned ${response.statusCode}');
@@ -463,8 +468,9 @@ class _MyAppState extends State<MyApp> {
       setState(() => _captureSettingsLoading = true);
     }
     try {
-      final response = await http
-          .get(Uri.parse('$apiBase/settings/capture'))
+      final response = await cachedJsonGet(
+            Uri.parse('$apiBase/settings/capture'),
+          )
           .timeout(const Duration(seconds: 5));
       if (response.statusCode != 200) {
         throw Exception(
@@ -659,6 +665,22 @@ class _MyAppState extends State<MyApp> {
     });
   }
 
+  Future<void> _loadCaptureResizePreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getInt(_captureResizePreferenceKey) ?? 1;
+    if (!mounted) return;
+    setState(() {
+      _captureResizeFactor = const [1, 2, 3, 5].contains(saved) ? saved : 1;
+    });
+  }
+
+  Future<void> _setCaptureResizeFactor(int factor) async {
+    if (!const [1, 2, 3, 5].contains(factor)) return;
+    setState(() => _captureResizeFactor = factor);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_captureResizePreferenceKey, factor);
+  }
+
   /// The wording a preset sends: the user's edit when there is one, else the
   /// prompt it shipped with.
   String _promptTextFor(ReflectionPromptPreset preset) {
@@ -832,7 +854,20 @@ class _MyAppState extends State<MyApp> {
       _apiBase,
       eventNotifications: events,
       proactiveNotifications: proactive,
+      speechEnabled: _proactiveVoiceEnabled,
     );
+  }
+
+  String get _audioDeliveryDeviceLabel {
+    if (kIsWeb) return 'this browser';
+    return switch (defaultTargetPlatform) {
+      TargetPlatform.android => 'this Android device',
+      TargetPlatform.windows => 'this Windows app',
+      TargetPlatform.iOS => 'this iPhone or iPad',
+      TargetPlatform.macOS => 'this Mac app',
+      TargetPlatform.linux => 'this Linux app',
+      TargetPlatform.fuchsia => 'this device',
+    };
   }
 
   @override
@@ -1559,8 +1594,9 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<List<_ReflectionSourceOption>> _reflectionSources() async {
-    final response = await http
-        .get(Uri.parse('$_apiBase/reflect/sources'))
+    final response = await cachedJsonGet(
+          Uri.parse('$_apiBase/reflect/sources'),
+        )
         .timeout(const Duration(seconds: 5));
     if (response.statusCode != 200) {
       throw Exception('backend returned ${response.statusCode}');
@@ -1998,7 +2034,8 @@ class _MyAppState extends State<MyApp> {
               '${item['body'] ?? ''}',
             );
           }
-          if (item['speak'] == true &&
+          if (_proactiveVoiceEnabled &&
+              item['speak'] == true &&
               defaultTargetPlatform != TargetPlatform.android) {
             try {
               final audio = await http
@@ -2164,6 +2201,7 @@ class _MyAppState extends State<MyApp> {
         fps: _fps,
         apiBase: _apiBase,
         frontCamera: _frontCamera,
+        resizeFactor: _captureResizeFactor,
       );
       final index = _captureSource == CaptureSource.camera ? 2 : 1;
       if (mounted)
@@ -2489,6 +2527,43 @@ class _MyAppState extends State<MyApp> {
               ],
             ],
           ),
+          const SizedBox(height: 8),
+          Column(
+            children: [
+              const Text(
+                'Image reduction',
+                style: TextStyle(fontSize: 12, color: _muted),
+              ),
+              const SizedBox(height: 4),
+              Wrap(
+                key: const Key('capture-resize-options'),
+                alignment: WrapAlignment.center,
+                spacing: 6,
+                runSpacing: 4,
+                children: [
+                  for (final factor in const [1, 2, 3, 5])
+                    ChoiceChip(
+                      key: ValueKey('capture-resize-${factor}x'),
+                      label: Text('${factor}x'),
+                      selected: _captureResizeFactor == factor,
+                      onSelected:
+                          running
+                              ? null
+                              : (_) => _setCaptureResizeFactor(factor),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 3),
+              Text(
+                _captureResizeFactor == 1
+                    ? 'Original capture size'
+                    : 'Width and height divided by $_captureResizeFactor '
+                        '(${_captureResizeFactor * _captureResizeFactor}x fewer pixels)',
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 10, color: _muted),
+              ),
+            ],
+          ),
           const SizedBox(height: 4),
           GestureDetector(
             onTap: running ? _stopCapture : _startCapture,
@@ -2513,6 +2588,12 @@ class _MyAppState extends State<MyApp> {
                 : 'Idle (runs in background when minimized)',
             style: const TextStyle(fontSize: 11, color: _muted),
           ),
+          if (running)
+            Text(
+              '${_captureStatus.resizeFactor}x reduction'
+              '${_captureStatus.width > 0 ? ' Â· ${_captureStatus.width}x${_captureStatus.height}' : ''}',
+              style: const TextStyle(fontSize: 10, color: _muted),
+            ),
           if (_captureStatus.error != null)
             Padding(
               padding: const EdgeInsets.only(top: 2.0),
@@ -3221,17 +3302,15 @@ class _MyAppState extends State<MyApp> {
                             ),
                             const Divider(height: 1, color: _line),
                             toggle(
-                              icon: Icons.volume_up_outlined,
-                              title: 'Speak insights',
+                              icon: Icons.speaker_phone_outlined,
+                              title: 'Play audio on $_audioDeliveryDeviceLabel',
                               subtitle:
-                                  'Play proactive insights aloud using TTS.',
+                                  'Route proactive insights, reflections, and spoken reminders to this installation. Set this separately on Windows and Android to choose one device or both.',
                               value: _proactiveVoiceEnabled,
                               onChanged:
-                                  proactiveControlsEnabled
-                                      ? (value) => update(
-                                        () => _proactiveVoiceEnabled = value,
-                                      )
-                                      : null,
+                                  (value) => update(
+                                    () => _proactiveVoiceEnabled = value,
+                                  ),
                             ),
                             toggle(
                               icon: Icons.chat_bubble_outline,
@@ -3686,7 +3765,10 @@ class _MyAppState extends State<MyApp> {
               _buildToggleSwitch(
                 'Conversation',
                 _isTalking,
-                (v) => setState(() => _isTalking = v),
+                (v) => setState(() {
+                  _isTalking = v;
+                  if (v) _conversationThinking = false;
+                }),
               ),
               _buildToggleSwitch('Live', _isLive, (v) {
                 if (v && _currentContext == 'talker') {
@@ -3701,9 +3783,13 @@ class _MyAppState extends State<MyApp> {
                 (v) => setState(() => _useMemory = v),
               ),
               _buildToggleSwitch(
-                'Thinking',
+                _isTalking ? 'Short dialogue' : 'Thinking',
                 _conversationThinking,
-                (v) => setState(() => _conversationThinking = v),
+                _isTalking
+                    ? (_) => _showSnack(
+                      'Conversation mode uses quick, short dialogue',
+                    )
+                    : (v) => setState(() => _conversationThinking = v),
               ),
             ],
           ),
@@ -3797,7 +3883,10 @@ class _MyAppState extends State<MyApp> {
               _buildToggleSwitch(
                 'Talk',
                 _isTalking,
-                (v) => setState(() => _isTalking = v),
+                (v) => setState(() {
+                  _isTalking = v;
+                  if (v) _conversationThinking = false;
+                }),
               ),
               _buildToggleSwitch('Live', _isLive, (v) {
                 if (v && _currentContext == 'talker') {
@@ -3812,9 +3901,12 @@ class _MyAppState extends State<MyApp> {
                 (v) => setState(() => _useMemory = v),
               ),
               _buildToggleSwitch(
-                'Thinking',
+                _isTalking ? 'Short dialogue' : 'Thinking',
                 _conversationThinking,
-                (v) => setState(() => _conversationThinking = v),
+                _isTalking
+                    ? (_) =>
+                        _showSnack('Talk mode keeps replies short and quick')
+                    : (v) => setState(() => _conversationThinking = v),
               ),
             ],
           ),

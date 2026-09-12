@@ -31,10 +31,11 @@ class MainActivity : FlutterActivity() {
                         val fps = call.argument<Int>("fps") ?: 5
                         val url = call.argument<String>("url") ?: ""
                         val lens = call.argument<String>("lens") ?: "back"
+                        val resizeFactor = call.argument<Int>("resizeFactor") ?: 1
                         if (source == "screen" && !CaptureBridge.hasProjectionConsent()) {
                             result.error("NO_CONSENT", "Screen capture not authorized", null)
                         } else {
-                            startCapture(source, fps, url, lens)
+                            startCapture(source, fps, url, lens, resizeFactor)
                             result.success(true)
                         }
                     }
@@ -78,6 +79,8 @@ class MainActivity : FlutterActivity() {
                             call.argument<Boolean>("eventNotifications") ?: true
                         val proactiveNotifications =
                             call.argument<Boolean>("proactiveNotifications") ?: false
+                        val speechEnabled =
+                            call.argument<Boolean>("speechEnabled") ?: true
                         val intent = Intent(this, AlertPollingService::class.java).apply {
                             putExtra(AlertPollingService.EXTRA_API_BASE, apiBase)
                             putExtra(
@@ -87,6 +90,10 @@ class MainActivity : FlutterActivity() {
                             putExtra(
                                 AlertPollingService.EXTRA_PROACTIVE_NOTIFICATIONS,
                                 proactiveNotifications,
+                            )
+                            putExtra(
+                                AlertPollingService.EXTRA_SPEECH_ENABLED,
+                                speechEnabled,
                             )
                         }
                         ContextCompat.startForegroundService(this, intent)
@@ -111,13 +118,20 @@ class MainActivity : FlutterActivity() {
             })
     }
 
-    private fun startCapture(source: String, fps: Int, url: String, lens: String) {
+    private fun startCapture(
+        source: String,
+        fps: Int,
+        url: String,
+        lens: String,
+        resizeFactor: Int,
+    ) {
         val intent = Intent(this, CaptureService::class.java).apply {
             action = CaptureService.ACTION_START
             putExtra(CaptureService.EXTRA_SOURCE, source)
             putExtra(CaptureService.EXTRA_FPS, fps)
             putExtra(CaptureService.EXTRA_URL, url)
             putExtra(CaptureService.EXTRA_LENS, lens)
+            putExtra(CaptureService.EXTRA_RESIZE_FACTOR, resizeFactor)
         }
         ContextCompat.startForegroundService(this, intent)
     }

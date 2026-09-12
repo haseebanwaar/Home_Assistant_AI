@@ -59,6 +59,7 @@ class CaptureService : Service() {
         const val EXTRA_FPS = "fps"              // Int
         const val EXTRA_URL = "url"              // String, e.g. http://ip:8000/capture/frame
         const val EXTRA_LENS = "lens"            // "back" | "front"
+        const val EXTRA_RESIZE_FACTOR = "resize_factor" // 1 | 2 | 3 | 5
 
         private const val CHANNEL_ID = "frame_capture"
         private const val NOTIFICATION_ID = 42
@@ -72,6 +73,9 @@ class CaptureService : Service() {
     @Volatile private var targetFps: Int = 5
     @Volatile private var endpointUrl: String = ""
     @Volatile private var lens: String = "back"
+    @Volatile private var resizeFactor: Int = 1
+    @Volatile private var outputWidth: Int = 0
+    @Volatile private var outputHeight: Int = 0
 
     private val frameCount = AtomicLong(0)
     @Volatile private var lastSentMs: Long = 0
@@ -116,6 +120,9 @@ class CaptureService : Service() {
                 targetFps = intent.getIntExtra(EXTRA_FPS, 5).coerceIn(1, 60)
                 endpointUrl = intent.getStringExtra(EXTRA_URL) ?: ""
                 lens = intent.getStringExtra(EXTRA_LENS) ?: "back"
+                resizeFactor = normalizeResizeFactor(
+                    intent.getIntExtra(EXTRA_RESIZE_FACTOR, 1),
+                )
                 startCapture()
                 return START_STICKY
             }
@@ -128,6 +135,8 @@ class CaptureService : Service() {
         if (isRunning) stopCapture()
         lastError = null
         frameCount.set(0)
+        outputWidth = 0
+        outputHeight = 0
         startForegroundWithType()
 
         captureThread = HandlerThread("capture").also { it.start() }
@@ -279,9 +288,13 @@ class CaptureService : Service() {
         val scale = maxOf(w, h).let { if (it > maxDim) maxDim.toFloat() / it else 1f }
         w = (w * scale).toInt().coerceAtLeast(2)
         h = (h * scale).toInt().coerceAtLeast(2)
+        w = (w / resizeFactor).coerceAtLeast(2)
+        h = (h / resizeFactor).coerceAtLeast(2)
         // Round to even dimensions.
         if (w % 2 == 1) w -= 1
         if (h % 2 == 1) h -= 1
+        outputWidth = w
+        outputHeight = h
 
         screenReader = ImageReader.newInstance(w, h, android.graphics.PixelFormat.RGBA_8888, 2).apply {
             setOnImageAvailableListener({ reader ->
@@ -371,7 +384,16 @@ class CaptureService : Service() {
     }
 
     private fun emit() {
-        CaptureBridge.emitStatus(isRunning, if (isRunning) source else null, targetFps, frameCount.get(), lastError)
+        CaptureBridge.emitStatus(
+            isRunning,
+            if (isRunning) source else null,
+            targetFps,
+            frameCount.get(),
+            resizeFactor,
+            outputWidth,
+            outputHeight,
+            lastError,
+        )
     }
 
     // --- Encoding helpers ---------------------------------------------------
@@ -382,8 +404,12 @@ class CaptureService : Service() {
         val jpeg = ByteArrayOutputStream()
         if (!yuv.compressToJpeg(Rect(0, 0, image.width, image.height), 70, jpeg)) return null
         val bytes = jpeg.toByteArray()
-        // Rotate to upright if needed.
-        return if (sensorOrientation % 360 != 0) rotateJpeg(bytes, sensorOrientation, lens == "front") else bytes
+        return transformJpeg(
+            bytes,
+            sensorOrientation,
+            lens == "front",
+            resizeFactor,
+        )
     }
 
     private fun yuv420ToNv21(image: Image): ByteArray {
@@ -441,32 +467,75 @@ class CaptureService : Service() {
         bitmap.copyPixelsFromBuffer(buffer)
         val cropped = if (rowPadding == 0) bitmap
             else Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
+        // Screen capture already reduced its VirtualDisplay dimensions.
+        val encodingFactor = if (source == "screen") 1 else resizeFactor
+        val targetWidth = (cropped.width / encodingFactor).coerceAtLeast(2)
+        val targetHeight = (cropped.height / encodingFactor).coerceAtLeast(2)
+        val scaled = if (encodingFactor > 1) {
+            Bitmap.createScaledBitmap(cropped, targetWidth, targetHeight, true)
+        } else {
+            cropped
+        }
+        outputWidth = scaled.width
+        outputHeight = scaled.height
         val out = ByteArrayOutputStream()
-        cropped.compress(Bitmap.CompressFormat.JPEG, 60, out)
-        if (cropped != bitmap) cropped.recycle()
+        scaled.compress(Bitmap.CompressFormat.JPEG, 60, out)
+        if (scaled !== cropped) scaled.recycle()
+        if (cropped !== bitmap) cropped.recycle()
         bitmap.recycle()
         return out.toByteArray()
     }
 
-    private fun rotateJpeg(jpeg: ByteArray, degrees: Int, mirror: Boolean): ByteArray {
+    private fun transformJpeg(
+        jpeg: ByteArray,
+        degrees: Int,
+        mirror: Boolean,
+        factor: Int,
+    ): ByteArray {
+        if (degrees % 360 == 0 && !mirror && factor == 1) {
+            val bounds = android.graphics.BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
+            outputWidth = bounds.outWidth
+            outputHeight = bounds.outHeight
+            return jpeg
+        }
         val src = android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return jpeg
         val matrix = android.graphics.Matrix()
         matrix.postRotate(degrees.toFloat())
         if (mirror) matrix.postScale(-1f, 1f)
-        val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+        val oriented = if (degrees % 360 != 0 || mirror) {
+            Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+        } else {
+            src
+        }
+        val targetWidth = (oriented.width / factor).coerceAtLeast(2)
+        val targetHeight = (oriented.height / factor).coerceAtLeast(2)
+        val resized = if (factor > 1) {
+            Bitmap.createScaledBitmap(oriented, targetWidth, targetHeight, true)
+        } else {
+            oriented
+        }
+        outputWidth = resized.width
+        outputHeight = resized.height
         val out = ByteArrayOutputStream()
-        rotated.compress(Bitmap.CompressFormat.JPEG, 70, out)
-        if (rotated != src) rotated.recycle()
+        resized.compress(Bitmap.CompressFormat.JPEG, 70, out)
+        if (resized !== oriented) resized.recycle()
+        if (oriented !== src) oriented.recycle()
         src.recycle()
         return out.toByteArray()
     }
+
+    private fun normalizeResizeFactor(value: Int): Int =
+        if (value in listOf(1, 2, 3, 5)) value else 1
 
     // --- Foreground notification -------------------------------------------
     private fun startForegroundWithType() {
         createChannel()
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Frame capture running")
-            .setContentText("Streaming $source frames")
+            .setContentText("Streaming $source frames at ${resizeFactor}x reduction")
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setOngoing(true)
             .build()

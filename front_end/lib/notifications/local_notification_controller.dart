@@ -3,8 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 class LocalNotificationController {
-  static const _channel =
-      MethodChannel('com.example.untitled/notifications');
+  static const _channel = MethodChannel('com.example.untitled/notifications');
 
   bool get isSupported =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
@@ -30,9 +29,10 @@ class LocalNotificationController {
     String apiBase, {
     required bool eventNotifications,
     required bool proactiveNotifications,
+    required bool speechEnabled,
   }) async {
     final signature =
-        '$apiBase|events=$eventNotifications|proactive=$proactiveNotifications';
+        '$apiBase|events=$eventNotifications|proactive=$proactiveNotifications|speech=$speechEnabled';
     if (!isSupported || apiBase.isEmpty || _monitoringSignature == signature) {
       return;
     }
@@ -41,6 +41,7 @@ class LocalNotificationController {
       'apiBase': apiBase,
       'eventNotifications': eventNotifications,
       'proactiveNotifications': proactiveNotifications,
+      'speechEnabled': speechEnabled,
     });
     _monitoringSignature = signature;
     _monitoringStateKnown = true;

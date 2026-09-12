@@ -14,6 +14,9 @@ class CaptureStatus {
   final String? source; // "camera" | "screen" | null
   final int fps;
   final int frames; // frames successfully POSTed
+  final int resizeFactor;
+  final int width;
+  final int height;
   final String? error;
 
   const CaptureStatus({
@@ -21,6 +24,9 @@ class CaptureStatus {
     required this.source,
     required this.fps,
     required this.frames,
+    required this.resizeFactor,
+    required this.width,
+    required this.height,
     required this.error,
   });
 
@@ -29,16 +35,22 @@ class CaptureStatus {
     source: null,
     fps: 0,
     frames: 0,
+    resizeFactor: 1,
+    width: 0,
+    height: 0,
     error: null,
   );
 
   factory CaptureStatus.fromMap(Map<dynamic, dynamic> m) => CaptureStatus(
-        running: m['running'] == true,
-        source: m['source'] as String?,
-        fps: (m['fps'] as num?)?.toInt() ?? 0,
-        frames: (m['frames'] as num?)?.toInt() ?? 0,
-        error: m['error'] as String?,
-      );
+    running: m['running'] == true,
+    source: m['source'] as String?,
+    fps: (m['fps'] as num?)?.toInt() ?? 0,
+    frames: (m['frames'] as num?)?.toInt() ?? 0,
+    resizeFactor: (m['resizeFactor'] as num?)?.toInt() ?? 1,
+    width: (m['width'] as num?)?.toInt() ?? 0,
+    height: (m['height'] as num?)?.toInt() ?? 0,
+    error: m['error'] as String?,
+  );
 }
 
 /// Dart-side wrapper around the native Android capture foreground service.
@@ -98,7 +110,9 @@ class FrameCaptureController {
       return true;
     } else {
       // Screen capture consent is handled by the native MediaProjection dialog.
-      final granted = await _method.invokeMethod<bool>('requestScreenPermission');
+      final granted = await _method.invokeMethod<bool>(
+        'requestScreenPermission',
+      );
       return granted == true;
     }
   }
@@ -109,6 +123,7 @@ class FrameCaptureController {
     required int fps,
     required String apiBase,
     bool frontCamera = false,
+    int resizeFactor = 1,
   }) async {
     if (!_supported) return;
     await _method.invokeMethod('start', {
@@ -116,6 +131,8 @@ class FrameCaptureController {
       'fps': fps.clamp(1, 60),
       'url': endpointFor(apiBase),
       'lens': frontCamera ? 'front' : 'back',
+      'resizeFactor':
+          const [1, 2, 3, 5].contains(resizeFactor) ? resizeFactor : 1,
     });
   }
 

@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
+import '../network/cached_http.dart' as http;
 
 import '../clips/clip_viewer.dart';
 import '../network/http_json.dart';

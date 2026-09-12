@@ -437,6 +437,11 @@ class CameraCaptureWorker:
             try:
                 self.clip_store.annotate(
                     clip_id, event_id=ingested.current_event.event_id)
+                # Normal/high camera observations are exactly the entries shown
+                # in the room's Useful view. Protect their evidence from the
+                # size-cap eviction pass as soon as the event is classified.
+                if ingested.current_event.importance >= 0.3:
+                    self.clip_store.pin(clip_id)
             except Exception as exc:
                 logger.debug("Could not annotate clip %s: %s", clip_id, exc)
         if self.insight_callback is not None and full_summary:

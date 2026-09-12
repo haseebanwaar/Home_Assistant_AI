@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
+import '../network/cached_http.dart' as http;
 
 import '../calendar/calendar_screen.dart';
 import '../voice/dictation_controller.dart';
@@ -9,7 +9,6 @@ import '../network/http_json.dart';
 import 'horizons_screen.dart';
 import 'quran_room_screen.dart';
 import 'research_room_screen.dart';
-import 'room_arc_screen.dart';
 import 'room_hygiene_sheet.dart';
 import 'room_shell.dart';
 import 'theme.dart';
@@ -17,6 +16,7 @@ import 'tomorrow_plan_screen.dart';
 import 'personal_agent_room_screens.dart';
 import 'daily_reflection_screen.dart';
 import '../widgets/rich_content.dart';
+import '../clips/clip_viewer.dart';
 
 const _ink = Color(0xFF070B14);
 const _panel = Color(0xFF111827);
@@ -196,11 +196,11 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
             )
             .then((_) => _load());
         return;
-      case 'agent:motivational':
+      case 'agent:relation':
         Navigator.of(context)
             .push(
               MaterialPageRoute(
-                builder: (_) => MotivationalRoomScreen(apiBase: widget.apiBase),
+                builder: (_) => RelationRoomScreen(apiBase: widget.apiBase),
               ),
             )
             .then((_) => _load());
@@ -319,18 +319,20 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
         final status = decodeJsonResponse(response) as Map<String, dynamic>;
         runtimeEnabled = status['enabled'] == true;
         final isResearch = room?['room_id'] == 'agent:research';
+        final requestLimitKey =
+            isResearch
+                ? 'research_request_limit'
+
+                : 'request_limit';
+        final toolLimitKey =
+            isResearch
+                ? 'research_tool_calls_limit'
+
+                : 'tool_calls_limit';
         defaultRequestLimit =
-            (status[isResearch ? 'research_request_limit' : 'request_limit']
-                    as num?)
-                ?.toInt() ??
-            defaultRequestLimit;
+            (status[requestLimitKey] as num?)?.toInt() ?? defaultRequestLimit;
         defaultToolCallsLimit =
-            (status[isResearch
-                        ? 'research_tool_calls_limit'
-                        : 'tool_calls_limit']
-                    as num?)
-                ?.toInt() ??
-            defaultToolCallsLimit;
+            (status[toolLimitKey] as num?)?.toInt() ?? defaultToolCallsLimit;
         availableTools =
             ((status['available_tools'] as List?) ?? [])
                 .whereType<Map>()
@@ -380,8 +382,10 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     );
     var executionProfile =
         (room?['execution_profile'] ?? 'investigate').toString();
+    final isolatesPrivateMemory =
+        room?['room_id']?.toString() == 'agent:hard-questions';
     final selectedTools = <String>{
-      'graph',
+      if (!isolatesPrivateMemory) 'graph',
       ...((room?['agent_tools'] as List?) ?? []).map((item) => item.toString()),
     };
     final isNew = room == null;
@@ -443,6 +447,7 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
                                 (selection) => setDialogState(() {
                                   executionProfile = selection.first;
                                   if (selectedTools.isEmpty &&
+                                      !isolatesPrivateMemory &&
                                       availableTools.any(
                                         (tool) => tool['id'] == 'graph',
                                       )) {
@@ -506,7 +511,9 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
                             ),
                             const SizedBox(height: 3),
                             Text(
-                              runtimeEnabled
+                              isolatesPrivateMemory
+                                  ? 'Big Question is browser-only. App data, graph and other memory tools are blocked.'
+                                  : runtimeEnabled
                                   ? 'Only selected toolsets are opened for this room.'
                                   : 'Agent runtime is disabled on the server; selections will be saved.',
                               style: const TextStyle(
@@ -525,7 +532,11 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
                                 spacing: 7,
                                 runSpacing: 7,
                                 children: [
-                                  for (final tool in availableTools)
+                                  for (final tool in availableTools.where(
+                                    (tool) =>
+                                        !isolatesPrivateMemory ||
+                                        tool['id'] == 'mcp:browser',
+                                  ))
                                     FilterChip(
                                       selected: selectedTools.contains(
                                         tool['id'],
@@ -674,14 +685,6 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
     final id = room['room_id'].toString();
     try {
       if (action == 'edit') return _editRoom(room);
-      if (action == 'arc') {
-        return openRoomArc(
-          context,
-          apiBase: widget.apiBase,
-          roomId: id,
-          roomName: (room['name'] ?? id).toString(),
-        );
-      }
       if (action == 'archive') {
         await http.patch(
           Uri.parse('${widget.apiBase}/rooms/$id'),
@@ -863,10 +866,6 @@ class _RoomsListScreenState extends State<RoomsListScreen> {
               onSelected: (value) => _roomAction(value, room),
               itemBuilder:
                   (_) => [
-                    const PopupMenuItem(
-                      value: 'arc',
-                      child: Text('Arc — week by week'),
-                    ),
                     const PopupMenuItem(value: 'edit', child: Text('Edit')),
                     PopupMenuItem(
                       value: 'pin',
@@ -957,37 +956,20 @@ const _forumActions = <String, _ForumActions>{
   ),
   'agent:hard-questions': _ForumActions(
     id: 'hard-questions',
-    name: 'Hard Questions',
-    runTooltip: 'Hold a Hard Questions session now',
+    name: 'Big Question',
+    runTooltip: 'Continue the Big Question conversation now',
     runQuestion:
-        'Take up the last Hard Questions session again in light of my feedback in this room.',
-    topicTooltip: 'Set what Hard Questions discusses on a coming night',
-    topicTitle: 'Set a Hard Questions topic',
-    topicLabel: 'What should the room argue that night?',
+        'Continue the Big Question conversation from the latest user message.',
+    topicTooltip: 'Set what Big Question discusses next',
+    topicTitle: 'Set a Big Question topic',
+    topicLabel: 'What should the room discuss?',
     topicHint:
         'For example: existential crisis — whether meaning is found or made, and what that asks of me.',
-    followupTooltip: 'Schedule a Hard Questions follow-up',
-    followupTitle: 'Schedule Hard Questions follow-up',
+    followupTooltip: 'Schedule a Big Question follow-up',
+    followupTitle: 'Schedule Big Question follow-up',
     followupLabel: 'What should the room take up?',
     followupHint:
         'For example: press harder on where the Islamic and Western answers actually part ways.',
-  ),
-  'agent:risk-assessment': _ForumActions(
-    id: 'risk-assessment',
-    name: 'Risk Assessment',
-    runTooltip: 'Run a Risk Assessment now',
-    runQuestion:
-        'Update the risk picture in light of my feedback in this room.',
-    topicTooltip: 'Set what Risk Assessment examines on a coming night',
-    topicTitle: 'Set a Risk Assessment topic',
-    topicLabel: 'What should the room assess that night?',
-    topicHint:
-        'For example: what AI coding tools do to the job market I am actually aiming at.',
-    followupTooltip: 'Schedule a Risk Assessment follow-up',
-    followupTitle: 'Schedule Risk Assessment follow-up',
-    followupLabel: 'What should the room assess?',
-    followupHint:
-        'For example: how exposed my savings and my field are if the funding climate turns.',
   ),
 };
 
@@ -1027,6 +1009,7 @@ class _RoomScreenState extends State<RoomScreen> {
   String? _date;
   String _eventView = 'useful'; // useful | all | high | low | flagged
   final Set<String> _kinds = {'event', 'note', 'message'};
+  final Set<String> _openEventClips = {};
   List<dynamic> _feed = []; // chronological (oldest -> newest)
 
   // -- scope: what the feed shows and what a question is answered from --------
@@ -1040,6 +1023,7 @@ class _RoomScreenState extends State<RoomScreen> {
   // Answer from the current camera/screen frame buffers as well as from memory.
   bool _live = false;
   bool _thinking = false;
+  Timer? _forumRefresh;
 
   bool get _isDaily => widget.kind == 'daily';
   bool get _isAgent => widget.kind == 'agent';
@@ -1123,6 +1107,17 @@ class _RoomScreenState extends State<RoomScreen> {
     }
     _load();
     if (_isSourceRoom) _loadSources();
+    if (widget.roomId == 'agent:hard-questions') {
+      _forumRefresh = Timer.periodic(
+        const Duration(seconds: 10),
+        // Keep the live conversation current without yanking someone away
+        // from an older message they are reading.
+        (_) =>
+            mounted && !_loading && !_sending
+                ? _load(scrollToBottom: false)
+                : null,
+      );
+    }
   }
 
   @override
@@ -1131,6 +1126,7 @@ class _RoomScreenState extends State<RoomScreen> {
     _search.dispose();
     _scroll.dispose();
     _dictation.dispose();
+    _forumRefresh?.cancel();
     super.dispose();
   }
 
@@ -1195,7 +1191,7 @@ class _RoomScreenState extends State<RoomScreen> {
     }
   }
 
-  Future<void> _load() async {
+  Future<void> _load({bool scrollToBottom = true}) async {
     setState(() {
       _loading = true;
       _error = null;
@@ -1222,7 +1218,7 @@ class _RoomScreenState extends State<RoomScreen> {
         final data = decodeJsonResponse(resp) as Map<String, dynamic>;
         final feed = (data['feed'] as List?) ?? [];
         setState(() => _feed = feed.reversed.toList()); // newest at bottom
-        _jumpToBottom();
+        if (scrollToBottom) _jumpToBottom();
       } else {
         setState(() => _error = 'HTTP ${resp.statusCode}');
       }
@@ -1507,6 +1503,84 @@ class _RoomScreenState extends State<RoomScreen> {
     }
   }
 
+  Future<void> _resetBigQuestion(_ForumActions forum) async {
+    final topic = TextEditingController();
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder:
+          (dialogContext) => StatefulBuilder(
+            builder:
+                (context, setDialogState) => AlertDialog(
+                  title: const Text('Reset Big Question'),
+                  content: SizedBox(
+                    width: 480,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'This removes the room’s previous conversation, '
+                          'sessions, scheduled follow-ups, and queued topics.',
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: topic,
+                          autofocus: true,
+                          minLines: 3,
+                          maxLines: 7,
+                          onChanged: (_) => setDialogState(() {}),
+                          decoration: const InputDecoration(
+                            labelText: 'New topic',
+                            hintText:
+                                'What should the five voices discuss now?',
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(dialogContext, false),
+                      child: const Text('Cancel'),
+                    ),
+                    FilledButton(
+                      onPressed:
+                          topic.text.trim().isEmpty
+                              ? null
+                              : () => Navigator.pop(dialogContext, true),
+                      child: const Text('Reset and start'),
+                    ),
+                  ],
+                ),
+          ),
+    );
+    if (accepted != true) {
+      topic.dispose();
+      return;
+    }
+    setState(() => _sending = true);
+    try {
+      final resp = await http
+          .post(
+            Uri.parse('${widget.apiBase}/forums/${forum.id}/reset'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode({'topic': topic.text.trim()}),
+          )
+          .timeout(const Duration(seconds: 20));
+      if (resp.statusCode == 202) {
+        await _load();
+        _snack('Old conversation removed. The new topic is starting.');
+      } else {
+        _snack('Could not reset ${forum.name}: HTTP ${resp.statusCode}');
+      }
+    } catch (e) {
+      _snack('Could not reset ${forum.name}: $e');
+    } finally {
+      topic.dispose();
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
   /// Set what a room will discuss on a coming night.
   ///
   /// Deliberately not a follow-up: this topic is carried *into* the routine
@@ -1562,7 +1636,11 @@ class _RoomScreenState extends State<RoomScreen> {
                             final date = await showDatePicker(
                               context: context,
                               initialDate: night,
-                              firstDate: DateTime(today.year, today.month, today.day),
+                              firstDate: DateTime(
+                                today.year,
+                                today.month,
+                                today.day,
+                              ),
                               lastDate: DateTime.now().add(
                                 const Duration(days: 730),
                               ),
@@ -1814,6 +1892,12 @@ class _RoomScreenState extends State<RoomScreen> {
             icon: const Icon(Icons.event_repeat, color: _violet),
             onPressed: _sending ? null : () => _scheduleForumFollowup(_forum!),
           ),
+          if (widget.roomId == 'agent:hard-questions')
+            IconButton(
+              tooltip: 'Reset conversation and start a new topic',
+              icon: const Icon(Icons.restart_alt, color: Color(0xFFF97362)),
+              onPressed: _sending ? null : () => _resetBigQuestion(_forum!),
+            ),
         ],
         if (_isCreativeCoach)
           IconButton(
@@ -2292,6 +2376,10 @@ class _RoomScreenState extends State<RoomScreen> {
   Widget _eventCard(Map<String, dynamic> it, String text) {
     final priority = (it['priority'] ?? 'normal').toString();
     final flagged = it['flagged'] == true;
+    final clip =
+        it['clip'] is Map ? Map<String, dynamic>.from(it['clip'] as Map) : null;
+    final clipId = (it['clip_id'] ?? '').toString();
+    final clipOpen = clipId.isNotEmpty && _openEventClips.contains(clipId);
     final priorityColor =
         priority == 'high'
             ? const Color(0xFFFFC857)
@@ -2447,6 +2535,40 @@ class _RoomScreenState extends State<RoomScreen> {
               'Reason: ${it['flag_reason']}',
               style: const TextStyle(color: Color(0xFFFFA0B8), fontSize: 11.5),
             ),
+          ],
+          if (_isCameraRoom && clipId.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            TextButton.icon(
+              key: ValueKey('camera-event-clip-${it['event_id']}'),
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xFFF59E0B),
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              onPressed:
+                  () => setState(() {
+                    clipOpen
+                        ? _openEventClips.remove(clipId)
+                        : _openEventClips.add(clipId);
+                  }),
+              icon: Icon(
+                clipOpen ? Icons.visibility_off : Icons.play_circle_outline,
+                size: 17,
+              ),
+              label: Text(clipOpen ? 'Hide clip' : 'Watch clip'),
+            ),
+            if (clipOpen)
+              Padding(
+                padding: const EdgeInsets.only(top: 8, right: 6),
+                child: ClipViewer(
+                  key: ValueKey('camera-clip-viewer-$clipId'),
+                  apiBase: widget.apiBase,
+                  clipId: clipId,
+                  coversSeconds: (clip?['covers_seconds'] as num?)?.toDouble(),
+                  playsSeconds: (clip?['plays_seconds'] as num?)?.toDouble(),
+                ),
+              ),
           ],
         ],
       ),
@@ -2761,7 +2883,10 @@ class _RoomScreenState extends State<RoomScreen> {
           borderRadius: BorderRadius.circular(14),
           border: Border.all(color: isUser ? _mint.withOpacity(.4) : _line),
         ),
-        child: RichContent.chat(data: text, accent: _mint),
+        child:
+            isUser
+                ? RichContent.chat(data: text, accent: _mint)
+                : NavigableRichContent.chat(data: text, accent: _mint),
       ),
     );
   }

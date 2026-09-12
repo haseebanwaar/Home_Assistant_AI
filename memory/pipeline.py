@@ -210,6 +210,7 @@ class MemoryPipeline:
             # Newest wins: an event spanning several windows is best illustrated
             # by the footage that made it notable, which is the latest one.
             self._ev_clip[result.current_event.event_id] = clip_id
+            result.current_event.clip_id = clip_id
 
         self._accumulate(result.current_event.event_id, ext, ctx)
         event_text = self.event_texts().get(result.current_event.event_id, {}).get("text")

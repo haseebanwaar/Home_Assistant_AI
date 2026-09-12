@@ -37,7 +37,7 @@
 - **`personal_agents.py`** — the built-in agent rooms. Each carries a `check_in`
   prompt and now a `check_in_at` time; the orchestrator runs the prompt at that
   hour, so the agents accompany the day instead of waiting to be pressed.
-  Times are spread out (`06:30` Quran, `08:00` Wisdom, `09:15` Motivational,
+  Times are spread out (`06:30` Quran, `08:00` Relation, `09:15` Wisdom,
   `18:00` PhD, `21:30` Roaster) and overridable through
   `AGENT_CHECKIN_SCHEDULE`; blank means manual only, which is what Research
   (expensive, tool-driven) and Tomorrow (the planner already runs it) use.

@@ -638,26 +638,6 @@ class Neo4jStore:
                  active_seconds=result["metrics"].get("active_seconds") or 0)
         return result
 
-    # -- Project arc -------------------------------------------------------
-    def room_weekly(self, room_id, start, end):
-        """Per-week activity buckets for a room (weeks start Monday)."""
-        return [dict(row) for row in self.run(
-            _ROOM_WEEKLY_CYPHER, room_id=room_id, start=start, end=end)]
-
-    def room_week_highlights(self, room_id, start, end, limit=5):
-        rows = self.run(_ROOM_WEEK_HIGHLIGHTS_CYPHER, room_id=room_id,
-                        start=start, end=end, limit=int(limit))
-        if not rows:
-            return {"claims": [], "summaries": []}
-        row = dict(rows[0])
-        return {"claims": [c for c in (row.get("claims") or []) if c],
-                "summaries": [s for s in (row.get("summaries") or []) if s]}
-
-    def room_week_entities(self, room_id, start, end, limit=8):
-        return [dict(row) for row in self.run(
-            _ROOM_WEEK_ENTITIES_CYPHER, room_id=room_id, start=start,
-            end=end, limit=int(limit))]
-
     # -- Room hygiene ------------------------------------------------------
     def room_stats(self):
         """Per-room activity counts, used to spot stale and thin rooms."""
@@ -1114,6 +1094,11 @@ class Neo4jStore:
                 row["citations"] = []
         return list(reversed(rows))
 
+    def clear_room_messages(self, room_id):
+        """Delete conversation messages while preserving the room and its notes."""
+        rows = self.run(_CLEAR_ROOM_MESSAGES_CYPHER, room_id=room_id)
+        return int(rows[0]["deleted"]) if rows else 0
+
     def room_applications(self, room_id, start=None, end=None):
         """The apps/cameras that have events in this room — the feed's source chips.
 
@@ -1192,6 +1177,7 @@ class Neo4jStore:
                   "ts": e["span_start"], "text": e.get("summary"),
                   "span_end": e.get("span_end"), "activity_type": e.get("activity_type"),
                   "application": e.get("application"),
+                  "clip_id": e.get("clip_id"),
                   "importance": e.get("importance"),
                   "confidence": e.get("confidence"),
                   "priority": e.get("priority") or "normal",
@@ -1604,6 +1590,7 @@ def _event_params(e):
         "memory_domain": e.get("memory_domain", "personal"),
         "importance": e.get("importance", 0.5),
         "confidence": e.get("confidence", 0.5),
+        "clip_id": e.get("clip_id"),
     }
 
 
@@ -1659,7 +1646,8 @@ SET e.activity_type = $activity_type,
     e.summary = $summary,
     e.memory_domain = $memory_domain,
     e.importance = $importance,
-    e.confidence = $confidence
+    e.confidence = $confidence,
+    e.clip_id = coalesce($clip_id, e.clip_id)
 WITH e
 MATCH (s:Session {session_id: $sid})
 MERGE (s)-[:HAS_EVENT]->(e)
@@ -1972,6 +1960,7 @@ RETURN e.event_id AS event_id, e.summary AS summary,
        e.project_id AS project_id, e.span_start AS span_start,
        e.span_end AS span_end, e.span_seconds AS span_seconds,
        e.boundary_label AS boundary_label, s.session_id AS session_id,
+       e.clip_id AS clip_id,
        coalesce(e.importance, 0.5) AS importance,
        coalesce(e.confidence, 0.5) AS confidence,
        coalesce(e.user_priority,
@@ -2322,42 +2311,6 @@ _SAVE_FOCUS_SUMMARY_CYPHER = """
 MATCH (f:FocusSession {focus_id: $focus_id})
 SET f.ended_at = $ended_at, f.events = $events,
     f.active_seconds = $active_seconds
-"""
-
-# -- Project arc ----------------------------------------------------------
-# Everything else here is day-scoped, so the payoff of long-term memory is
-# invisible: you can see today in detail but not how a project actually went
-# over a month. These bucket a room's activity into weeks.
-
-_ROOM_WEEKLY_CYPHER = """
-MATCH (r:Room {room_id: $room_id})-[:CONTAINS]->(e:Event)
-WHERE e.span_start >= $start AND e.span_start < $end
-WITH e, date(datetime({epochSeconds: toInteger(e.span_start)})) AS day
-WITH e, day, day - duration({days: day.dayOfWeek - 1}) AS week_start
-RETURN toString(week_start) AS week_start,
-       count(DISTINCT e) AS events,
-       round(sum(coalesce(e.span_end, 0) - coalesce(e.span_start, 0)) / 60.0) AS active_minutes,
-       count(DISTINCT date(datetime({epochSeconds: toInteger(e.span_start)}))) AS active_days,
-       collect(DISTINCT e.application)[0..5] AS applications
-ORDER BY week_start
-"""
-
-_ROOM_WEEK_HIGHLIGHTS_CYPHER = """
-MATCH (r:Room {room_id: $room_id})-[:CONTAINS]->(e:Event)
-WHERE e.span_start >= $start AND e.span_start < $end
-OPTIONAL MATCH (e)-[:SUPPORTS]->(c:Claim)
-WITH e, c
-ORDER BY c.confidence DESC
-RETURN collect(DISTINCT c.text)[0..$limit] AS claims,
-       collect(DISTINCT e.summary)[0..$limit] AS summaries
-"""
-
-_ROOM_WEEK_ENTITIES_CYPHER = """
-MATCH (r:Room {room_id: $room_id})-[:CONTAINS]->(e:Event)-[:MENTIONS]->(n:Entity)
-WHERE e.span_start >= $start AND e.span_start < $end
-RETURN n.name AS name, n.type AS type, count(DISTINCT e) AS mentions
-ORDER BY mentions DESC
-LIMIT $limit
 """
 
 # -- Room hygiene ---------------------------------------------------------
@@ -2742,7 +2695,8 @@ _ROOM_FEED_CYPHER = """
 MATCH (r:Room {room_id: $room_id})-[rel:CONTAINS]->(e:Event)
 RETURN e.event_id AS event_id, e.span_start AS span_start, e.span_end AS span_end,
        e.summary AS summary, e.activity_type AS activity_type,
-       e.application AS application, rel.assignment AS assignment, rel.manual AS manual,
+       e.application AS application, e.clip_id AS clip_id,
+       rel.assignment AS assignment, rel.manual AS manual,
        coalesce(e.importance, 0.5) AS importance,
        coalesce(e.confidence, 0.5) AS confidence,
        coalesce(e.user_priority,
@@ -2783,6 +2737,13 @@ RETURN m.message_id AS message_id, m.role AS role, m.text AS text,
        m.citations_json AS citations_json, m.ts AS ts
 ORDER BY m.ts DESC
 LIMIT $limit
+"""
+
+_CLEAR_ROOM_MESSAGES_CYPHER = """
+MATCH (r:Room {room_id: $room_id})-[:HAS_MESSAGE]->(m:RoomMessage)
+WITH m
+DETACH DELETE m
+RETURN count(*) AS deleted
 """
 
 # The chat-context queries below all take the same optional scope: a time window
@@ -2858,7 +2819,8 @@ MATCH (r:Room {room_id: $room_id})-[rel:CONTAINS]->(e:Event)
 WHERE e.span_start >= $start AND e.span_start < $end
 RETURN e.event_id AS event_id, e.span_start AS span_start, e.span_end AS span_end,
        e.summary AS summary, e.activity_type AS activity_type,
-       e.application AS application, rel.assignment AS assignment, rel.manual AS manual,
+       e.application AS application, e.clip_id AS clip_id,
+       rel.assignment AS assignment, rel.manual AS manual,
        coalesce(e.importance, 0.5) AS importance,
        coalesce(e.confidence, 0.5) AS confidence,
        coalesce(e.user_priority,
